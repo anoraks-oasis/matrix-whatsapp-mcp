@@ -1,72 +1,167 @@
 // Command server is the matrix-whatsapp-mcp entrypoint. It loads the
 // configuration, brings up the Matrix sync loop and trigger dispatcher, and
-// will serve the MCP server (stdio or Streamable HTTP) once Phase B lands.
+// serves the MCP server over stdio or Streamable HTTP until interrupted.
 package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
+	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/config"
 	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/logger"
 	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/matrix"
+	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/mcpserver"
 	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/trigger"
-
-	// Pinned now so go.mod records the resolved version; the MCP server that
-	// actually uses this package is wired in Phase B.
-	_ "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func main() {
 	log := logger.New()
+	if err := run(log); err != nil {
+		log.Fatalf("fatal: %v", err)
+	}
+}
 
+// run brings the process up and shuts it down cleanly. It returns nil on a
+// graceful shutdown and a non-nil error on a fatal start or sync failure, which
+// main turns into a non-zero exit.
+func run(log *log.Logger) error {
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("configuration error: %v", err)
+		return fmt.Errorf("configuration error: %w", err)
 	}
-	// cfg.String() redacts secrets. Never log cfg fields directly.
 
 	matrixClient, err := matrix.New(cfg, log)
 	if err != nil {
-		log.Fatalf("matrix client: %v", err)
+		return fmt.Errorf("matrix client: %w", err)
 	}
-	defer func() {
-		if err := matrixClient.Close(); err != nil {
-			log.Printf("matrix client close: %v", err)
-		}
-	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 
 	dispatcher := trigger.New(cfg.TriggerWebhook, matrixClient, log)
 	dispatcher.Attach(matrixClient)
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	var wg sync.WaitGroup
+
+	// Signal watcher: cancel the run on the first signal, then exit.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		select {
+		case <-sigCh:
+			log.Println("shutdown signal received")
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	var fatalMu sync.Mutex
+	var fatalErr error
+	setFatal := func(err error) {
+		fatalMu.Lock()
+		if fatalErr == nil {
+			fatalErr = err
+		}
+		fatalMu.Unlock()
+		cancel()
+	}
+
+	// Sync loop. A fatal error (invalid token, user mismatch) cancels the run;
+	// a plain cancellation returns nil.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := matrixClient.Sync(ctx); err != nil {
+			log.Printf("sync loop stopped: %v", err)
+			setFatal(fmt.Errorf("sync loop: %w", err))
+		}
+	}()
 
 	dispatcher.Start(ctx)
 
-	// TODO(Phase B): construct and serve the MCP server here.
-	//   - cfg.Transport == config.TransportStdio: JSON-RPC over stdin/stdout.
-	//   - cfg.Transport == config.TransportHTTP: Streamable HTTP on cfg.HTTPAddr.
-	// The tool handlers must go through matrixClient (MatrixService) and
-	// dispatcher.Recent, and enforce cfg.SendAllowed / cfg.ReadOnly.
+	mcpServer := mcpserver.New(matrixClient, matrixClient, dispatcher, cfg.AllowedSendRooms)
 
-	syncErr := make(chan error, 1)
-	go func() {
-		syncErr <- matrixClient.Sync(ctx)
-	}()
-
-	select {
-	case <-ctx.Done():
-		log.Println("shutdown signal received")
-	case err := <-syncErr:
-		if err != nil {
-			log.Printf("sync loop stopped: %v", err)
+	switch cfg.Transport {
+	case config.TransportStdio:
+		log.Println("serving MCP over stdio")
+		if err := mcpServer.Run(ctx, &mcp.StdioTransport{}); err != nil && !errors.Is(err, context.Canceled) {
+			setFatal(fmt.Errorf("mcp server: %w", err))
+		}
+	case config.TransportHTTP:
+		if err := serveHTTP(ctx, cfg.HTTPAddr, mcpServer, log); err != nil {
+			setFatal(err)
 		}
 	}
+
+	// Graceful shutdown: the serve loop has already returned. Stop the
+	// dispatcher, then the Matrix client, then join every goroutine.
+	cancel()
 
 	if err := dispatcher.Close(); err != nil {
 		log.Printf("dispatcher close: %v", err)
 	}
+	if err := matrixClient.Close(); err != nil {
+		log.Printf("matrix client close: %v", err)
+	}
+
+	wg.Wait()
+
+	fatalMu.Lock()
+	defer fatalMu.Unlock()
+	return fatalErr
+}
+
+// serveHTTP serves the MCP server over Streamable HTTP and blocks until the
+// context is cancelled or the listener fails. On cancellation it performs a
+// graceful http.Server shutdown, which also closes the MCP sessions.
+func serveHTTP(ctx context.Context, addr string, mcpServer *mcp.Server, log *log.Logger) error {
+	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return mcpServer }, nil)
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	log.Printf("serving MCP over HTTP on %s", addr)
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.ListenAndServe() }()
+
+	select {
+	case <-ctx.Done():
+		// Signal or fatal sync error: graceful HTTP shutdown below.
+	case err := <-serveErr:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("http server: %w", err)
+		}
+		return nil
+	}
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	err := srv.Shutdown(shutdownCtx)
+	shutdownCancel()
+	if err != nil {
+		log.Printf("http server shutdown: %v", err)
+		_ = srv.Close()
+	}
+	if err := <-serveErr; err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("http server: %w", err)
+	}
+	return nil
 }
