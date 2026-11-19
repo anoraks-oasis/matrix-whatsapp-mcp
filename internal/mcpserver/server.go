@@ -30,6 +30,11 @@ const (
 	// sendInterval is the minimum time between two accepted sends across all
 	// rooms: the token bucket holds one token and refills it every sendInterval.
 	sendInterval = 3 * time.Second
+
+	// listProbeParallel bounds how many room probes (canonical alias + bridged
+	// check) run at once so list_rooms does not do room_count × 2 sequential
+	// network round-trips.
+	listProbeParallel = 8
 )
 
 // RoomProber is the best-effort room detail probe backed by *matrix.Client.
@@ -151,24 +156,41 @@ func (s *Server) handleListRooms(ctx context.Context, _ *mcp.CallToolRequest, _ 
 	if err != nil {
 		return nil, nil, err
 	}
-	out := make([]roomResult, 0, len(rooms))
-	for _, r := range rooms {
-		if ctx.Err() != nil {
-			return nil, nil, ctx.Err()
-		}
-		name := r.Name
-		if name == "" || name == r.ID {
-			name = "unnamed"
-			if s.prober != nil {
-				if alias := s.prober.CanonicalAlias(ctx, r.ID); alias != "" {
-					name = alias
-				}
+
+	results := make([]roomResult, len(rooms))
+	sem := make(chan struct{}, listProbeParallel)
+	var wg sync.WaitGroup
+	for i, r := range rooms {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, r matrix.Room) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			results[i] = s.probeRoom(ctx, r)
+		}(i, r)
+	}
+	wg.Wait()
+	if ctx.Err() != nil {
+		return nil, nil, ctx.Err()
+	}
+	return nil, results, nil
+}
+
+// probeRoom resolves a room's display name and bridged flag. Both probes are
+// best effort: any error inside them (including cancellation) yields the
+// fallback value rather than failing the list_rooms call.
+func (s *Server) probeRoom(ctx context.Context, r matrix.Room) roomResult {
+	res := roomResult{RoomID: r.ID, Name: r.Name}
+	if res.Name == "" || res.Name == r.ID {
+		res.Name = "unnamed"
+		if s.prober != nil {
+			if alias := s.prober.CanonicalAlias(ctx, r.ID); alias != "" {
+				res.Name = alias
 			}
 		}
-		bridged := s.prober != nil && s.prober.IsBridged(ctx, r.ID)
-		out = append(out, roomResult{RoomID: r.ID, Name: name, Bridged: bridged})
 	}
-	return nil, out, nil
+	res.Bridged = s.prober != nil && s.prober.IsBridged(ctx, r.ID)
+	return res
 }
 
 func (s *Server) handleReadMessages(ctx context.Context, _ *mcp.CallToolRequest, in readMessagesInput) (*mcp.CallToolResult, []messageResult, error) {
