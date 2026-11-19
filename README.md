@@ -14,6 +14,9 @@ scripts) remain.
 - Go 1.26+ (the toolchain requirement is imposed by the current mautrix
   release; see Architecture > Dependencies)
 - A Matrix homeserver account with an access token
+- The pure-Go olm crypto backend, selected with the `goolm` build tag. Every
+  build/run/test command below carries `-tags goolm`; the alternative is to
+  install libolm and build without the tag.
 
 ## Configuration
 
@@ -41,8 +44,18 @@ will refuse to send to it.
 ```sh
 cp .env.example .env   # then fill in real values
 set -a; . ./.env; set +a
-go run ./cmd/server
+go run -tags goolm ./cmd/server
 ```
+
+Or build a binary and run it:
+
+```sh
+go build -tags goolm -o matrix-whatsapp-mcp ./cmd/server
+./matrix-whatsapp-mcp
+```
+
+A `Makefile` wraps the tagged commands so the `goolm` tag cannot be forgotten:
+`make build`, `make run`, `make test`, `make vet`.
 
 ## Architecture
 
@@ -231,7 +244,10 @@ the sync loop in a managed goroutine, and serves the MCP server. With
 `MCP_TRANSPORT=stdio` (the default) it serves `mcp.StdioTransport` on
 stdin/stdout; with `MCP_TRANSPORT=http` it serves
 `mcp.NewStreamableHTTPHandler` on `HTTP_ADDR` behind an `http.Server` with
-read/write/idle timeouts. On SIGINT/SIGTERM (or a fatal sync error) the run
+read-header, read and idle timeouts but no `WriteTimeout`. The write deadline
+is left at 0 on purpose: the Streamable HTTP transport holds a long-lived GET
+SSE stream open for server→client messages, and a server-wide write deadline
+would cut that stream. On SIGINT/SIGTERM (or a fatal sync error) the run
 context is cancelled, the HTTP server and MCP session are shut down, the
 dispatcher and Matrix client are closed, and every goroutine is joined before
 the process exits. A fatal start or sync error exits non-zero; a graceful
