@@ -5,8 +5,9 @@ bridge. It listens to incoming message events, keeps a small in-memory history,
 optionally forwards them to a webhook, and exposes MCP tools for listing rooms,
 reading messages, and sending replies (allow-list gated, fail closed).
 
-Status: Phase A — scaffold, configuration, Matrix client, and trigger
-dispatcher. The MCP server itself and the four tool handlers land in Phase B.
+Status: Phase B — the MCP server and its four tool handlers are wired and
+served over stdio or Streamable HTTP. Phase C (review) and Phase D (tests and
+scripts) remain.
 
 ## Requirements
 
@@ -173,6 +174,69 @@ when `TRIGGER_WEBHOOK_URL` is set forwards each one over HTTP with a 5s
 timeout and exactly one retry. Delivery is fully async on worker goroutines and
 never blocks the sync loop; every goroutine exits on context cancellation and is
 joined by `Close`.
+
+### mcpserver
+
+```go
+package mcpserver
+
+const (
+    Name    = "matrix-whatsapp-mcp"
+    Version = "0.1.0"
+)
+
+type RoomProber interface {
+    IsBridged(ctx context.Context, roomID string) bool
+    CanonicalAlias(ctx context.Context, roomID string) string
+}
+
+type TriggerReader interface {
+    Recent(since int64, limit int) []trigger.Trigger
+}
+
+func New(svc matrix.MatrixService, prober RoomProber, recent TriggerReader,
+    allowed []string) *mcp.Server
+```
+
+`New` builds an `mcp.Server` with exactly four tools:
+
+| Tool | Inputs | Annotations |
+| --- | --- | --- |
+| `list_rooms` | none | `readOnlyHint: true` |
+| `read_messages` | `room_id` (required), `limit` (default 20, clamped 1..100) | `readOnlyHint: true` |
+| `get_recent_triggers` | `since_timestamp` (unix millis), `limit` (default 20, clamped 1..100) | `readOnlyHint: true` |
+| `send_message` | `room_id` (required), `text` (required, non-whitespace) | `destructiveHint: true`, `idempotentHint: false`, `readOnlyHint: false` |
+
+`read_messages` returns events oldest-first; `get_recent_triggers` returns the
+dispatcher's ring buffer newest-first.
+
+Bridged detection in `list_rooms` is best effort and never fails the whole
+call. A room is `bridged: true` when an `m.bridge` state event is present on
+the room; failing that, when any joined member's localpart contains
+`whatsapp` (case-insensitive). Any probe error leaves `bridged: false` and
+keeps the room. The room `name` is the room name, falling back to the
+canonical alias, then to `unnamed`.
+
+Sending is gated by an unexported `sendGate` type that combines the allow-list
+and a token bucket (one message per 3 seconds across all rooms). An empty
+`ALLOWED_SEND_ROOMS` rejects every send with a read-only error; a room not in
+a non-empty list is rejected without consuming the token; a throttled call
+returns `rate limited, retry in Ns` rather than blocking. The access token is
+never logged and never appears in an error or tool result.
+
+### cmd/server
+
+`cmd/server` loads the config, builds the Matrix client and dispatcher, starts
+the sync loop in a managed goroutine, and serves the MCP server. With
+`MCP_TRANSPORT=stdio` (the default) it serves `mcp.StdioTransport` on
+stdin/stdout; with `MCP_TRANSPORT=http` it serves
+`mcp.NewStreamableHTTPHandler` on `HTTP_ADDR` behind an `http.Server` with
+read/write/idle timeouts. On SIGINT/SIGTERM (or a fatal sync error) the run
+context is cancelled, the HTTP server and MCP session are shut down, the
+dispatcher and Matrix client are closed, and every goroutine is joined before
+the process exits. A fatal start or sync error exits non-zero; a graceful
+shutdown exits zero. Logging goes to stderr only, so nothing but MCP frames
+ever reaches stdout in stdio mode.
 
 ### Dependencies
 
