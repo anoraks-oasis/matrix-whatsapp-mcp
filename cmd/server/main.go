@@ -130,12 +130,16 @@ func run(log *log.Logger) error {
 // graceful http.Server shutdown, which also closes the MCP sessions.
 func serveHTTP(ctx context.Context, addr string, mcpServer *mcp.Server, log *log.Logger) error {
 	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return mcpServer }, nil)
+	// WriteTimeout is deliberately left at 0: the Streamable HTTP transport
+	// holds a long-lived GET SSE stream open for server->client messages, and
+	// net/http would apply a server-wide write deadline of now+WriteTimeout to
+	// every response, cutting that stream. The SDK owns the connection
+	// lifecycle; per-request bounds belong in the handler, not here.
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 
