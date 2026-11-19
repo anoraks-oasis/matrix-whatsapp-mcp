@@ -244,3 +244,19 @@ func TestConcurrentBufferAccess(t *testing.T) {
 		t.Fatalf("Recent after concurrent access = %d, want %d", len(got), BufferSize)
 	}
 }
+
+// TestNewDispatcherDefaults locks the documented production defaults. These
+// are a public contract (5s webhook timeout, exactly one retry), so any drift
+// here is a production bug, not a test bug.
+func TestNewDispatcherDefaults(t *testing.T) {
+	d := New("http://example.invalid/hook", nil, discardLogger())
+	if d.timeout != 5*time.Second {
+		t.Fatalf("default timeout = %v, want exactly 5s", d.timeout)
+	}
+	if d.retries != 1 {
+		t.Fatalf("default retries = %d, want exactly 1", d.retries)
+	}
+	if d.retryDelay != 500*time.Millisecond {
+		t.Fatalf("default retryDelay = %v, want exactly 500ms", d.retryDelay)
+	}
+}
