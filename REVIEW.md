@@ -1,6 +1,6 @@
 # Phase C review — matrix-whatsapp-mcp
 
-Re-reviewed at HEAD `3b4e244` (fix wave `d99c7e7`–`7d64dd8` + Phase D tests `e28a750`, `edfa5d0`, `bce28ef`, `3b4e244`). The previous review was at `c53fa55`.
+Re-reviewed at HEAD `3c637eb` (fix wave `d99c7e7`–`7d64dd8` + Phase D tests `e28a750`, `edfa5d0`, `bce28ef`, `3b4e244`, plus the N1 fix `3c637eb`). The previous review was at `c53fa55`.
 
 Blocking issues: 0
 
@@ -17,9 +17,9 @@ Blocking issues: 0
 
 | ID | Severity | Area | Location | What is wrong | Why it matters | Fix |
 | --- | --- | --- | --- | --- | --- | --- |
-| N1 | nit | tests | internal/trigger/dispatcher.go:28-30,86-88 | No test pins the production webhook defaults; every timing test injects a fast `timeout`/`retryDelay`, so a green suite does not prove the shipped values. | The 5s / exactly-1-retry contract is load-bearing and was just refactored onto struct fields; a future change could silently alter it and the suite would stay green. | Add a `TestNewDispatcherDefaults` asserting `d.timeout == 5*time.Second`, `d.retries == 1`, `d.retryDelay == 500*time.Millisecond`. |
+| N1 | nit | tests | internal/trigger/dispatcher.go:28-30,86-88 | No test pins the production webhook defaults; every timing test injects a fast `timeout`/`retryDelay`, so a green suite does not prove the shipped values. | The 5s / exactly-1-retry contract is load-bearing and was just refactored onto struct fields; a future change could silently alter it and the suite would stay green. | **Fixed by 3c637eb** — `TestNewDispatcherDefaults` asserts `timeout == 5*time.Second`, `retries == 1`, `retryDelay == 500*time.Millisecond`. |
 
-The production default is nonetheless correct — see the proof below. N1 is a test-coverage gap, not a code defect.
+The production default is nonetheless correct — see the proof below. N1 was a test-coverage gap, not a code defect.
 
 ## Production webhook default (re-audit item 2)
 
@@ -38,7 +38,7 @@ The shipped defaults are literally 5s and exactly 1 retry, verified by inspectio
 - **No test can reach a real homeserver** — matrix tests use `httptest.NewServer` or `http://127.0.0.1:1` (and the latter paths — self-filter registration, empty-text rejection — make no network call). `scripts/smoke_test.sh` is offline by default and only runs reachability/`list_rooms` when the operator explicitly supplies their own `MATRIX_*` credentials.
 - **Sleeps** — a few bounded sleeps/polls exist (`5ms` poll with deadline, a `50ms` drain after `close(release)`, `3 * retryDelay` settle). They are bounded and support assertions that rest on channels/atomic counters plus deadlines, not on the sleeps alone; the timing-critical gate is clock-injected. Acceptable, mildly flaky-prone at worst.
 
-## Full gate output (re-audit item 4), from a clean tree at `3b4e244`
+## Full gate output (re-audit item 4), from a clean tree at `3c637eb`
 
 ```
 $ go build -tags goolm ./...            # exit 0, no output
@@ -49,9 +49,9 @@ $ go test -race -count=1 -tags goolm ./...
 ?   github.com/ButterHost69/matrix-whatsapp-mcp/cmd/server           [no test files]
 ?   github.com/ButterHost69/matrix-whatsapp-mcp/internal/config       [no test files]
 ?   github.com/ButterHost69/matrix-whatsapp-mcp/internal/logger       [no test files]
-ok  github.com/ButterHost69/matrix-whatsapp-mcp/internal/matrix       1.022s
-ok  github.com/ButterHost69/matrix-whatsapp-mcp/internal/mcpserver    1.088s
-ok  github.com/ButterHost69/matrix-whatsapp-mcp/internal/trigger      1.702s
+ok  github.com/ButterHost69/matrix-whatsapp-mcp/internal/matrix       1.030s
+ok  github.com/ButterHost69/matrix-whatsapp-mcp/internal/mcpserver    1.098s
+ok  github.com/ButterHost69/matrix-whatsapp-mcp/internal/trigger      1.666s
 $ bash scripts/smoke_test.sh
 INFO: building binary with -tags goolm
 PASS: built executable binary with -tags goolm
