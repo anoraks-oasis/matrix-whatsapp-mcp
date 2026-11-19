@@ -25,10 +25,11 @@ const (
 	// BufferSize is the number of triggers kept for Recent.
 	BufferSize = 100
 
-	webhookTimeout = 5 * time.Second
-	retryDelay     = 500 * time.Millisecond
-	queueSize      = 256
-	workerCount    = 4
+	webhookTimeout    = 5 * time.Second
+	webhookRetryDelay = 500 * time.Millisecond
+	webhookRetries    = 1
+	queueSize         = 256
+	workerCount       = 4
 )
 
 // Trigger is a normalized incoming message. Timestamp is unix milliseconds.
@@ -57,6 +58,9 @@ type Dispatcher struct {
 	namer      RoomNamer
 	webhookURL string
 	httpClient *http.Client
+	timeout    time.Duration
+	retryDelay time.Duration
+	retries    int
 
 	mu    sync.RWMutex
 	ring  [BufferSize]Trigger
@@ -78,7 +82,10 @@ func New(webhookURL string, namer RoomNamer, logger *log.Logger) *Dispatcher {
 		log:        logger,
 		namer:      namer,
 		webhookURL: webhookURL,
-		httpClient: &http.Client{Timeout: webhookTimeout},
+		httpClient: &http.Client{},
+		timeout:    webhookTimeout,
+		retryDelay: webhookRetryDelay,
+		retries:    webhookRetries,
 		queue:      make(chan Trigger, queueSize),
 	}
 }
@@ -224,24 +231,27 @@ func (d *Dispatcher) deliver(ctx context.Context, t Trigger) {
 		d.log.Printf("webhook encode failed for %s: %v", t.EventID, err)
 		return
 	}
-	err = d.post(ctx, body)
-	if err == nil || ctx.Err() != nil {
-		return
-	}
-	timer := time.NewTimer(retryDelay)
-	select {
-	case <-ctx.Done():
-		timer.Stop()
-		return
-	case <-timer.C:
-	}
-	if err = d.post(ctx, body); err != nil && ctx.Err() == nil {
-		d.log.Printf("webhook delivery failed for %s after retry: %v", t.EventID, err)
+	for attempt := 0; ; attempt++ {
+		err = d.post(ctx, body)
+		if err == nil || ctx.Err() != nil {
+			return
+		}
+		if attempt >= d.retries {
+			d.log.Printf("webhook delivery failed for %s after %d retries: %v", t.EventID, d.retries, err)
+			return
+		}
+		timer := time.NewTimer(d.retryDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
 	}
 }
 
 func (d *Dispatcher) post(ctx context.Context, body []byte) error {
-	ctx, cancel := context.WithTimeout(ctx, webhookTimeout)
+	ctx, cancel := context.WithTimeout(ctx, d.timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.webhookURL, bytes.NewReader(body))
 	if err != nil {
