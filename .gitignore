@@ -4,8 +4,10 @@
 
 # Matrix crypto / state databases
 *.db
-*.sqlite
-*.sqlite3
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite*
 
 # Built binaries
 /matrix-whatsapp-mcp
