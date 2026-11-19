@@ -206,6 +206,60 @@ func (c *Client) fetchName(ctx context.Context, roomID string) {
 	c.setName(roomID, content.Name)
 }
 
+// CanonicalAlias returns the room's canonical alias, or "" if it has none or
+// the lookup fails. It is best effort so a failed lookup never fails a caller.
+func (c *Client) CanonicalAlias(ctx context.Context, roomID string) string {
+	ctx, cancel := context.WithTimeout(ctx, nameFetchTimeout)
+	defer cancel()
+	var content event.CanonicalAliasEventContent
+	if err := c.cli.StateEvent(ctx, id.RoomID(roomID), event.StateCanonicalAlias, "", &content); err != nil {
+		return ""
+	}
+	return content.Alias.String()
+}
+
+// IsBridged reports whether a room appears to be bridged from WhatsApp. It is
+// deliberately best effort: the presence of an m.bridge state event marks the
+// room as bridged; failing that, a joined member whose localpart contains
+// "whatsapp" does. Any probe error (including an inaccessible room or a
+// timeout) is treated as not bridged, so a single room never fails the whole
+// list_rooms call.
+func (c *Client) IsBridged(ctx context.Context, roomID string) bool {
+	ctx, cancel := context.WithTimeout(ctx, nameFetchTimeout)
+	defer cancel()
+	var bridge event.BridgeEventContent
+	err := c.cli.StateEvent(ctx, id.RoomID(roomID), event.StateBridge, "", &bridge)
+	if err == nil {
+		return true
+	}
+	if !errors.Is(err, mautrix.MNotFound) {
+		c.log.Printf("bridge probe failed for %s: %v", roomID, err)
+	}
+
+	members, err := c.cli.Members(ctx, id.RoomID(roomID))
+	if err != nil {
+		c.log.Printf("member probe failed for %s: %v", roomID, err)
+		return false
+	}
+	for _, evt := range members.Chunk {
+		if evt.Type != event.StateMember {
+			continue
+		}
+		if evt.Content.Parsed == nil {
+			if err := evt.Content.ParseRaw(event.StateMember); err != nil {
+				continue
+			}
+		}
+		if member := evt.Content.AsMember(); member != nil && member.Membership == event.MembershipJoin {
+			localpart, _, err := id.UserID(evt.GetStateKey()).Parse()
+			if err == nil && strings.Contains(strings.ToLower(localpart), "whatsapp") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // JoinedRooms implements MatrixService.
 func (c *Client) JoinedRooms(ctx context.Context) ([]Room, error) {
 	resp, err := c.cli.JoinedRooms(ctx)
