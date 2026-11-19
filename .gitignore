@@ -1,0 +1,14 @@
+# Secrets and local configuration
+.env
+*.env.local
+
+# Matrix crypto / state databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Built binaries
+/matrix-whatsapp-mcp
+/server
+/matrix-whatsapp-mcp.exe
+/server.exe
