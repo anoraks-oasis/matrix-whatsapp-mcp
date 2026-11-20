@@ -2,6 +2,7 @@ package trigger
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -258,5 +259,67 @@ func TestNewDispatcherDefaults(t *testing.T) {
 	}
 	if d.retryDelay != 500*time.Millisecond {
 		t.Fatalf("default retryDelay = %v, want exactly 500ms", d.retryDelay)
+	}
+}
+
+// mediaEvent builds an m.room.message event of an arbitrary msgtype.
+func mediaEvent(evID, roomID, sender string, ts int64, msgtype event.MessageType, body string) *event.Event {
+	return &event.Event{
+		Type:      event.EventMessage,
+		ID:        id.EventID(evID),
+		RoomID:    id.RoomID(roomID),
+		Sender:    id.UserID(sender),
+		Timestamp: ts,
+		Content:   event.Content{Parsed: &event.MessageEventContent{MsgType: msgtype, Body: body}},
+	}
+}
+
+// TestHandleMediaPlaceholderAndMsgType closes the live media defect on the
+// trigger path: a photo with an empty body must not reach a webhook consumer as
+// a blank string, and the msgtype must be carried through.
+func TestHandleMediaPlaceholderAndMsgType(t *testing.T) {
+	tests := []struct {
+		name        string
+		msgtype     event.MessageType
+		body        string
+		wantBody    string
+		wantMsgType string
+	}{
+		{"image with empty body", event.MsgImage, "", "[image]", "m.image"},
+		{"video with empty body", event.MsgVideo, "", "[video]", "m.video"},
+		{"audio with empty body", event.MsgAudio, "", "[audio]", "m.audio"},
+		{"file with empty body", event.MsgFile, "", "[file]", "m.file"},
+		{"image with caption", event.MsgImage, "a caption", "a caption", "m.image"},
+		{"text keeps its body", event.MsgText, "hello there", "hello there", "m.text"},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			d := New("", nil, discardLogger())
+			d.Handle(context.Background(), mediaEvent("$e", "!r:test", "@wa:test", int64(i+1), tc.msgtype, tc.body))
+			got := d.Recent(0, 0)
+			if len(got) != 1 {
+				t.Fatalf("Recent = %d triggers, want 1", len(got))
+			}
+			if got[0].Body != tc.wantBody {
+				t.Fatalf("Body = %q, want %q", got[0].Body, tc.wantBody)
+			}
+			if got[0].MsgType != tc.wantMsgType {
+				t.Fatalf("MsgType = %q, want %q", got[0].MsgType, tc.wantMsgType)
+			}
+			payload, err := json.Marshal(got[0])
+			if err != nil {
+				t.Fatalf("marshal trigger: %v", err)
+			}
+			var decoded map[string]any
+			if err := json.Unmarshal(payload, &decoded); err != nil {
+				t.Fatalf("unmarshal trigger: %v", err)
+			}
+			if decoded["msgtype"] != tc.wantMsgType {
+				t.Fatalf("trigger JSON msgtype = %v, want %q", decoded["msgtype"], tc.wantMsgType)
+			}
+			if decoded["body"] != tc.wantBody {
+				t.Fatalf("trigger JSON body = %v, want %q", decoded["body"], tc.wantBody)
+			}
+		})
 	}
 }

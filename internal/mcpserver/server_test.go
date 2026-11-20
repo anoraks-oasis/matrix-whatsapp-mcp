@@ -217,6 +217,13 @@ func TestToolsListHasFourToolsWithSchemas(t *testing.T) {
 
 	read := schemaMap(t, toolByName(t, res.Tools, "read_messages"))
 	hasField(t, read, "room_id")
+	// read_messages must describe the type of every message it returns, so a
+	// media event is never a blank body with no hint about what it was.
+	for _, field := range []string{"msgtype", "encrypted", "body"} {
+		if _, ok := outputProperties(t, toolByName(t, res.Tools, "read_messages"))[field]; !ok {
+			t.Fatalf("read_messages output schema has no %q property", field)
+		}
+	}
 	readProps := read["properties"].(map[string]any)
 	limit := readProps["limit"].(map[string]any)
 	if limit["type"] != "integer" {
@@ -270,6 +277,25 @@ func TestListRoomsKeepsRoomsWithFailedProbes(t *testing.T) {
 	}
 }
 
+// outputProperties returns the properties of a tool's structured output, which
+// is an array schema in every tool here.
+func outputProperties(t *testing.T, tool *mcp.Tool) map[string]any {
+	t.Helper()
+	schema, ok := tool.OutputSchema.(map[string]any)
+	if !ok {
+		t.Fatalf("tool %q OutputSchema is %T, want map[string]any", tool.Name, tool.OutputSchema)
+	}
+	items, ok := schema["items"].(map[string]any)
+	if !ok {
+		t.Fatalf("tool %q output schema has no items object: %v", tool.Name, schema)
+	}
+	props, ok := items["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("tool %q output schema has no properties: %v", tool.Name, items)
+	}
+	return props
+}
+
 func TestReadMessagesOrdersAndClamps(t *testing.T) {
 	svc := &fakeMatrix{msgs: []matrix.Message{
 		{EventID: "$2", RoomID: "!r:test", Body: "new", Timestamp: 200},
@@ -309,6 +335,40 @@ func TestReadMessagesOrdersAndClamps(t *testing.T) {
 	msgs := decodeStructured[[]messageResult](t, res)
 	if len(msgs) != 2 || msgs[0].EventID != "$1" || msgs[1].EventID != "$2" {
 		t.Fatalf("read_messages = %+v, want [$1 $2] oldest first", msgs)
+	}
+}
+
+// TestReadMessagesCarriesMsgType proves the live media defect is closed at the
+// MCP boundary: every message reports its msgtype and encryption flag, and the
+// media placeholder produced by the Matrix layer is passed through untouched.
+func TestReadMessagesCarriesMsgType(t *testing.T) {
+	svc := &fakeMatrix{msgs: []matrix.Message{
+		{EventID: "$img", RoomID: "!r:test", Body: "[image]", MsgType: "m.image", Timestamp: 200},
+		{EventID: "$txt", RoomID: "!r:test", Body: "hello", MsgType: "m.text", Timestamp: 100, Encrypted: true},
+	}}
+	srv := New(svc, &fakeProber{}, &fakeRecent{}, nil)
+	session, cleanup := connect(t, srv)
+	defer cleanup()
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "read_messages",
+		Arguments: map[string]any{"room_id": "!r:test"},
+	})
+	if err != nil {
+		t.Fatalf("read_messages: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("read_messages returned error: %s", resultErrorText(t, res))
+	}
+	msgs := decodeStructured[[]messageResult](t, res)
+	if len(msgs) != 2 {
+		t.Fatalf("read_messages returned %d messages, want 2", len(msgs))
+	}
+	if msgs[0].EventID != "$txt" || msgs[0].MsgType != "m.text" || !msgs[0].Encrypted || msgs[0].Body != "hello" {
+		t.Fatalf("msgs[0] = %+v, want $txt/m.text/encrypted with body hello", msgs[0])
+	}
+	if msgs[1].EventID != "$img" || msgs[1].MsgType != "m.image" || msgs[1].Body != "[image]" {
+		t.Fatalf("msgs[1] = %+v, want $img/m.image with body [image]", msgs[1])
 	}
 }
 

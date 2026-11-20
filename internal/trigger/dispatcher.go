@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,12 +34,16 @@ const (
 )
 
 // Trigger is a normalized incoming message. Timestamp is unix milliseconds.
+// A media event (m.image, m.video, ...) that carries no text body gets a
+// bracketed type marker such as "[image]" instead of an empty string, so a
+// webhook or trigger consumer never sees a silently blank body.
 type Trigger struct {
 	EventID   string `json:"event_id"`
 	RoomID    string `json:"room_id"`
 	RoomName  string `json:"room_name"`
 	Sender    string `json:"sender"`
 	Body      string `json:"body"`
+	MsgType   string `json:"msgtype"`
 	Timestamp int64  `json:"timestamp"`
 }
 
@@ -115,13 +120,29 @@ func (d *Dispatcher) Handle(_ context.Context, evt *event.Event) {
 		RoomID:    roomID,
 		RoomName:  name,
 		Sender:    evt.Sender.String(),
-		Body:      msg.Body,
+		Body:      bodyOrPlaceholder(msg.MsgType, msg.Body),
+		MsgType:   string(msg.MsgType),
 		Timestamp: evt.Timestamp,
 	}
 	if !d.record(t) {
 		return
 	}
 	d.enqueue(t)
+}
+
+// bodyOrPlaceholder substitutes a short bracketed marker for a media event
+// with no text body, derived from the msgtype alone. Text-like bodies are
+// returned verbatim. It mirrors the rule in internal/matrix so a trigger and
+// the corresponding read_messages entry describe the same event identically.
+func bodyOrPlaceholder(msgtype event.MessageType, body string) string {
+	if body != "" {
+		return body
+	}
+	switch msgtype {
+	case event.MsgText, event.MsgNotice, event.MsgEmote, "":
+		return body
+	}
+	return "[" + strings.TrimPrefix(string(msgtype), "m.") + "]"
 }
 
 func (d *Dispatcher) record(t Trigger) bool {

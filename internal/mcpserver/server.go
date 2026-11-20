@@ -124,8 +124,10 @@ type messageResult struct {
 	EventID   string `json:"event_id" jsonschema:"the Matrix event ID"`
 	RoomID    string `json:"room_id" jsonschema:"the Matrix room ID"`
 	Sender    string `json:"sender" jsonschema:"the sender Matrix user ID"`
-	Body      string `json:"body" jsonschema:"the plain-text message body"`
+	Body      string `json:"body" jsonschema:"the message body; media events with no text body carry a bracketed type marker such as [image] or [file]"`
+	MsgType   string `json:"msgtype" jsonschema:"the message type, for example m.text, m.notice or m.image"`
 	Timestamp int64  `json:"timestamp" jsonschema:"unix milliseconds when the message was sent"`
+	Encrypted bool   `json:"encrypted" jsonschema:"whether the event was encrypted; an undecryptable body is a fixed placeholder"`
 }
 
 type recentTriggersInput struct {
@@ -138,7 +140,8 @@ type triggerResult struct {
 	RoomID    string `json:"room_id" jsonschema:"the Matrix room ID"`
 	RoomName  string `json:"room_name" jsonschema:"the display name of the room"`
 	Sender    string `json:"sender" jsonschema:"the sender Matrix user ID"`
-	Body      string `json:"body" jsonschema:"the plain-text message body"`
+	Body      string `json:"body" jsonschema:"the message body; media events with no text body carry a bracketed type marker such as [image] or [file]"`
+	MsgType   string `json:"msgtype" jsonschema:"the message type, for example m.text, m.notice or m.image"`
 	Timestamp int64  `json:"timestamp" jsonschema:"unix milliseconds when the message was received"`
 }
 
@@ -205,7 +208,9 @@ func (s *Server) handleReadMessages(ctx context.Context, _ *mcp.CallToolRequest,
 			RoomID:    m.RoomID,
 			Sender:    m.Sender,
 			Body:      m.Body,
+			MsgType:   m.MsgType,
 			Timestamp: m.Timestamp,
+			Encrypted: m.Encrypted,
 		})
 	}
 	// The Matrix API returns newest first; the tool contract is chronological.
@@ -225,6 +230,7 @@ func (s *Server) handleRecentTriggers(_ context.Context, _ *mcp.CallToolRequest,
 			RoomName:  t.RoomName,
 			Sender:    t.Sender,
 			Body:      t.Body,
+			MsgType:   t.MsgType,
 			Timestamp: t.Timestamp,
 		})
 	}
