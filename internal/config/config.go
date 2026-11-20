@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -22,8 +23,9 @@ const (
 )
 
 const (
-	defaultHTTPAddr     = ":8080"
-	defaultCryptoDBPath = "matrix-crypto.db"
+	defaultHTTPAddr         = ":8080"
+	defaultCryptoDBPath     = "matrix-crypto.db"
+	defaultBridgeAckTimeout = time.Second
 
 	// maxRoomIDLen is the Matrix spec's 255-byte cap on room IDs.
 	maxRoomIDLen = 255
@@ -65,6 +67,9 @@ type Config struct {
 	AllowedSendRooms []string
 	Transport        Transport
 	HTTPAddr         string
+	// BridgeAckTimeout is how long SendText waits for a bridge notice that
+	// reports the message was not bridged. Zero disables the wait.
+	BridgeAckTimeout time.Duration
 }
 
 // ReadOnly reports whether sending is disabled. It is true unless at least one
@@ -103,9 +108,9 @@ func ValidRoomID(roomID string) bool {
 
 // String implements fmt.Stringer with secrets redacted.
 func (c *Config) String() string {
-	return fmt.Sprintf("Config{Homeserver:%s UserID:%s AccessToken:%s E2EEEnabled:%t CryptoDBPath:%s PickleKey:%s TriggerWebhook:%s AllowedSendRooms:%d Transport:%s HTTPAddr:%s}",
+	return fmt.Sprintf("Config{Homeserver:%s UserID:%s AccessToken:%s E2EEEnabled:%t CryptoDBPath:%s PickleKey:%s TriggerWebhook:%s AllowedSendRooms:%d Transport:%s HTTPAddr:%s BridgeAckTimeout:%s}",
 		c.Homeserver, c.UserID, redact(c.AccessToken), c.E2EEEnabled, c.CryptoDBPath, redact(c.PickleKey),
-		redactURL(c.TriggerWebhook), len(c.AllowedSendRooms), c.Transport, c.HTTPAddr)
+		redactURL(c.TriggerWebhook), len(c.AllowedSendRooms), c.Transport, c.HTTPAddr, c.BridgeAckTimeout)
 }
 
 // GoString implements fmt.GoStringer so %#v cannot leak secrets either.
@@ -154,6 +159,8 @@ func LoadFrom(getenv func(string) string) (*Config, error) {
 		PickleKey:    get("MATRIX_PICKLE_KEY"),
 		Transport:    TransportStdio,
 		HTTPAddr:     defaultHTTPAddr,
+
+		BridgeAckTimeout: defaultBridgeAckTimeout,
 	}
 
 	if cfg.Homeserver != "" && !validHTTPURL(cfg.Homeserver) {
@@ -176,6 +183,15 @@ func LoadFrom(getenv func(string) string) (*Config, error) {
 		}
 		if cfg.CryptoDBPath == "" {
 			cfg.CryptoDBPath = defaultCryptoDBPath
+		}
+	}
+
+	if v := get("MATRIX_BRIDGE_ACK_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 {
+			fail("MATRIX_BRIDGE_ACK_TIMEOUT", ErrInvalid, "must be a Go duration such as 1s or 500ms, or 0 to disable")
+		} else {
+			cfg.BridgeAckTimeout = d
 		}
 	}
 

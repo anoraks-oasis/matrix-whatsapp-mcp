@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 // domainlessRoomID has the shape the live WhatsApp bridge hands out: no
@@ -82,6 +83,49 @@ func TestValidRoomID(t *testing.T) {
 	for _, roomID := range invalid {
 		if ValidRoomID(roomID) {
 			t.Errorf("ValidRoomID(%q) = true, want false", roomID)
+		}
+	}
+}
+
+func TestLoadBridgeAckTimeout(t *testing.T) {
+	cfg, err := LoadFrom(minimalEnv(nil))
+	if err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	if cfg.BridgeAckTimeout != time.Second {
+		t.Fatalf("default BridgeAckTimeout = %v, want 1s", cfg.BridgeAckTimeout)
+	}
+
+	for raw, want := range map[string]time.Duration{
+		"0":     0,
+		"250ms": 250 * time.Millisecond,
+		"2s":    2 * time.Second,
+	} {
+		cfg, err := LoadFrom(minimalEnv(map[string]string{"MATRIX_BRIDGE_ACK_TIMEOUT": raw}))
+		if err != nil {
+			t.Fatalf("LoadFrom(MATRIX_BRIDGE_ACK_TIMEOUT=%q): %v", raw, err)
+		}
+		if cfg.BridgeAckTimeout != want {
+			t.Fatalf("BridgeAckTimeout for %q = %v, want %v", raw, cfg.BridgeAckTimeout, want)
+		}
+	}
+
+	for _, raw := range []string{"abc", "-1s", "5", "1s500", "two seconds"} {
+		_, err := LoadFrom(minimalEnv(map[string]string{"MATRIX_BRIDGE_ACK_TIMEOUT": raw}))
+		if err == nil {
+			t.Fatalf("LoadFrom(MATRIX_BRIDGE_ACK_TIMEOUT=%q) = nil error, want a typed config error", raw)
+		}
+		var verr *VarError
+		if !errors.As(err, &verr) || verr.Var != "MATRIX_BRIDGE_ACK_TIMEOUT" {
+			t.Fatalf("LoadFrom(MATRIX_BRIDGE_ACK_TIMEOUT=%q) = %v, want a MATRIX_BRIDGE_ACK_TIMEOUT VarError", raw, err)
+		}
+	}
+
+	// The message names the variable but never echoes the rejected value.
+	for _, raw := range []string{"abc", "-1s", "1s500", "two seconds"} {
+		_, err := LoadFrom(minimalEnv(map[string]string{"MATRIX_BRIDGE_ACK_TIMEOUT": raw}))
+		if strings.Contains(err.Error(), raw) {
+			t.Fatalf("config error for %q echoes the value: %v", raw, err)
 		}
 	}
 }
