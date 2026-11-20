@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -241,5 +242,66 @@ func TestInviteAllowedWithEmptyAllowlist(t *testing.T) {
 	}
 	if !cfg.InviteAllowed("@anyone:anywhere.example") {
 		t.Fatal("InviteAllowed with an empty allow-list = false, want true (accept from anyone)")
+	}
+}
+
+// TestConfigStringRedactsSecrets pins the redaction safety net: a config that
+// is logged or printed with %v, %+v or %#v must never carry the access token,
+// the pickle key or the webhook URL, which is why String and GoString exist and
+// neither fmt verb can reach the struct's fields directly.
+func TestConfigStringRedactsSecrets(t *testing.T) {
+	const (
+		token     = "syt_access_token_value_that_must_not_leak"
+		pickleKey = "pickle-key-value-that-must-not-leak"
+		webhook   = "https://hooks.example.com/services/T000/B000/secret-path"
+	)
+	cfg := &Config{
+		Homeserver:     "https://matrix.example.com",
+		UserID:         "@bot:example.com",
+		AccessToken:    token,
+		E2EEEnabled:    true,
+		CryptoDBPath:   "matrix-crypto.db",
+		PickleKey:      pickleKey,
+		TriggerWebhook: webhook,
+	}
+
+	renderings := map[string]string{
+		"String":     cfg.String(),
+		"fmt %v":     fmt.Sprintf("%v", cfg),
+		"fmt %+v":    fmt.Sprintf("%+v", cfg),
+		"GoString":   cfg.GoString(),
+		"fmt %#v":    fmt.Sprintf("%#v", cfg),
+		"in a value": fmt.Sprint("config: ", cfg),
+	}
+	for verb, got := range renderings {
+		for _, secret := range []string{token, pickleKey, webhook, "secret-path"} {
+			if strings.Contains(got, secret) {
+				t.Fatalf("%s leaked %q: %s", verb, secret, got)
+			}
+		}
+	}
+
+	// The redaction has to be visible too: a rendering that dropped the fields
+	// entirely would pass the checks above while telling a reader nothing.
+	rendered := cfg.String()
+	if strings.Count(rendered, "<redacted>") != 2 || !strings.Contains(rendered, "<set>") {
+		t.Fatalf("String() = %s, want the token and pickle key marked <redacted> and the webhook <set>", rendered)
+	}
+	if !strings.Contains(rendered, cfg.Homeserver) || !strings.Contains(rendered, cfg.UserID) {
+		t.Fatalf("String() = %s, want the non-secret fields readable", rendered)
+	}
+}
+
+// TestConfigStringMarksUnsetSecrets covers the other half of the contract: an
+// unset secret reads as unset rather than as an empty field a reader could
+// mistake for a redacted one.
+func TestConfigStringMarksUnsetSecrets(t *testing.T) {
+	cfg := &Config{Homeserver: "https://matrix.example.com"}
+	rendered := cfg.String()
+	if !strings.Contains(rendered, "AccessToken:<unset>") {
+		t.Fatalf("String() = %s, want an unset token marked <unset>", rendered)
+	}
+	if !strings.Contains(rendered, "PickleKey:<unset>") {
+		t.Fatalf("String() = %s, want an unset pickle key marked <unset>", rendered)
 	}
 }

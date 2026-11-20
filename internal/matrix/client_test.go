@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -1690,4 +1691,31 @@ func eventIDs(msgs []Message) []string {
 		out = append(out, m.EventID)
 	}
 	return out
+}
+
+// TestIsFatal covers the sync loop's stop condition. A revoked or missing token
+// and a token that belongs to another user stop the loop for good; everything
+// else — a network blip, a rate limit, a plain cancellation — is retried.
+func TestIsFatal(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"M_UNKNOWN_TOKEN", mautrix.MUnknownToken, true},
+		{"M_UNKNOWN_TOKEN wrapped", fmt.Errorf("matrix: whoami: %w", mautrix.MUnknownToken), true},
+		{"M_MISSING_TOKEN", mautrix.MMissingToken, true},
+		{"M_MISSING_TOKEN wrapped", fmt.Errorf("matrix: whoami: %w", mautrix.MMissingToken), true},
+		{"ErrUserMismatch", ErrUserMismatch, true},
+		{"ErrUserMismatch wrapped", fmt.Errorf("matrix: whoami: %w", ErrUserMismatch), true},
+		{"M_FORBIDDEN", mautrix.MForbidden, false},
+		{"M_LIMIT_EXCEEDED", mautrix.MLimitExceeded, false},
+		{"network error", errors.New("dial tcp: connection refused"), false},
+		{"cancelled", context.Canceled, false},
+		{"nil", nil, false},
+	} {
+		if got := isFatal(tc.err); got != tc.want {
+			t.Fatalf("%s: isFatal(%v) = %t, want %t", tc.name, tc.err, got, tc.want)
+		}
+	}
 }
