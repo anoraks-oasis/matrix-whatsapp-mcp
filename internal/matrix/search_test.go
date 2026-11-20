@@ -444,3 +444,62 @@ func TestSearchHonoursCancellation(t *testing.T) {
 		t.Fatalf("SearchMessages error = %v, want the context error", err)
 	}
 }
+
+// TestSearchFallbackNamesOnlyBudgetedRooms is R2's regression: the room budget
+// must be applied to the joined room list before any room is named, so 40
+// joined rooms cost at most SearchMaxRooms name lookups rather than one per
+// room.
+func TestSearchFallbackNamesOnlyBudgetedRooms(t *testing.T) {
+	const joined = 40
+	ids := make([]string, 0, joined)
+	for i := 0; i < joined; i++ {
+		ids = append(ids, `"!r`+itoa(int64(i))+`:test"`)
+	}
+
+	var nameLookups, messagePages atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/search"):
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{"errcode":"M_UNRECOGNIZED"}`)
+		case strings.HasSuffix(r.URL.Path, "/joined_rooms"):
+			io.WriteString(w, `{"joined_rooms":[`+strings.Join(ids, ",")+`]}`)
+		case strings.Contains(r.URL.Path, "/state/m.room.name"):
+			nameLookups.Add(1)
+			room := strings.Split(strings.TrimPrefix(r.URL.Path, "/_matrix/client/v3/rooms/"), "/state/")[0]
+			io.WriteString(w, `{"name":"Name of `+room+`"}`)
+		case strings.Contains(r.URL.Path, "/messages"):
+			messagePages.Add(1)
+			io.WriteString(w, `{"chunk":[`+textEvent("$hit", 100, "needle")+`],"end":""}`)
+		default:
+			t.Errorf("unexpected request %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c, err := New(testConfig(srv.URL), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := c.SearchMessages(context.Background(), SearchRequest{Query: "needle", Limit: 5})
+	if err != nil {
+		t.Fatalf("SearchMessages: %v", err)
+	}
+	if got := nameLookups.Load(); got > SearchMaxRooms {
+		t.Fatalf("named %d rooms for a %d-room account, want at most the %d-room budget", got, joined, SearchMaxRooms)
+	}
+	if got := messagePages.Load(); got != SearchMaxRooms {
+		t.Fatalf("/messages requests = %d, want the %d-room budget", got, SearchMaxRooms)
+	}
+	if out.ScannedRooms != SearchMaxRooms {
+		t.Fatalf("scanned rooms = %d, want %d", out.ScannedRooms, SearchMaxRooms)
+	}
+	if !out.Truncated {
+		t.Fatal("truncated = false: the room budget cut the scan and the answer must say so")
+	}
+	if len(out.Hits) == 0 || !strings.HasPrefix(out.Hits[0].RoomName, "Name of !r") {
+		t.Fatalf("hits = %+v, want them labelled with the names that were resolved", out.Hits)
+	}
+}

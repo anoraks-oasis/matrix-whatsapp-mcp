@@ -392,13 +392,39 @@ func (c *Client) IsBridged(ctx context.Context, roomID string) bool {
 
 // JoinedRooms implements MatrixService.
 func (c *Client) JoinedRooms(ctx context.Context) ([]Room, error) {
+	ids, err := c.joinedRoomIDs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rooms, err := c.nameRooms(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(rooms, func(i, j int) bool {
+		if rooms[i].Name != rooms[j].Name {
+			return rooms[i].Name < rooms[j].Name
+		}
+		return rooms[i].ID < rooms[j].ID
+	})
+	return rooms, nil
+}
+
+// joinedRoomIDs lists the account's joined rooms without resolving any name,
+// so a caller that will only look at some of them can apply its budget first.
+func (c *Client) joinedRoomIDs(ctx context.Context) ([]id.RoomID, error) {
 	resp, err := c.cli.JoinedRooms(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("matrix: list joined rooms: %w", err)
 	}
+	return resp.JoinedRooms, nil
+}
+
+// nameRooms resolves a display name for every room in ids that is not cached
+// yet, nameFetchParallel at a time, and returns them in the order given.
+func (c *Client) nameRooms(ctx context.Context, ids []id.RoomID) ([]Room, error) {
 	sem := make(chan struct{}, nameFetchParallel)
 	var wg sync.WaitGroup
-	for _, rid := range resp.JoinedRooms {
+	for _, rid := range ids {
 		if _, ok := c.knownName(rid.String()); ok {
 			continue
 		}
@@ -416,16 +442,10 @@ func (c *Client) JoinedRooms(ctx context.Context) ([]Room, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	rooms := make([]Room, 0, len(resp.JoinedRooms))
-	for _, rid := range resp.JoinedRooms {
+	rooms := make([]Room, 0, len(ids))
+	for _, rid := range ids {
 		rooms = append(rooms, Room{ID: rid.String(), Name: c.RoomName(rid.String())})
 	}
-	sort.Slice(rooms, func(i, j int) bool {
-		if rooms[i].Name != rooms[j].Name {
-			return rooms[i].Name < rooms[j].Name
-		}
-		return rooms[i].ID < rooms[j].ID
-	})
 	return rooms, nil
 }
 

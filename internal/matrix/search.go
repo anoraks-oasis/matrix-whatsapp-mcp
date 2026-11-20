@@ -26,7 +26,9 @@ const (
 
 const (
 	// SearchMaxRooms is how many rooms the fallback scan reads when the caller
-	// did not name one. Rooms are taken in the name order JoinedRooms returns.
+	// did not name one. The budget applies to the joined room list before any
+	// room is named, so a large account costs the budget in name lookups, not
+	// one lookup per joined room.
 	SearchMaxRooms = 10
 	// SearchEventsPerRoom is how many messages the fallback scan reads from
 	// each room, and so also the total it can read: SearchMaxRooms × this.
@@ -174,7 +176,7 @@ func (c *Client) indexSearch(ctx context.Context, req SearchRequest) (SearchOutc
 // scanSearch is the fallback: it reads the newest SearchEventsPerRoom messages
 // of at most SearchMaxRooms rooms and matches them in this process.
 func (c *Client) scanSearch(ctx context.Context, req SearchRequest) (SearchOutcome, error) {
-	rooms, err := c.searchRooms(ctx, req.RoomID)
+	rooms, roomBudgetCut, err := c.scanRooms(ctx, req.RoomID)
 	if err != nil {
 		return SearchOutcome{}, err
 	}
@@ -182,14 +184,10 @@ func (c *Client) scanSearch(ctx context.Context, req SearchRequest) (SearchOutco
 	out := SearchOutcome{Source: SearchSourceScan}
 	terms := strings.Fields(strings.ToLower(req.Query))
 	hits := make([]SearchHit, 0, req.Limit)
-	truncated := false
-	for i, room := range rooms {
-		if i >= SearchMaxRooms {
-			// More rooms were eligible than the budget allows, so this search
-			// did not look at everything.
-			truncated = true
-			break
-		}
+	// More joined rooms were eligible than the room budget allows, so this
+	// search did not look at everything it was asked to search.
+	truncated := roomBudgetCut
+	for _, room := range rooms {
 		if err := ctx.Err(); err != nil {
 			return SearchOutcome{}, err
 		}
@@ -234,22 +232,38 @@ func (c *Client) scanSearch(ctx context.Context, req SearchRequest) (SearchOutco
 	return out, nil
 }
 
-// searchRooms resolves the rooms a scan covers: the one the caller named, or
-// every joined room. Names come from JoinedRooms (which resolves them) or from
-// the cache; a name is never invented.
-func (c *Client) searchRooms(ctx context.Context, roomID string) ([]Room, error) {
-	if roomID == "" {
-		return c.JoinedRooms(ctx)
+// scanRooms resolves the rooms a scan covers: the one the caller named, or at
+// most SearchMaxRooms of the joined rooms. The room budget is applied to the
+// joined list before any room is named, so the number of name lookups is
+// bounded by the budget rather than by the size of the account. Names come from
+// the cache or from the room's own name state event; a name is never invented.
+// The second result reports whether the room budget cut the scan short.
+func (c *Client) scanRooms(ctx context.Context, roomID string) ([]Room, bool, error) {
+	if roomID != "" {
+		if !config.ValidRoomID(roomID) {
+			return nil, false, ErrInvalidRoomID
+		}
+		// One room is cheap to name even when the cache was not seeded yet, and
+		// a hit whose room_name is just its room ID is much less useful.
+		nameCtx, cancel := context.WithTimeout(ctx, nameFetchTimeout)
+		c.fetchName(nameCtx, roomID)
+		cancel()
+		return []Room{{ID: roomID, Name: c.RoomName(roomID)}}, false, nil
 	}
-	if !config.ValidRoomID(roomID) {
-		return nil, ErrInvalidRoomID
+
+	ids, err := c.joinedRoomIDs(ctx)
+	if err != nil {
+		return nil, false, err
 	}
-	// One room is cheap to name even when the cache was not seeded yet, and a
-	// hit whose room_name is just its room ID is much less useful.
-	nameCtx, cancel := context.WithTimeout(ctx, nameFetchTimeout)
-	c.fetchName(nameCtx, roomID)
-	cancel()
-	return []Room{{ID: roomID, Name: c.RoomName(roomID)}}, nil
+	cut := len(ids) > SearchMaxRooms
+	if cut {
+		ids = ids[:SearchMaxRooms]
+	}
+	rooms, err := c.nameRooms(ctx, ids)
+	if err != nil {
+		return nil, false, err
+	}
+	return rooms, cut, nil
 }
 
 // matchesTerms reports whether every lowercased term appears in body. The scan
