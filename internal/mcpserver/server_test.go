@@ -3,6 +3,9 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"log"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -10,6 +13,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/allowlist"
 	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/matrix"
 	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/trigger"
 )
@@ -598,5 +602,73 @@ func TestSendGateEmptyAllowlistRejects(t *testing.T) {
 		t.Fatal("send with empty allowlist succeeded, want read-only error")
 	} else if !strings.Contains(err.Error(), "read-only") {
 		t.Fatalf("empty allowlist error = %v, want read-only", err)
+	}
+}
+
+// TestSendGateFollowsAllowlistFile proves the live allowlist: a room enrolled
+// by writing the file (which is what `rooms allow` does) becomes sendable in
+// the running server, and removing it revokes that, with no restart.
+func TestSendGateFollowsAllowlistFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "allow.txt")
+	store := allowlist.New(nil, path, log.New(io.Discard, "", 0), allowlist.WithMinInterval(0))
+	svc := &fakeMatrix{sentID: "$sent"}
+	srv := NewWithAllowlist(svc, &fakeProber{}, &fakeRecent{}, store)
+	session, cleanup := connect(t, srv)
+	defer cleanup()
+
+	send := func(t *testing.T) *mcp.CallToolResult {
+		t.Helper()
+		res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+			Name:      "send_message",
+			Arguments: map[string]any{"room_id": "!enrolled:test", "text": "hello"},
+		})
+		if err != nil {
+			t.Fatalf("send_message: %v", err)
+		}
+		return res
+	}
+
+	res := send(t)
+	if text := resultErrorText(t, res); !strings.Contains(text, "read-only") {
+		t.Fatalf("send before enrollment = %q, want a read-only error", text)
+	}
+
+	if _, err := allowlist.Add(path, "!enrolled:test"); err != nil {
+		t.Fatalf("allowlist.Add: %v", err)
+	}
+	res = send(t)
+	if res.IsError {
+		t.Fatalf("send after enrollment = %q, want success", resultErrorText(t, res))
+	}
+	if got := decodeStructured[sendMessageResult](t, res); got.EventID != "$sent" {
+		t.Fatalf("send after enrollment returned %q, want $sent", got.EventID)
+	}
+
+	if _, err := allowlist.Remove(path, "!enrolled:test"); err != nil {
+		t.Fatalf("allowlist.Remove: %v", err)
+	}
+	res = send(t)
+	if !res.IsError || !strings.Contains(resultErrorText(t, res), "read-only") {
+		t.Fatalf("send after denial = %+v, want a read-only error", res)
+	}
+}
+
+// TestSendGateUnionOfEnvAndFile keeps ALLOWED_SEND_ROOMS working alongside the
+// file: neither source alone decides, and a room present in both is allowed.
+func TestSendGateUnionOfEnvAndFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "allow.txt")
+	if _, err := allowlist.Add(path, "!file:test"); err != nil {
+		t.Fatalf("allowlist.Add: %v", err)
+	}
+	store := allowlist.New([]string{"!env:test"}, path, log.New(io.Discard, "", 0), allowlist.WithMinInterval(0))
+	gate := newSendGateWith(store, 0)
+
+	for _, room := range []string{"!env:test", "!file:test"} {
+		if err := gate.check(room); err != nil {
+			t.Fatalf("check(%q) = %v, want nil", room, err)
+		}
+	}
+	if err := gate.check("!other:test"); err == nil || !strings.Contains(err.Error(), "not allowed") {
+		t.Fatalf("check of an unlisted room = %v, want a not-allowed error", err)
 	}
 }

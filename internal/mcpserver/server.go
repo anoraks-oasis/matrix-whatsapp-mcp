@@ -14,6 +14,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/allowlist"
 	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/matrix"
 	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/trigger"
 )
@@ -60,14 +61,21 @@ type Server struct {
 }
 
 // New builds the MCP server with its four tools wired to the given Matrix
-// service, room prober and trigger reader. allowed is the send allow-list; an
-// empty list keeps the server read-only (every send is rejected).
+// service, room prober and trigger reader. allowed is a fixed send allow-list;
+// an empty list keeps the server read-only (every send is rejected). Use
+// NewWithAllowlist for the live allow-list the running server reads.
 func New(svc matrix.MatrixService, prober RoomProber, recent TriggerReader, allowed []string) *mcp.Server {
+	return NewWithAllowlist(svc, prober, recent, allowlist.FromSlice(allowed))
+}
+
+// NewWithAllowlist is New against a live allow-list source, so a room added by
+// `matrix-whatsapp-mcp rooms allow` becomes sendable without a restart.
+func NewWithAllowlist(svc matrix.MatrixService, prober RoomProber, recent TriggerReader, allow allowlist.List) *mcp.Server {
 	s := &Server{
 		matrix: svc,
 		prober: prober,
 		recent: recent,
-		gate:   newSendGate(allowed, sendInterval),
+		gate:   newSendGateWith(allow, sendInterval),
 	}
 
 	mcpServer := mcp.NewServer(&mcp.Implementation{Name: Name, Version: Version}, &mcp.ServerOptions{
@@ -270,7 +278,7 @@ func boolPtr(b bool) *bool { return &b }
 // all rooms. It is the unit of allow-list and rate-limit logic that Phase D
 // tests directly, with no homeserver in the loop.
 type sendGate struct {
-	allowed  map[string]struct{}
+	allow    allowlist.List
 	interval time.Duration
 	now      func() time.Time
 
@@ -279,23 +287,22 @@ type sendGate struct {
 }
 
 var (
-	errReadOnly       = errors.New("sending is disabled: ALLOWED_SEND_ROOMS is empty (read-only mode)")
+	errReadOnly       = errors.New("sending is disabled: ALLOWED_SEND_ROOMS and the allowlist file are both empty (read-only mode)")
 	errRoomNotAllowed = errors.New("sending to this room is not allowed")
 	errRateLimited    = errors.New("rate limited")
 )
 
-// newSendGate builds a sendGate from the allowed room set. The token bucket
-// holds a single token and refills it every interval.
+// newSendGate builds a sendGate over a fixed room set. The token bucket holds a
+// single token and refills it every interval.
 func newSendGate(allowed []string, interval time.Duration) *sendGate {
-	g := &sendGate{
-		allowed:  make(map[string]struct{}, len(allowed)),
-		interval: interval,
-		now:      time.Now,
-	}
-	for _, r := range allowed {
-		g.allowed[r] = struct{}{}
-	}
-	return g
+	return newSendGateWith(allowlist.FromSlice(allowed), interval)
+}
+
+// newSendGateWith builds a sendGate over a live allowlist. The list is consulted
+// per send, and it is cheap to do so: the file behind it is re-read at most once
+// per second.
+func newSendGateWith(allow allowlist.List, interval time.Duration) *sendGate {
+	return &sendGate{allow: allow, interval: interval, now: time.Now}
 }
 
 // check validates the room against the allow-list and acquires the single
@@ -304,10 +311,10 @@ func newSendGate(allowed []string, interval time.Duration) *sendGate {
 // the token. When throttled it returns an error naming the retry delay in
 // seconds rather than blocking past the deadline.
 func (g *sendGate) check(roomID string) error {
-	if len(g.allowed) == 0 {
+	if len(g.allow.Rooms()) == 0 {
 		return errReadOnly
 	}
-	if _, ok := g.allowed[roomID]; !ok {
+	if !g.allow.Allowed(roomID) {
 		return fmt.Errorf("%w: %s", errRoomNotAllowed, roomID)
 	}
 	g.mu.Lock()

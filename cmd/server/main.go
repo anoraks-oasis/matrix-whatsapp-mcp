@@ -93,7 +93,7 @@ func run(log *log.Logger) error {
 
 	dispatcher.Start(ctx)
 
-	mcpServer := mcpserver.New(matrixClient, matrixClient, dispatcher, cfg.AllowedSendRooms)
+	mcpServer := mcpserver.NewWithAllowlist(matrixClient, matrixClient, dispatcher, matrixClient.Allowlist())
 
 	switch cfg.Transport {
 	case config.TransportStdio:
