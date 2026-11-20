@@ -45,18 +45,30 @@ type Room struct {
 // when the parent is outside the page the caller asked for, so a reply is never
 // orphaned. A redacted message keeps its place in the stream with Redacted true
 // and an empty Body: the deleted text is never returned.
+//
+// MimeType, Filename, SizeBytes, Width, Height, DurationMS and MXCURI describe
+// an attachment. They are filled from content.url (plaintext media) or
+// content.file (encrypted media) plus content.info, and every one of them is
+// absent on a message that carries no attachment.
 type Message struct {
-	EventID   string   `json:"event_id"`
-	RoomID    string   `json:"room_id"`
-	Sender    string   `json:"sender"`
-	Body      string   `json:"body"`
-	MsgType   string   `json:"msgtype"`
-	Timestamp int64    `json:"timestamp"`
-	Encrypted bool     `json:"encrypted"`
-	ReplyTo   string   `json:"reply_to,omitempty"`
-	EditOf    string   `json:"edit_of,omitempty"`
-	Mentions  []string `json:"mentions,omitempty"`
-	Redacted  bool     `json:"redacted"`
+	EventID    string   `json:"event_id"`
+	RoomID     string   `json:"room_id"`
+	Sender     string   `json:"sender"`
+	Body       string   `json:"body"`
+	MsgType    string   `json:"msgtype"`
+	Timestamp  int64    `json:"timestamp"`
+	Encrypted  bool     `json:"encrypted"`
+	ReplyTo    string   `json:"reply_to,omitempty"`
+	EditOf     string   `json:"edit_of,omitempty"`
+	Mentions   []string `json:"mentions,omitempty"`
+	Redacted   bool     `json:"redacted"`
+	MimeType   string   `json:"mimetype,omitempty"`
+	Filename   string   `json:"filename,omitempty"`
+	SizeBytes  int64    `json:"size_bytes,omitempty"`
+	Width      int      `json:"width,omitempty"`
+	Height     int      `json:"height,omitempty"`
+	DurationMS int64    `json:"duration_ms,omitempty"`
+	MXCURI     string   `json:"mxc_uri,omitempty"`
 }
 
 // MessagePage is one page of a room's history, in the order the homeserver
@@ -92,6 +104,13 @@ type MatrixService interface {
 	// Participants lists the joined members of a room and marks the ones the
 	// WhatsApp bridge owns.
 	Participants(ctx context.Context, roomID string) ([]Participant, error)
+	// Media downloads the attachment of one event, decrypting it when it is
+	// encrypted and E2EE is enabled. Nothing is written to disk.
+	Media(ctx context.Context, roomID, eventID string) (MediaAttachment, error)
+	// SendMedia uploads one attachment and sends it as a single message of the
+	// type its MIME type implies. Like SendText it fails closed unless the room
+	// is allow-listed.
+	SendMedia(ctx context.Context, roomID string, media MediaUpload, caption, replyTo string) (MediaSendResult, error)
 	// Close releases resources. Cancel the Sync context first.
 	Close() error
 }
@@ -569,17 +588,25 @@ func (c *Client) convert(ctx context.Context, evt *event.Event) (Message, bool) 
 		return Message{}, false
 	}
 	replyTo, editOf, mentions := relationFields(msg)
+	att, _ := contentAttachment(msg)
 	return Message{
-		EventID:   evt.ID.String(),
-		RoomID:    evt.RoomID.String(),
-		Sender:    evt.Sender.String(),
-		Body:      placeholderBody(msg.MsgType, msg.Body),
-		MsgType:   string(msg.MsgType),
-		Timestamp: evt.Timestamp,
-		Encrypted: encrypted,
-		ReplyTo:   replyTo,
-		EditOf:    editOf,
-		Mentions:  mentions,
+		EventID:    evt.ID.String(),
+		RoomID:     evt.RoomID.String(),
+		Sender:     evt.Sender.String(),
+		Body:       placeholderBody(msg.MsgType, msg.Body),
+		MsgType:    string(msg.MsgType),
+		Timestamp:  evt.Timestamp,
+		Encrypted:  encrypted,
+		ReplyTo:    replyTo,
+		EditOf:     editOf,
+		Mentions:   mentions,
+		MimeType:   att.MimeType,
+		Filename:   att.Filename,
+		SizeBytes:  att.SizeBytes,
+		Width:      att.Width,
+		Height:     att.Height,
+		DurationMS: att.DurationMS,
+		MXCURI:     att.MXCURI,
 	}, true
 }
 
@@ -696,7 +723,7 @@ func (c *Client) SendText(ctx context.Context, roomID, text, replyTo string) (st
 	if replyTo != "" && !ValidEventID(replyTo) {
 		return "", ErrInvalidEventID
 	}
-	if err := c.prepareEncryption(ctx, id.RoomID(roomID)); err != nil {
+	if _, err := c.prepareEncryption(ctx, id.RoomID(roomID)); err != nil {
 		return "", err
 	}
 	content := &event.MessageEventContent{MsgType: event.MsgText, Body: text}
@@ -825,34 +852,36 @@ func sanitizeNotice(body string) string {
 }
 
 // prepareEncryption makes sure a message is never sent in plaintext into an
-// encrypted room. The initial sync is deliberately not processed (so history
-// never triggers anything), which means the state store does not know about
-// room encryption or membership until it is fetched here.
-func (c *Client) prepareEncryption(ctx context.Context, roomID id.RoomID) error {
+// encrypted room, and reports whether the room is encrypted so a caller that
+// carries media can encrypt the payload too. The initial sync is deliberately
+// not processed (so history never triggers anything), which means the state
+// store does not know about room encryption or membership until it is fetched
+// here.
+func (c *Client) prepareEncryption(ctx context.Context, roomID id.RoomID) (bool, error) {
 	var content event.EncryptionEventContent
 	err := c.cli.StateEvent(ctx, roomID, event.StateEncryption, "", &content)
 	if errors.Is(err, mautrix.MNotFound) {
-		return nil
+		return false, nil
 	}
 	if err != nil {
-		return fmt.Errorf("matrix: check room encryption: %w", err)
+		return false, fmt.Errorf("matrix: check room encryption: %w", err)
 	}
 	if c.crypto.Load() == nil || c.cli.StateStore == nil {
-		return ErrRoomEncrypted
+		return false, ErrRoomEncrypted
 	}
 	if err := c.cli.StateStore.SetEncryptionEvent(ctx, roomID, &content); err != nil {
-		return fmt.Errorf("matrix: record room encryption: %w", err)
+		return false, fmt.Errorf("matrix: record room encryption: %w", err)
 	}
 	fetched, err := c.cli.StateStore.HasFetchedMembers(ctx, roomID)
 	if err != nil {
-		return fmt.Errorf("matrix: check member cache: %w", err)
+		return false, fmt.Errorf("matrix: check member cache: %w", err)
 	}
 	if !fetched {
 		if _, err := c.cli.Members(ctx, roomID); err != nil {
-			return fmt.Errorf("matrix: fetch room members: %w", err)
+			return false, fmt.Errorf("matrix: fetch room members: %w", err)
 		}
 	}
-	return nil
+	return true, nil
 }
 
 // handleInvites accepts pending room invitations. It runs as a sync listener,
