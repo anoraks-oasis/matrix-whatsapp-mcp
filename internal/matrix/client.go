@@ -34,7 +34,9 @@ type Room struct {
 
 // Message is one m.room.message event. Timestamp is unix milliseconds. When
 // Encrypted is true and the event could not be decrypted, Body is a fixed
-// placeholder rather than ciphertext.
+// placeholder rather than ciphertext. A media event (m.image, m.video, ...)
+// that carries no text body gets a bracketed type marker such as "[image]" so
+// callers never see a silently blank message; see placeholderBody.
 type Message struct {
 	EventID   string `json:"event_id"`
 	RoomID    string `json:"room_id"`
@@ -87,6 +89,14 @@ const (
 	nameFetchTimeout  = 10 * time.Second
 	nameFetchParallel = 8
 	undecryptable     = "[encrypted message could not be decrypted]"
+
+	// maxMessagePages bounds how many /messages pages one Messages call walks
+	// backward while looking for enough convertible messages.
+	maxMessagePages = 10
+	// maxMessageRawFactor bounds the raw events scanned per requested message.
+	// A busy room is mostly membership, edit and reaction events, so a single
+	// page can yield almost no messages.
+	maxMessageRawFactor = 5
 )
 
 // Client is the mautrix-backed MatrixService.
@@ -299,7 +309,13 @@ func (c *Client) JoinedRooms(ctx context.Context) ([]Room, error) {
 	return rooms, nil
 }
 
-// Messages implements MatrixService. A limit outside 1..100 is clamped.
+// Messages implements MatrixService. A limit outside 1..100 is clamped. It
+// pages backward through /messages until it has limit convertible messages or
+// the room is exhausted, because the raw event stream is dominated by
+// membership, edit and reaction events that convert to nothing. Paging is
+// bounded by maxMessagePages and maxMessageRawFactor so a huge or noisy room
+// cannot make the call unbounded. Messages are returned in the order the
+// homeserver hands them out (newest first).
 func (c *Client) Messages(ctx context.Context, roomID string, limit int) ([]Message, error) {
 	if !config.ValidRoomID(roomID) {
 		return nil, ErrInvalidRoomID
@@ -310,16 +326,30 @@ func (c *Client) Messages(ctx context.Context, roomID string, limit int) ([]Mess
 	case limit > maxMsgLimit:
 		limit = maxMsgLimit
 	}
-	resp, err := c.cli.Messages(ctx, id.RoomID(roomID), "", "", mautrix.DirectionBackward, nil, limit)
-	if err != nil {
-		return nil, fmt.Errorf("matrix: fetch messages: %w", err)
-	}
-	out := make([]Message, 0, len(resp.Chunk))
-	for _, evt := range resp.Chunk {
-		evt.RoomID = id.RoomID(roomID)
-		if msg, ok := c.convert(ctx, evt); ok {
-			out = append(out, msg)
+
+	out := make([]Message, 0, limit)
+	rawBudget := maxMessageRawFactor * limit
+	from := ""
+	for page := 0; page < maxMessagePages && len(out) < limit && rawBudget > 0; page++ {
+		want := min(limit-len(out), rawBudget)
+		resp, err := c.cli.Messages(ctx, id.RoomID(roomID), from, "", mautrix.DirectionBackward, nil, want)
+		if err != nil {
+			return nil, fmt.Errorf("matrix: fetch messages: %w", err)
 		}
+		rawBudget -= len(resp.Chunk)
+		for _, evt := range resp.Chunk {
+			evt.RoomID = id.RoomID(roomID)
+			if msg, ok := c.convert(ctx, evt); ok {
+				out = append(out, msg)
+				if len(out) == limit {
+					break
+				}
+			}
+		}
+		if len(resp.Chunk) == 0 || resp.End == "" {
+			break
+		}
+		from = resp.End
 	}
 	return out, nil
 }
@@ -357,11 +387,28 @@ func (c *Client) convert(ctx context.Context, evt *event.Event) (Message, bool) 
 		EventID:   evt.ID.String(),
 		RoomID:    evt.RoomID.String(),
 		Sender:    evt.Sender.String(),
-		Body:      msg.Body,
+		Body:      placeholderBody(msg.MsgType, msg.Body),
 		MsgType:   string(msg.MsgType),
 		Timestamp: evt.Timestamp,
 		Encrypted: encrypted,
 	}, true
+}
+
+// placeholderBody substitutes a short bracketed marker for a media event that
+// carries no text body: bridges commonly send m.image/m.video/m.file events
+// with body "" (the caption, if any, is elsewhere), and an empty string reads
+// to an AI client as a blank message. The marker is derived from the msgtype
+// alone and never from the event's content; text-like bodies are returned
+// verbatim.
+func placeholderBody(msgtype event.MessageType, body string) string {
+	if body != "" {
+		return body
+	}
+	switch msgtype {
+	case event.MsgText, event.MsgNotice, event.MsgEmote, "":
+		return body
+	}
+	return "[" + strings.TrimPrefix(string(msgtype), "m.") + "]"
 }
 
 func (c *Client) decrypt(ctx context.Context, evt *event.Event) *event.Event {

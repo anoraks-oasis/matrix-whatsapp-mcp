@@ -420,3 +420,202 @@ func TestRoomIDValidation(t *testing.T) {
 		t.Fatalf("send paths = %v, want exactly one send to %s", paths, want)
 	}
 }
+
+// messagesRequest is one recorded /messages call.
+type messagesRequest struct {
+	from  string
+	limit string
+}
+
+// messagesServer serves scripted /messages pages. page(n) returns the raw chunk
+// JSON and the end token for request n; requests past the script fail the test.
+func messagesServer(t *testing.T, page func(n int) (chunk, end string)) (*httptest.Server, func() []messagesRequest) {
+	t.Helper()
+	var mu sync.Mutex
+	var reqs []messagesRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/messages") {
+			http.NotFound(w, r)
+			return
+		}
+		mu.Lock()
+		n := len(reqs)
+		reqs = append(reqs, messagesRequest{from: r.URL.Query().Get("from"), limit: r.URL.Query().Get("limit")})
+		mu.Unlock()
+		chunk, end := page(n)
+		io.WriteString(w, `{"chunk":[`+chunk+`],"end":"`+end+`"}`)
+	}))
+	return srv, func() []messagesRequest {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]messagesRequest(nil), reqs...)
+	}
+}
+
+func textEvent(id string, ts int64, body string) string {
+	return `{"type":"m.room.message","event_id":"` + id + `","sender":"@alice:test","origin_server_ts":` +
+		itoa(ts) + `,"content":{"msgtype":"m.text","body":"` + body + `"}}`
+}
+
+func memberEvent(id, user string) string {
+	return `{"type":"m.room.member","event_id":"` + id + `","sender":"` + user + `","state_key":"` + user +
+		`","origin_server_ts":1,"content":{"membership":"join"}}`
+}
+
+func itoa(n int64) string {
+	if n == 0 {
+		return "0"
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(buf[i:])
+}
+
+// TestMessagesPagesPastNonMessageEvents proves that Messages keeps paging
+// backward with the /messages end token until it has the requested number of
+// convertible messages: the live defect was a page full of member events
+// yielding fewer messages than asked for.
+func TestMessagesPagesPastNonMessageEvents(t *testing.T) {
+	srv, requests := messagesServer(t, func(n int) (string, string) {
+		switch n {
+		case 0:
+			return memberEvent("$j1", "@alice:test") + "," + textEvent("$m1", 100, "one") + "," +
+				memberEvent("$j2", "@bob:test") + "," + textEvent("$m2", 200, "two"), "page2"
+		case 1:
+			return textEvent("$m3", 300, "three") + "," + textEvent("$m4", 400, "four"), ""
+		default:
+			t.Errorf("unexpected /messages request %d", n+1)
+			return "", ""
+		}
+	})
+	defer srv.Close()
+
+	c, err := New(testConfig(srv.URL), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := c.Messages(context.Background(), "!r:test", 4)
+	if err != nil {
+		t.Fatalf("Messages: %v", err)
+	}
+	var got []string
+	for _, m := range msgs {
+		got = append(got, m.EventID)
+	}
+	want := []string{"$m1", "$m2", "$m3", "$m4"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("Messages = %v, want %v (server order, paged past member events)", got, want)
+	}
+
+	reqs := requests()
+	if len(reqs) != 2 {
+		t.Fatalf("/messages requests = %d (%+v), want 2", len(reqs), reqs)
+	}
+	if reqs[0].from != "" || reqs[0].limit != "4" {
+		t.Fatalf("first request = %+v, want from=\"\" limit=4", reqs[0])
+	}
+	if reqs[1].from != "page2" || reqs[1].limit != "2" {
+		t.Fatalf("second request = %+v, want from=page2 limit=2 (2 messages still missing)", reqs[1])
+	}
+}
+
+// TestMessagesPaginationIsBounded proves the two hard bounds: page count and
+// raw events scanned, so a room that converts nothing cannot make read_messages
+// walk forever.
+func TestMessagesPaginationIsBounded(t *testing.T) {
+	t.Run("page cap", func(t *testing.T) {
+		srv, requests := messagesServer(t, func(n int) (string, string) {
+			return memberEvent("$j"+itoa(int64(n)), "@alice:test"), "next" + itoa(int64(n))
+		})
+		defer srv.Close()
+
+		c, err := New(testConfig(srv.URL), testLogger())
+		if err != nil {
+			t.Fatal(err)
+		}
+		msgs, err := c.Messages(context.Background(), "!r:test", 2)
+		if err != nil {
+			t.Fatalf("Messages: %v", err)
+		}
+		if len(msgs) != 0 {
+			t.Fatalf("Messages = %+v, want none (only member events)", msgs)
+		}
+		if n := len(requests()); n != maxMessagePages {
+			t.Fatalf("/messages requests = %d, want %d (page cap)", n, maxMessagePages)
+		}
+	})
+
+	t.Run("raw event budget", func(t *testing.T) {
+		var chunk []string
+		for i := 0; i < 5; i++ {
+			chunk = append(chunk, memberEvent("$j"+itoa(int64(i)), "@alice:test"))
+		}
+		srv, requests := messagesServer(t, func(n int) (string, string) {
+			return strings.Join(chunk, ","), "next" + itoa(int64(n))
+		})
+		defer srv.Close()
+
+		c, err := New(testConfig(srv.URL), testLogger())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Messages(context.Background(), "!r:test", 2); err != nil {
+			t.Fatalf("Messages: %v", err)
+		}
+		want := (maxMessageRawFactor * 2) / 5
+		if n := len(requests()); n != want {
+			t.Fatalf("/messages requests = %d, want %d (raw event budget)", n, want)
+		}
+	})
+}
+
+// TestMessagesMediaPlaceholder covers the live media defect: a bridge sends
+// m.image with an empty body, which surfaced as a blank message.
+func TestMessagesMediaPlaceholder(t *testing.T) {
+	page := `{"type":"m.room.message","event_id":"$img","sender":"@wa:test","origin_server_ts":100,"content":{"msgtype":"m.image","body":""}},` +
+		`{"type":"m.room.message","event_id":"$txt","sender":"@wa:test","origin_server_ts":101,"content":{"msgtype":"m.text","body":"hello there"}},` +
+		`{"type":"m.room.message","event_id":"$cap","sender":"@wa:test","origin_server_ts":102,"content":{"msgtype":"m.image","body":"a caption"}},` +
+		`{"type":"m.room.message","event_id":"$file","sender":"@wa:test","origin_server_ts":103,"content":{"msgtype":"m.file","body":""}},` +
+		`{"type":"m.room.message","event_id":"$note","sender":"@wa:test","origin_server_ts":104,"content":{"msgtype":"m.notice","body":""}}`
+	srv, _ := messagesServer(t, func(int) (string, string) { return page, "" })
+	defer srv.Close()
+
+	c, err := New(testConfig(srv.URL), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := c.Messages(context.Background(), "!r:test", 10)
+	if err != nil {
+		t.Fatalf("Messages: %v", err)
+	}
+	if len(msgs) != 5 {
+		t.Fatalf("Messages returned %d messages, want 5", len(msgs))
+	}
+	wantBodies := map[string]string{
+		"$img":  "[image]",
+		"$txt":  "hello there",
+		"$cap":  "a caption",
+		"$file": "[file]",
+		"$note": "",
+	}
+	wantTypes := map[string]string{
+		"$img":  "m.image",
+		"$txt":  "m.text",
+		"$cap":  "m.image",
+		"$file": "m.file",
+		"$note": "m.notice",
+	}
+	for _, m := range msgs {
+		if m.Body != wantBodies[m.EventID] {
+			t.Errorf("%s body = %q, want %q", m.EventID, m.Body, wantBodies[m.EventID])
+		}
+		if m.MsgType != wantTypes[m.EventID] {
+			t.Errorf("%s msgtype = %q, want %q", m.EventID, m.MsgType, wantTypes[m.EventID])
+		}
+	}
+}
