@@ -110,8 +110,15 @@ func runDoctor(ctx context.Context, args []string, deps Deps) int {
 	if roomsErr != nil {
 		rep.check(statusFail, "joined rooms", roomsErr.Error())
 	} else {
-		bridged = probeBridged(ctx, svc, rooms)
-		rep.check(statusOK, "joined rooms", fmt.Sprintf("%d joined, %d bridged from WhatsApp", len(rooms), countTrue(bridged)))
+		probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+		var cut bool
+		bridged, cut = probeBridged(probeCtx, svc, rooms)
+		cancel()
+		detail := fmt.Sprintf("%d joined, %d bridged from WhatsApp", len(rooms), countTrue(bridged))
+		if cut {
+			detail += fmt.Sprintf("\nthe bridged check was cut off after %s, so some rooms were not probed", probeTimeout)
+		}
+		rep.check(statusOK, "joined rooms", detail)
 	}
 
 	store := newStore(cfg, logger)

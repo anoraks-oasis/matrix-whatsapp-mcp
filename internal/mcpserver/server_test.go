@@ -1478,3 +1478,90 @@ func TestSendMessageIdempotencyInFlightPastTTL(t *testing.T) {
 		t.Fatalf("matrix saw %d sends, want exactly 1 for one key across the ttl boundary", len(texts))
 	}
 }
+
+// deadlineProber records the deadline of every probe context it is handed, so a
+// test can prove the probe phase is bounded without waiting for the bound.
+type deadlineProber struct {
+	mu        sync.Mutex
+	remaining []time.Duration
+}
+
+func (p *deadlineProber) note(ctx context.Context) {
+	deadline, ok := ctx.Deadline()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !ok {
+		p.remaining = append(p.remaining, 0)
+		return
+	}
+	p.remaining = append(p.remaining, time.Until(deadline))
+}
+
+func (p *deadlineProber) IsBridged(ctx context.Context, _ string) bool {
+	p.note(ctx)
+	return false
+}
+
+func (p *deadlineProber) CanonicalAlias(ctx context.Context, _ string) string {
+	p.note(ctx)
+	return ""
+}
+
+func (p *deadlineProber) seen() []time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]time.Duration(nil), p.remaining...)
+}
+
+// TestListRoomsBoundsTheProbePhase is R8's list_rooms half: every probe runs
+// under one overall deadline, so a large account costs a bounded wait instead
+// of two sequential 10s requests per room. The tool description states that
+// bound, and its numbers come from the same constants as the code.
+func TestListRoomsBoundsTheProbePhase(t *testing.T) {
+	if listRoomsTimeout <= 0 {
+		t.Fatalf("listRoomsTimeout = %s, want a positive bound", listRoomsTimeout)
+	}
+	rooms := []matrix.Room{
+		{ID: "!a:test", Name: "Alpha"},
+		{ID: "!b:test"}, // unnamed, so the alias probe runs too
+	}
+	prober := &deadlineProber{}
+	srv := New(&fakeMatrix{rooms: rooms}, prober, &fakeRecent{}, nil)
+	session, cleanup := connect(t, srv)
+	defer cleanup()
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "list_rooms"})
+	if err != nil {
+		t.Fatalf("list_rooms: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("list_rooms returned error: %s", resultErrorText(t, res))
+	}
+	if got := decodeStructured[[]roomResult](t, res); len(got) != len(rooms) {
+		t.Fatalf("list_rooms returned %d rooms, want %d", len(got), len(rooms))
+	}
+
+	seen := prober.seen()
+	if len(seen) != 3 { // Alpha's bridged probe, plus the alias and bridged probe for !b:test
+		t.Fatalf("recorded %d probe contexts, want 3", len(seen))
+	}
+	for i, remaining := range seen {
+		if remaining <= 0 {
+			t.Fatalf("probe %d ran without a deadline: the probe phase is unbounded", i)
+		}
+		if remaining > listRoomsTimeout {
+			t.Fatalf("probe %d had %s left, want at most the %s bound", i, remaining, listRoomsTimeout)
+		}
+	}
+
+	tools, err := session.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("tools/list: %v", err)
+	}
+	desc := toolByName(t, tools.Tools, "list_rooms").Description
+	for _, want := range []string{fmt.Sprint(listProbeParallel), listRoomsTimeout.String(), "cut off"} {
+		if !strings.Contains(desc, want) {
+			t.Fatalf("list_rooms description = %q, want it to state %q", desc, want)
+		}
+	}
+}

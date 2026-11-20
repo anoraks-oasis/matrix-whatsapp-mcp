@@ -39,7 +39,13 @@ func listRooms(ctx context.Context, deps Deps) int {
 	if err != nil {
 		return fail(deps, fmt.Errorf("listing joined rooms: %w", err))
 	}
-	printRooms(deps.Stdout, rooms, probeBridged(ctx, env.rooms, rooms), env.allow)
+	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+	bridged, cut := probeBridged(probeCtx, env.rooms, rooms)
+	cancel()
+	printRooms(deps.Stdout, rooms, bridged, env.allow)
+	if cut {
+		fmt.Fprintf(deps.Stderr, "note: the bridged check was cut off after %s; rooms it did not reach are listed as not bridged\n", probeTimeout)
+	}
 	return exitOK
 }
 

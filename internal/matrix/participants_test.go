@@ -272,3 +272,53 @@ func TestIsBridgedFalseWithoutBridgeEvidence(t *testing.T) {
 		t.Fatal("IsBridged = true for a room with no bridge evidence")
 	}
 }
+
+// TestParticipantTimeoutsArePinned pins the shipped bounds: participantTimeout
+// is the only thing keeping a huge room from hanging list_participants, and the
+// per-profile fan-out is what keeps a room of unnamed members bounded. Both are
+// numbers a refactor could quietly change without any behavioural test failing.
+func TestParticipantTimeoutsArePinned(t *testing.T) {
+	if participantTimeout != 10*time.Second {
+		t.Fatalf("participantTimeout = %s, want 10s", participantTimeout)
+	}
+	if profileTimeout != 2*time.Second {
+		t.Fatalf("profileTimeout = %s, want 2s", profileTimeout)
+	}
+	if profileParallel != 8 {
+		t.Fatalf("profileParallel = %d, want 8", profileParallel)
+	}
+	if got := (&Client{}).participantDeadline; got != 0 {
+		t.Fatalf("zero Client.participantDeadline = %s, want 0 (New sets it)", got)
+	}
+}
+
+// TestParticipantsOwnDeadlineEndsTheCall is the behavioural half of the pin: a
+// homeserver that never answers /members must end the call at the call's own
+// deadline, not at the caller's. TestParticipantsHonoursCancellation only
+// exercises the caller's context.
+func TestParticipantsOwnDeadlineEndsTheCall(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	c, err := New(testConfig(srv.URL), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.participantDeadline = 100 * time.Millisecond
+
+	start := time.Now()
+	_, err = c.Participants(context.Background(), "!room:test")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("Participants returned no error from a homeserver that never answered")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Participants error = %v, want the call's own deadline", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("Participants took %s, want it bounded by the call's deadline", elapsed)
+	}
+}

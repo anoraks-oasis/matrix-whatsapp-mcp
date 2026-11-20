@@ -36,6 +36,12 @@ const (
 
 	// probeParallel bounds concurrent room probes for the bridged check.
 	probeParallel = 8
+	// probeTimeout bounds the bridged-probe phase of `rooms` and `doctor` as a
+	// whole. Each room costs up to two probes with a 10s network timeout each,
+	// so an unbounded phase would spend the 30s command budget on a large
+	// account and end in a context error with no table at all; cut off, the
+	// table still prints and the bridged column says it is partial.
+	probeTimeout = 20 * time.Second
 
 	nameWidth = 48
 	idWidth   = 80
@@ -190,8 +196,10 @@ func fail(deps Deps, err error) int {
 }
 
 // probeBridged resolves the bridged flag for every room, bounded to
-// probeParallel concurrent probes.
-func probeBridged(ctx context.Context, svc RoomService, rooms []matrix.Room) []bool {
+// probeParallel concurrent probes and to ctx. It reports whether ctx ended
+// before the probes could finish, so the caller can say the column is partial
+// instead of presenting an unprobed room as a confident "not bridged".
+func probeBridged(ctx context.Context, svc RoomService, rooms []matrix.Room) ([]bool, bool) {
 	bridged := make([]bool, len(rooms))
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, probeParallel)
@@ -205,7 +213,7 @@ func probeBridged(ctx context.Context, svc RoomService, rooms []matrix.Room) []b
 		}(i)
 	}
 	wg.Wait()
-	return bridged
+	return bridged, ctx.Err() != nil
 }
 
 func yesNo(b bool) string {

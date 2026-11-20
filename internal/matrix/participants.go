@@ -62,7 +62,7 @@ func (c *Client) Participants(ctx context.Context, roomID string) ([]Participant
 	if !config.ValidRoomID(roomID) {
 		return nil, ErrInvalidRoomID
 	}
-	callCtx, cancel := context.WithTimeout(ctx, participantTimeout)
+	callCtx, cancel := context.WithTimeout(ctx, c.participantDeadline)
 	defer cancel()
 
 	resp, err := c.cli.Members(callCtx, id.RoomID(roomID), mautrix.ReqMembers{Membership: event.MembershipJoin})

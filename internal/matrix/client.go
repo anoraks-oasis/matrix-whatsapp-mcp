@@ -213,6 +213,10 @@ type Client struct {
 	closed    bool
 	closeOnce sync.Once
 	closeErr  error
+	// participantDeadline is participantTimeout in production. Tests shorten it
+	// to exercise the call's own deadline, which no test otherwise reaches
+	// without sleeping for the shipped ten seconds.
+	participantDeadline time.Duration
 }
 
 var _ MatrixService = (*Client)(nil)
@@ -257,6 +261,8 @@ func New(cfg *config.Config, logger *log.Logger) (*Client, error) {
 		joining:  make(map[id.RoomID]struct{}),
 		bgCtx:    bgCtx,
 		bgCancel: bgCancel,
+
+		participantDeadline: participantTimeout,
 	}
 	syncer.OnEventType(event.StateRoomName, func(_ context.Context, evt *event.Event) {
 		if content, ok := evt.Content.Parsed.(*event.RoomNameEventContent); ok {

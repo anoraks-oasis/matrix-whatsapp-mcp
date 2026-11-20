@@ -44,6 +44,12 @@ const (
 	// check) run at once so list_rooms does not do room_count × 2 sequential
 	// network round-trips.
 	listProbeParallel = 8
+	// listRoomsTimeout bounds the whole probe phase of one list_rooms call.
+	// Each room costs up to two probes with a 10s network timeout each, so
+	// without an overall bound a large account would pay minutes on a call an
+	// agent makes casually. Past the bound the rooms are still listed, with
+	// the bridged flag false for the ones the probes did not reach.
+	listRoomsTimeout = 10 * time.Second
 )
 
 // RoomProber is the best-effort room detail probe backed by *matrix.Client.
@@ -102,8 +108,11 @@ func newServer(svc matrix.MatrixService, prober RoomProber, recent TriggerReader
 	})
 
 	mcp.AddTool(mcpServer, &mcp.Tool{
-		Name:        "list_rooms",
-		Description: "List every room the account has joined, with the resolved display name and whether it appears bridged from WhatsApp.",
+		Name: "list_rooms",
+		Description: fmt.Sprintf("List every room the account has joined, with the resolved display name and whether it appears bridged from WhatsApp. "+
+			"Room probes run %d at a time and the whole probe phase is cut off after %s, so a large account answers promptly: "+
+			"a room whose probes did not finish is still listed, with bridged false and the name the joined-rooms list carried.",
+			listProbeParallel, listRoomsTimeout),
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, s.handleListRooms)
 
@@ -292,6 +301,11 @@ func (s *Server) handleListRooms(ctx context.Context, _ *mcp.CallToolRequest, _ 
 
 	results := make([]roomResult, len(rooms))
 	sem := make(chan struct{}, listProbeParallel)
+	// The probe phase has its own deadline: every room costs up to two
+	// requests, so an unbounded phase would scale with the account. Past it,
+	// probeRoom's best-effort fallbacks fill the row in.
+	probeCtx, cancel := context.WithTimeout(ctx, listRoomsTimeout)
+	defer cancel()
 	var wg sync.WaitGroup
 	for i, r := range rooms {
 		wg.Add(1)
@@ -299,7 +313,7 @@ func (s *Server) handleListRooms(ctx context.Context, _ *mcp.CallToolRequest, _ 
 		go func(i int, r matrix.Room) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			results[i] = s.probeRoom(ctx, r)
+			results[i] = s.probeRoom(probeCtx, r)
 		}(i, r)
 	}
 	wg.Wait()

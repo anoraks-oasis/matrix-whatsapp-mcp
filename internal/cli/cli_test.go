@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 
 // fakeRooms is a RoomService with no homeserver behind it.
 type fakeRooms struct {
+	mu       sync.Mutex
 	rooms    []matrix.Room
 	roomsErr error
 	bridged  map[string]bool
@@ -26,11 +28,30 @@ type fakeRooms struct {
 	deviceID string
 	whoErr   error
 	closed   bool
+	// probeRemaining records, per bridged probe, how long its context had left;
+	// a probe without a deadline records 0.
+	probeRemaining []time.Duration
 }
 
 func (f *fakeRooms) JoinedRooms(context.Context) ([]matrix.Room, error) { return f.rooms, f.roomsErr }
 
-func (f *fakeRooms) IsBridged(_ context.Context, roomID string) bool { return f.bridged[roomID] }
+func (f *fakeRooms) IsBridged(ctx context.Context, roomID string) bool {
+	var remaining time.Duration
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining = time.Until(deadline)
+	}
+	f.mu.Lock()
+	f.probeRemaining = append(f.probeRemaining, remaining)
+	f.mu.Unlock()
+	return f.bridged[roomID]
+}
+
+// probes returns how long each bridged probe's context had left.
+func (f *fakeRooms) probes() []time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]time.Duration(nil), f.probeRemaining...)
+}
 
 func (f *fakeRooms) WhoAmI(context.Context) (string, string, error) {
 	return f.userID, f.deviceID, f.whoErr
@@ -570,4 +591,39 @@ func readFile(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(data)
+}
+
+// TestRoomsProbePhaseIsBounded is R8's CLI half: the bridged probes run under
+// one overall deadline, so a large account with a slow homeserver cannot spend
+// the whole 30s command budget probing and end with no table at all. Reaching
+// IsBridged without a deadline would mean the phase is unbounded again.
+func TestRoomsProbePhaseIsBounded(t *testing.T) {
+	if probeTimeout <= 0 || probeTimeout >= commandTimeout {
+		t.Fatalf("probeTimeout = %s, want it inside the %s command budget", probeTimeout, commandTimeout)
+	}
+
+	b := newBus(t)
+	b.svc.rooms = twoRooms()
+	if code := b.run(t, "rooms"); code != exitOK {
+		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, b.errOut.String())
+	}
+
+	probes := b.svc.probes()
+	if len(probes) != len(twoRooms()) {
+		t.Fatalf("recorded %d bridged probes for %d rooms, want one per room", len(probes), len(twoRooms()))
+	}
+	for i, remaining := range probes {
+		if remaining <= 0 {
+			t.Fatalf("probe %d ran without a deadline, want the probe phase bounded", i)
+		}
+		// The command's own 30s deadline reaches this context too, so the bound
+		// under test is the shorter one: anything above it means the phase is
+		// running on the command budget alone.
+		if remaining > probeTimeout {
+			t.Fatalf("probe %d had %s left, want at most the %s probe bound", i, remaining, probeTimeout)
+		}
+	}
+	if strings.Contains(b.errOut.String(), "cut off") {
+		t.Fatalf("stderr = %q, want no cut-off note when every probe finished", b.errOut.String())
+	}
 }
