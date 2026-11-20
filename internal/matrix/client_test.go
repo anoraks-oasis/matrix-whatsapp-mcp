@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode"
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
@@ -617,5 +618,176 @@ func TestMessagesMediaPlaceholder(t *testing.T) {
 		if m.MsgType != wantTypes[m.EventID] {
 			t.Errorf("%s msgtype = %q, want %q", m.EventID, m.MsgType, wantTypes[m.EventID])
 		}
+	}
+}
+
+// bridgeAckServer is a fake homeserver for the bridge-ack guard. sendEvent is
+// the event ID returned by the send endpoint; messages is the JSON chunk served
+// by /messages (empty string serves an empty chunk).
+type bridgeAckServer struct {
+	mu       sync.Mutex
+	messages []string
+	sends    int
+	polls    int
+}
+
+func (b *bridgeAckServer) setMessages(chunk string) {
+	b.mu.Lock()
+	b.messages = []string{chunk}
+	b.mu.Unlock()
+}
+
+func (b *bridgeAckServer) counts() (sends, polls int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.sends, b.polls
+}
+
+func (b *bridgeAckServer) start(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/state/m.room.encryption"):
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{"errcode":"M_NOT_FOUND","error":"Not found"}`)
+		case strings.Contains(r.URL.Path, "/send/m.room.message/"):
+			b.mu.Lock()
+			b.sends++
+			b.mu.Unlock()
+			io.WriteString(w, `{"event_id":"$send1"}`)
+		case strings.Contains(r.URL.Path, "/messages"):
+			b.mu.Lock()
+			b.polls++
+			chunk := ""
+			if len(b.messages) > 0 {
+				chunk = b.messages[0]
+			}
+			b.mu.Unlock()
+			io.WriteString(w, `{"chunk":[`+chunk+`],"end":""}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func testConfigWithAck(homeserver string, ack time.Duration, allowed ...string) *config.Config {
+	cfg := testConfig(homeserver, allowed...)
+	cfg.BridgeAckTimeout = ack
+	return cfg
+}
+
+// TestSendTextBridgeNoticeFailsClosed reproduces the live hole: Matrix accepts
+// the event, the bridge then posts a notice relating to it, and the caller must
+// see a failure rather than a delivered-looking success.
+func TestSendTextBridgeNoticeFailsClosed(t *testing.T) {
+	fake := &bridgeAckServer{}
+	fake.setMessages(`{"type":"m.room.message","event_id":"$n1","sender":"@whatsappbot:test","origin_server_ts":2,` +
+		`"content":{"msgtype":"m.notice","body":"⚠️ Your message was not bridged: You're not logged in\n(relay not set)\u001b[0m",` +
+		`"m.relates_to":{"rel_type":"m.reference","event_id":"$send1"}}}`)
+	srv := fake.start(t)
+
+	c, err := New(testConfigWithAck(srv.URL, 250*time.Millisecond, "!ok:test"), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	eventID, err := c.SendText(context.Background(), "!ok:test", "hello world")
+	if err == nil {
+		t.Fatalf("SendText = %q, nil; want a bridge rejection error", eventID)
+	}
+	if !errors.Is(err, ErrNotBridged) {
+		t.Fatalf("SendText error = %v, want it to match ErrNotBridged", err)
+	}
+	var noticeErr *BridgeNoticeError
+	if !errors.As(err, &noticeErr) {
+		t.Fatalf("SendText error %v is not a *BridgeNoticeError", err)
+	}
+	if noticeErr.EventID != "$send1" {
+		t.Fatalf("BridgeNoticeError.EventID = %q, want $send1", noticeErr.EventID)
+	}
+	if !strings.Contains(noticeErr.Notice, "Your message was not bridged") || !strings.Contains(noticeErr.Notice, "(relay not set)") {
+		t.Fatalf("BridgeNoticeError.Notice = %q, want the bridge's notice text", noticeErr.Notice)
+	}
+	if strings.ContainsAny(noticeErr.Notice, "\n\r\t") || strings.ContainsFunc(noticeErr.Notice, unicode.IsControl) {
+		t.Fatalf("BridgeNoticeError.Notice = %q, want a single line with no control characters", noticeErr.Notice)
+	}
+	if msg := err.Error(); !strings.Contains(msg, "$send1") || !strings.Contains(msg, "not bridged") {
+		t.Fatalf("send error text = %q, want it to name the event and the notice", msg)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("SendText took %v, want it to return as soon as the notice appears", elapsed)
+	}
+}
+
+// TestSendTextNoNoticeSucceeds proves the guard does not fail a normal send.
+func TestSendTextNoNoticeSucceeds(t *testing.T) {
+	fake := &bridgeAckServer{}
+	// A notice for a different event, plus an ordinary message: neither is the
+	// bridge rejecting our send.
+	fake.setMessages(`{"type":"m.room.message","event_id":"$n1","sender":"@whatsappbot:test","origin_server_ts":2,` +
+		`"content":{"msgtype":"m.notice","body":"different notice","m.relates_to":{"rel_type":"m.reference","event_id":"$other"}}}` +
+		`,` + textEvent("$m1", 3, "hi"))
+	srv := fake.start(t)
+
+	c, err := New(testConfigWithAck(srv.URL, 50*time.Millisecond, "!ok:test"), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	eventID, err := c.SendText(context.Background(), "!ok:test", "hello world")
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("SendText: %v, want success when no bridge notice appears", err)
+	}
+	if eventID != "$send1" {
+		t.Fatalf("SendText event ID = %q, want $send1", eventID)
+	}
+	if elapsed < 40*time.Millisecond || elapsed > time.Second {
+		t.Fatalf("SendText waited %v, want roughly the configured 50ms window", elapsed)
+	}
+	if _, polls := fake.counts(); polls == 0 {
+		t.Fatal("guard never polled the room, so it could not have seen a notice")
+	}
+}
+
+// TestSendTextAckDisabledIssuesNoExtraRequest proves MATRIX_BRIDGE_ACK_TIMEOUT=0
+// turns the guard off entirely: no poll, no wait.
+func TestSendTextAckDisabledIssuesNoExtraRequest(t *testing.T) {
+	fake := &bridgeAckServer{}
+	fake.setMessages(`{"type":"m.room.message","event_id":"$n1","sender":"@whatsappbot:test","origin_server_ts":2,` +
+		`"content":{"msgtype":"m.notice","body":"would have been a rejection","m.relates_to":{"rel_type":"m.reference","event_id":"$send1"}}}`)
+	srv := fake.start(t)
+
+	c, err := New(testConfigWithAck(srv.URL, 0, "!ok:test"), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	if _, err := c.SendText(context.Background(), "!ok:test", "hello world"); err != nil {
+		t.Fatalf("SendText: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("SendText took %v with the guard disabled, want no wait at all", elapsed)
+	}
+	sends, polls := fake.counts()
+	if sends != 1 || polls != 0 {
+		t.Fatalf("requests = %d sends, %d polls; want 1 send and no /messages poll", sends, polls)
+	}
+}
+
+// TestSanitizeNoticeBoundsAndFlattens covers the notice text hygiene rule.
+func TestSanitizeNoticeBoundsAndFlattens(t *testing.T) {
+	got := sanitizeNotice("  line one\nline\ttwo\x00end  ")
+	if got != "line one line two end" {
+		t.Fatalf("sanitizeNotice = %q, want a flattened single line", got)
+	}
+	if empty := sanitizeNotice(" \n\t "); empty != "(empty notice)" {
+		t.Fatalf("sanitizeNotice(blank) = %q, want a placeholder", empty)
+	}
+	long := sanitizeNotice(strings.Repeat("x", 1000))
+	if len(long) != 303 || !strings.HasSuffix(long, "...") {
+		t.Fatalf("sanitizeNotice(1000 chars) produced %d chars, want a 300-char bound", len(long))
 	}
 }

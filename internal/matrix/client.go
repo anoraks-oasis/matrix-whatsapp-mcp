@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix"
@@ -78,7 +79,24 @@ var (
 	ErrUserMismatch = errors.New("matrix: access token does not belong to MATRIX_USER_ID")
 	// ErrClosed is returned by operations on a closed client.
 	ErrClosed = errors.New("matrix: client closed")
+	// ErrNotBridged is returned when the bridge reported that the message was
+	// not forwarded, even though Matrix accepted the event.
+	ErrNotBridged = errors.New("matrix: bridge did not bridge the message")
 )
+
+// BridgeNoticeError reports a message that Matrix accepted but the bridge
+// refused to forward, carrying the bridge's own notice text. It matches
+// ErrNotBridged through errors.Is.
+type BridgeNoticeError struct {
+	EventID string
+	Notice  string
+}
+
+func (e *BridgeNoticeError) Error() string {
+	return fmt.Sprintf("%v: event %s: %s", ErrNotBridged, e.EventID, e.Notice)
+}
+
+func (e *BridgeNoticeError) Unwrap() error { return ErrNotBridged }
 
 const (
 	minBackoff        = time.Second
@@ -97,6 +115,12 @@ const (
 	// A busy room is mostly membership, edit and reaction events, so a single
 	// page can yield almost no messages.
 	maxMessageRawFactor = 5
+
+	// bridgeAckPollInterval is how often the bridge-ack guard re-reads a room
+	// while waiting for the bridge's notice.
+	bridgeAckPollInterval = 100 * time.Millisecond
+	// bridgeAckScanLimit is how many recent events each poll examines.
+	bridgeAckScanLimit = 20
 )
 
 // Client is the mautrix-backed MatrixService.
@@ -448,7 +472,101 @@ func (c *Client) SendText(ctx context.Context, roomID, text string) (string, err
 	if err != nil {
 		return "", fmt.Errorf("matrix: send message: %w", err)
 	}
-	return resp.EventID.String(), nil
+	eventID := resp.EventID.String()
+	// Matrix accepting the event does not mean the bridge forwarded it: a
+	// bridge whose relay/login is misconfigured posts an m.notice into the room
+	// that relates to the sent event. Reporting success there would let a
+	// caller believe a WhatsApp message was delivered when nothing was.
+	if c.cfg.BridgeAckTimeout > 0 {
+		if notice, ok := c.awaitBridgeNotice(ctx, roomID, resp.EventID); ok {
+			return "", &BridgeNoticeError{EventID: eventID, Notice: notice}
+		}
+	}
+	return eventID, nil
+}
+
+// awaitBridgeNotice polls the newest events of a room until a bridge notice
+// about eventID shows up or cfg.BridgeAckTimeout elapses. It issues no request
+// at all when the guard is disabled (the caller checks), honours ctx, and
+// starts no goroutine, so nothing can outlive the send.
+func (c *Client) awaitBridgeNotice(ctx context.Context, roomID string, eventID id.EventID) (string, bool) {
+	waitCtx, cancel := context.WithTimeout(ctx, c.cfg.BridgeAckTimeout)
+	defer cancel()
+	ticker := time.NewTicker(bridgeAckPollInterval)
+	defer ticker.Stop()
+	var logged bool
+	for {
+		notice, ok, err := c.findBridgeNotice(waitCtx, roomID, eventID)
+		if ok {
+			return notice, true
+		}
+		// A failing probe leaves the send a success, but it also silently
+		// disables the guard, so report it once per send rather than never.
+		if err != nil && !logged {
+			logged = true
+			c.log.Printf("bridge-ack probe failed for %s: %v", roomID, err)
+		}
+		select {
+		case <-waitCtx.Done():
+			return "", false
+		case <-ticker.C:
+		}
+	}
+}
+
+// findBridgeNotice looks for the bridge's rejection notice among the newest
+// events of a room. A notice counts when its m.relates_to.event_id is the sent
+// event and it was not sent by this account. The rule deliberately does not
+// depend on the bridge bot's user ID, which differs per bridge deployment;
+// a false positive needs another client to reply with an m.notice to this exact
+// event, and even then the caller only gets a quoted notice, never a lost send.
+func (c *Client) findBridgeNotice(ctx context.Context, roomID string, eventID id.EventID) (string, bool, error) {
+	resp, err := c.cli.Messages(ctx, id.RoomID(roomID), "", "", mautrix.DirectionBackward, nil, bridgeAckScanLimit)
+	if err != nil {
+		// A probe failure must not turn a delivered send into an error.
+		return "", false, err
+	}
+	for _, evt := range resp.Chunk {
+		if evt.Type != event.EventMessage || evt.Sender == c.cli.UserID {
+			continue
+		}
+		if evt.Content.Parsed == nil {
+			if err := evt.Content.ParseRaw(evt.Type); err != nil {
+				continue
+			}
+		}
+		msg := evt.Content.AsMessage()
+		if msg == nil || msg.MsgType != event.MsgNotice {
+			continue
+		}
+		if msg.RelatesTo == nil || msg.RelatesTo.EventID != eventID {
+			continue
+		}
+		return sanitizeNotice(msg.Body), true, nil
+	}
+	return "", false, nil
+}
+
+// sanitizeNotice renders a bridge notice as one trimmed line with no control
+// characters and a sane upper bound, so an error message stays readable and
+// cannot smuggle terminal escapes or an unbounded body into a log or a tool
+// result.
+func sanitizeNotice(body string) string {
+	body = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, body)
+	body = strings.Join(strings.Fields(body), " ")
+	const maxNotice = 300
+	if runes := []rune(body); len(runes) > maxNotice {
+		body = string(runes[:maxNotice]) + "..."
+	}
+	if body == "" {
+		body = "(empty notice)"
+	}
+	return body
 }
 
 // prepareEncryption makes sure a message is never sent in plaintext into an

@@ -95,8 +95,10 @@ func New(svc matrix.MatrixService, prober RoomProber, recent TriggerReader, allo
 	}, s.handleRecentTriggers)
 
 	mcp.AddTool(mcpServer, &mcp.Tool{
-		Name:        "send_message",
-		Description: "Send a plain-text message to a room. Fails closed unless the room is allow-listed, and is rate-limited to one message every 3 seconds.",
+		Name: "send_message",
+		Description: "Send a plain-text message to a room. Fails closed unless the room is allow-listed, and is rate-limited to one message every 3 seconds. " +
+			"A message can be accepted by Matrix and still be rejected by the WhatsApp bridge; when the bridge posts its rejection notice within the acknowledgement window, " +
+			"the send fails with that notice instead of reporting success. The usual cause is relay mode (bridge.relay.enabled) not being configured for the sender's account.",
 		Annotations: &mcp.ToolAnnotations{
 			DestructiveHint: boolPtr(true),
 			IdempotentHint:  false,
