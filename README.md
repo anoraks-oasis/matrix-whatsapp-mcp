@@ -258,6 +258,15 @@ Behavioral guarantees:
 - Events where `evt.Sender == client.UserID` are filtered out before reaching
   `OnEventType` handlers registered through `Client.OnEventType`.
 - `Client.RoomName(roomID)` resolves cached room names without network I/O.
+- `Messages` pages backward through `/messages` until it has the requested
+  number of convertible messages or the room is exhausted. A page of raw events
+  in a busy room is mostly `m.room.member`, edits and reactions, so a single
+  page would often return far fewer messages than asked for. Paging is bounded
+  by 10 pages and by `5 x limit` raw events scanned.
+- A media event with an empty `body` (`m.image`, `m.video`, `m.audio`,
+  `m.file`, ...) is reported with a bracketed type marker such as `[image]`
+  derived from the `msgtype` alone, never invented content. Non-empty bodies
+  and text-like types (`m.text`, `m.notice`, `m.emote`) are returned verbatim.
 - With `MATRIX_E2EE_ENABLED=true`, `New`/first `Sync` wires
   `crypto/cryptohelper` with a SQLite store at `MATRIX_CRYPTO_DB_PATH`, and
   `SendText` refuses plaintext sends into encrypted rooms
@@ -274,6 +283,7 @@ type Trigger struct {
     RoomName  string `json:"room_name"`
     Sender    string `json:"sender"`
     Body      string `json:"body"`
+    MsgType   string `json:"msgtype"`
     Timestamp int64  `json:"timestamp"` // unix milliseconds
 }
 
@@ -333,7 +343,10 @@ func New(svc matrix.MatrixService, prober RoomProber, recent TriggerReader,
 | `send_message` | `room_id` (required), `text` (required, non-whitespace) | `destructiveHint: true`, `idempotentHint: false`, `readOnlyHint: false` |
 
 `read_messages` returns events oldest-first; `get_recent_triggers` returns the
-dispatcher's ring buffer newest-first.
+dispatcher's ring buffer newest-first. Every returned message carries its
+`msgtype` and, on `read_messages`, its `encrypted` flag, so a media event is
+never a blank body with no hint about what it was; a media event with no text
+body reports a bracketed type marker (`[image]`, `[file]`, ...).
 
 Bridged detection in `list_rooms` is best effort and never fails the whole
 call. A room is `bridged: true` when an `m.bridge` state event is present on
