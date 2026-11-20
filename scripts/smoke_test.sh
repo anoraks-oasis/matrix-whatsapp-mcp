@@ -56,6 +56,24 @@ if ! grep -qF "required but not set" <<<"$missing_out"; then
 fi
 pass "binary exits non-zero and names every missing variable"
 
+# 2b. The subcommands must fail the same way without configuration, and must not
+#     fall through to serving MCP (which would hang on stdin).
+for cmd in rooms doctor; do
+	set +e
+	sub_out="$(env -i "$BIN" "$cmd" 2>&1)"
+	sub_status=$?
+	set -e
+	if [ "$sub_status" -eq 0 ]; then
+		fail "'$cmd' exited 0 with no configuration"
+	fi
+	for var in MATRIX_HOMESERVER MATRIX_USER_ID MATRIX_ACCESS_TOKEN; do
+		if ! grep -qF "$var" <<<"$sub_out"; then
+			fail "'$cmd' did not name $var: $sub_out"
+		fi
+	done
+done
+pass "rooms and doctor exit non-zero and name every missing variable"
+
 # 3. Read-only homeserver reachability check (skipped without credentials).
 if [ -n "${MATRIX_HOMESERVER:-}" ] && [ -n "${MATRIX_USER_ID:-}" ] && [ -n "${MATRIX_ACCESS_TOKEN:-}" ]; then
 	info "checking $MATRIX_HOMESERVER/_matrix/client/versions"

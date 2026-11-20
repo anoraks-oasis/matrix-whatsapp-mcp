@@ -1,6 +1,9 @@
-// Command server is the matrix-whatsapp-mcp entrypoint. It loads the
-// configuration, brings up the Matrix sync loop and trigger dispatcher, and
-// serves the MCP server over stdio or Streamable HTTP until interrupted.
+// Command server is the matrix-whatsapp-mcp entrypoint. With no arguments it
+// loads the configuration, brings up the Matrix sync loop and trigger
+// dispatcher, and serves the MCP server over stdio or Streamable HTTP until
+// interrupted. The first argument selects one of the helper subcommands
+// `rooms`, `rooms allow|deny` or `doctor`, which run against the homeserver and
+// exit instead of serving.
 package main
 
 import (
@@ -17,6 +20,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/cli"
 	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/config"
 	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/logger"
 	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/matrix"
@@ -26,6 +30,13 @@ import (
 
 func main() {
 	log := logger.New()
+	// Any argument means a subcommand: `rooms` and `doctor` are one-shot
+	// commands that must not fall through to serving MCP, where an accidental
+	// invocation would hang a terminal instead of printing a table.
+	if len(os.Args) > 1 {
+		deps := cli.DefaultDeps(os.Stdout, os.Stderr)
+		os.Exit(cli.Run(context.Background(), os.Args[1:], deps))
+	}
 	if err := run(log); err != nil {
 		log.Fatalf("fatal: %v", err)
 	}
