@@ -5,9 +5,10 @@ bridge. It listens to incoming message events, keeps a small in-memory history,
 optionally forwards them to a webhook, and exposes MCP tools for listing rooms,
 reading messages, and sending replies (allow-list gated, fail closed).
 
-Status: Phase D — the codebase is covered by unit and protocol tests (run under
-the race detector), a smoke script exercises the built binary end to end, and
-`go vet`/`gofmt` are clean.
+Status: Phase E — the codebase is covered by unit and protocol tests (run under
+the race detector), a smoke script exercises the built binary end to end,
+`go vet`/`gofmt` are clean, and enrolling a room is one command (`rooms allow`)
+instead of an Element lookup, an `.env` edit and a restart.
 
 ## Prerequisites
 
@@ -34,15 +35,19 @@ per variable, with an example value:
 | `MATRIX_CRYPTO_DB_PATH` | no | `matrix-crypto.db` | `matrix-crypto.db` | SQLite crypto store path, used only when E2EE is on. |
 | `MATRIX_PICKLE_KEY` | no | — | `change-me-32-byte-random-string` | Crypto pickle key; required when E2EE is on. Secret. |
 | `TRIGGER_WEBHOOK_URL` | no | — | `https://example.com/hooks/wa` | Optional URL to POST incoming-message triggers (JSON, 5s timeout, 1 retry). |
-| `ALLOWED_SEND_ROOMS` | no | — (empty) | `!room1:example.com,!UBRW6WycBKpUJu3m4HP0RCMsGnUp_EwSZa2RLXHe34Y` | Comma-separated room IDs allowed to receive outbound messages; a `:server` suffix is optional. Empty = read-only (sending fails closed). |
+| `ALLOWED_SEND_ROOMS` | no | — (empty) | `!room1:example.com,!UBRW6WycBKpUJu3m4HP0RCMsGnUp_EwSZa2RLXHe34Y` | Comma-separated room IDs allowed to receive outbound messages; a `:server` suffix is optional. Unioned with `MATRIX_ALLOWLIST_FILE`. Both empty = read-only (sending fails closed). |
+| `MATRIX_ALLOWLIST_FILE` | no | `$XDG_CONFIG_HOME/matrix-whatsapp-mcp/allow.txt`, else `~/.config/matrix-whatsapp-mcp/allow.txt` | `/home/me/.config/matrix-whatsapp-mcp/allow.txt` | Room IDs allowed to receive outbound messages, one per line, `#` comments allowed. Unioned with `ALLOWED_SEND_ROOMS`, and re-read while the server runs, so `rooms allow` needs no restart. |
+| `MATRIX_AUTO_JOIN_INVITES` | no | `false` | `true` | Accept room invitations automatically instead of joining by hand in Element. Every join and every refusal is logged to stderr. |
+| `MATRIX_INVITE_ALLOWLIST` | no | — (empty) | `@alice:example.com,@bob:example.com` | With auto-join on, accept invitations only from these user IDs (compared case-insensitively). Empty = accept from anyone. |
 | `MATRIX_BRIDGE_ACK_TIMEOUT` | no | `1s` | `1s`, `500ms`, `0` | How long a send waits for the bridge's rejection notice. `0` disables the check. |
 | `MCP_TRANSPORT` | no | `stdio` | `stdio` or `http` | How the MCP server is exposed. |
 | `HTTP_ADDR` | no | `:8080` | `127.0.0.1:8080` | Listen address when `MCP_TRANSPORT=http`. |
 
 See [.env.example](.env.example) for a copy-paste template. Sending fails
-closed: unless a room is listed in `ALLOWED_SEND_ROOMS`, the server refuses to
-send to it, and a send the WhatsApp bridge rejects is reported as a failure
-rather than a success (see `MATRIX_BRIDGE_ACK_TIMEOUT`).
+closed: unless a room is in the effective allowlist — the union of
+`ALLOWED_SEND_ROOMS` and `MATRIX_ALLOWLIST_FILE` — the server refuses to send to
+it, and a send the WhatsApp bridge rejects is reported as a failure rather than
+a success (see `MATRIX_BRIDGE_ACK_TIMEOUT`).
 
 ## Building and running
 
@@ -80,6 +85,152 @@ The Streamable HTTP endpoint is then served on `HTTP_ADDR` (any path).
 
 A `Makefile` wraps the tagged commands so the `goolm` tag cannot be forgotten:
 `make build`, `make run`, `make test`, `make vet`.
+
+## Enrolling a room in three steps
+
+A new room is unusable until the bot has joined it and it is in the send
+allowlist. Three steps, once per room.
+
+### 1. Invite the bot from Element
+
+Open the room in Element and invite the bot's account (`MATRIX_USER_ID`). This
+is the one step that cannot be automated: Matrix requires the invited account to
+accept the invitation itself.
+
+With `MATRIX_AUTO_JOIN_INVITES=true` the bot joins within a few seconds and
+logs the join:
+
+```
+matrix-whatsapp-mcp: auto-join: joined !cafe:example.com (invited by @you:example.com)
+```
+
+With `MATRIX_INVITE_ALLOWLIST` set, an invitation from anyone else is refused and
+logged the same way, and the invitation stays pending in Element:
+
+```
+matrix-whatsapp-mcp: auto-join: refusing invitation to !spam:example.com from @stranger:example.com: not in MATRIX_INVITE_ALLOWLIST
+```
+
+With auto-join off (the default) accept the invitation by hand in Element; the
+rest of the flow is identical. An invitation is also picked up after a restart:
+the bot accepts pending invitations from its first sync, so inviting it while it
+is down is safe.
+
+### 2. Find the room
+
+```sh
+./matrix-whatsapp-mcp rooms
+```
+
+```
+  #  NAME             ROOM ID                BRIDGED  SEND
+  1  Cafe             !cafe:example.com      yes      no
+  2  Family WhatsApp  !family:example.com    yes      no
+
+2 room(s), 0 send-allowed
+allowlist: 0 from ALLOWED_SEND_ROOMS, 0 from /home/me/.config/matrix-whatsapp-mcp/allow.txt (not created yet)
+```
+
+`#` is the number the next step takes. `BRIDGED` is the same best-effort check
+`list_rooms` uses (an `m.bridge` state event, else a joined member whose
+localpart contains `whatsapp`). `SEND` says whether the room is in the effective
+allowlist right now.
+
+### 3. Allow it
+
+```sh
+./matrix-whatsapp-mcp rooms allow 2
+# allowed "Family WhatsApp" (!family:example.com)
+# wrote /home/me/.config/matrix-whatsapp-mcp/allow.txt
+# the running server picks this up within a second; no restart needed
+```
+
+`rooms deny` reverses it. Both accept a room ID, a name, or `--index N` with the
+number printed above:
+
+- an exact room ID wins outright;
+- otherwise an exact name, case-insensitively;
+- otherwise a case-insensitive substring of the name or the room ID.
+
+Anything but a single match is an error, and an ambiguous query prints every
+candidate and exits non-zero rather than guessing which room was meant:
+
+```
+error: "family" matches 2 rooms, refusing to guess:
+  "Family Photos" (!family2:example.com)
+  "Family WhatsApp" (!family:example.com)
+name one of them exactly, pass the room ID, or use --index N
+```
+
+`rooms allow` writes the allowlist file atomically (a temporary file plus a
+rename) and creates its directory when it does not exist. The running server
+notices the change on its next send, so there is no restart and no `.env` edit.
+
+An empty allowlist is still read-only and fails closed. `rooms deny` edits the
+file only, so a room that is also listed in `ALLOWED_SEND_ROOMS` is reported as
+still allowed and the command exits non-zero rather than claiming a denial that
+did not happen.
+
+### If the server runs from a different user
+
+The default file path comes from `$XDG_CONFIG_HOME`/`$HOME`. A server started by
+a systemd unit can resolve a different path than your shell, so set
+`MATRIX_ALLOWLIST_FILE` explicitly to the same absolute path in both places.
+
+## Doctor
+
+```sh
+./matrix-whatsapp-mcp doctor
+```
+
+```
+matrix-whatsapp-mcp doctor
+
+config
+  homeserver    https://matrix.example.com
+  user          @bot:example.com
+  transport     stdio
+  e2ee          disabled
+
+checks
+  [ok  ] versions        HTTP 200 in 43ms, 3 versions, newest v1.11
+  [ok  ] whoami          @bot:example.com (device DEVICE)
+  [ok  ] joined rooms    2 joined, 1 bridged from WhatsApp
+  [ok  ] send allowlist  1 from ALLOWED_SEND_ROOMS, 1 from /home/me/.config/matrix-whatsapp-mcp/allow.txt
+  [ok  ] crypto db       not needed, MATRIX_E2EE_ENABLED is false
+
+joined rooms
+  #  NAME             ROOM ID              BRIDGED  SEND
+  1  Cafe             !cafe:example.com    yes      yes
+  2  Family WhatsApp  !family:example.com  yes      yes
+
+2 room(s), 2 send-allowed
+allowlist: 1 from ALLOWED_SEND_ROOMS, 1 from /home/me/.config/matrix-whatsapp-mcp/allow.txt
+
+send allowlist
+  !cafe:example.com
+      ALLOWED_SEND_ROOMS
+  !family:example.com
+      /home/me/.config/matrix-whatsapp-mcp/allow.txt
+  file /home/me/.config/matrix-whatsapp-mcp/allow.txt
+
+all 5 checks passed
+```
+
+Each line is one check:
+
+| Check | What it proves |
+| --- | --- |
+| `config` | Every required variable is set and well formed. A failure prints every problem at once and stops the run. |
+| `versions` | `GET {MATRIX_HOMESERVER}/_matrix/client/versions` answers `200`, which separates a wrong URL or an unreachable homeserver from a bad token. It is unauthenticated, so no secret is sent. |
+| `whoami` | The token is valid and belongs to `MATRIX_USER_ID`. A mismatch names both IDs. |
+| `joined rooms` | The rooms the account can see, and how many look bridged from WhatsApp. |
+| `send allowlist` | The effective allowlist and where every entry came from: `ALLOWED_SEND_ROOMS`, the allowlist file, or both. Nothing allowed is reported as read-only, which is a valid state, not a failure. |
+| `crypto db` | Only with E2EE on: the SQLite crypto store is writable. This is a `[warn]`, and the run still exits non-zero, because the server cannot start without it. |
+
+Exit status is `0` when every check passes, `1` when any check failed (or warned,
+as the crypto store does), and `2` for a usage error. Failures never echo the
+access token or the pickle key.
 
 ## MCP client configuration
 
@@ -156,10 +307,25 @@ It never prints the access token.
   are inaccessible to the token, or the bridge has not populated the rooms yet.
   Verify the account is a member of the bridged rooms and that `MATRIX_USER_ID`
   matches the token's user.
-- **Sending is rejected** — sending fails closed. Add the room ID to
-  `ALLOWED_SEND_ROOMS`; an empty value means read-only mode. Room IDs the
-  bridge lists without a `:server` suffix are valid and can be allow-listed
-  as-is.
+- **Sending is rejected** — sending fails closed. Run `./matrix-whatsapp-mcp
+  rooms` and check the `SEND` column, then `rooms allow <index>`. An empty
+  allowlist means read-only mode. Room IDs the bridge lists without a `:server`
+  suffix are valid and can be allow-listed as-is.
+- **`rooms allow` did not make a room sendable** — the server and the command
+  resolve `MATRIX_ALLOWLIST_FILE` differently. The default comes from
+  `$XDG_CONFIG_HOME`/`$HOME`, which a systemd unit usually sets to something
+  other than your shell's. Set `MATRIX_ALLOWLIST_FILE` to the same absolute path
+  in both.
+- **`rooms deny` exits non-zero and the room stays sendable** — it is listed in
+  `ALLOWED_SEND_ROOMS`, which `rooms` does not edit; remove it there and
+  restart, or leave the file as the only source.
+- **The bot never joins the room after the invite** — check stderr for an
+  `auto-join:` line. Without `MATRIX_AUTO_JOIN_INVITES=true` nothing joins for
+  you; with `MATRIX_INVITE_ALLOWLIST` set, an invitation from anyone else is
+  refused on purpose. The pending invitation stays visible in Element until it
+  is accepted or withdrawn.
+- **`rooms allow 3` says the index is out of range** — the numbers come from the
+  current listing; re-run `rooms` and use the number printed there.
 
 ## Architecture
 
@@ -191,6 +357,9 @@ type Config struct {
     AllowedSendRooms []string
     Transport        Transport
     HTTPAddr         string
+    AutoJoinInvites  bool
+    InviteAllowlist  []string
+    AllowlistFile    string
 }
 
 func Load() (*Config, error)
@@ -203,6 +372,7 @@ func ValidRoomID(roomID string) bool
 
 func (c *Config) ReadOnly() bool
 func (c *Config) SendAllowed(roomID string) bool
+func (c *Config) InviteAllowed(userID string) bool
 func (c *Config) String() string // redacts secrets
 func (c *Config) GoString() string
 ```
@@ -211,9 +381,69 @@ func (c *Config) GoString() string
 `matrix.Client` (for `Messages` and `SendText`) use, so the allow-list and the
 client can never disagree about which room IDs are acceptable.
 
+`ReadOnly` and `SendAllowed` describe the `ALLOWED_SEND_ROOMS` baseline only;
+the effective allowlist is `allowlist.Store`, which unions that baseline with
+`MATRIX_ALLOWLIST_FILE`. `InviteAllowed` is true when
+`MATRIX_INVITE_ALLOWLIST` is empty or names the inviter, ignoring case.
+
 `Load()` validates every variable and returns a joined error of
 `*config.VarError` values. Error messages name the offending variable and
 never echo its value, so tokens and pickle keys cannot leak through errors.
+
+### allowlist
+
+```go
+package allowlist
+
+const EnvSource = "ALLOWED_SEND_ROOMS"
+
+type List interface {
+    Rooms() []string
+    Allowed(roomID string) bool
+}
+
+type Entry struct {
+    RoomID  string
+    Sources []string // EnvSource, the file path, or both
+}
+
+type Store struct{ /* ... */ }
+
+func New(baseline []string, path string, logger *log.Logger, opts ...Option) *Store
+func WithMinInterval(d time.Duration) Option
+func FromSlice(rooms []string) List
+
+func (s *Store) Rooms() []string
+func (s *Store) Allowed(roomID string) bool
+func (s *Store) Entries() []Entry
+func (s *Store) Path() string
+func (s *Store) Refresh()
+func (s *Store) Reload()
+
+func Add(path, roomID string) (changed bool, err error)
+func Remove(path, roomID string) (changed bool, err error)
+```
+
+`Store` is the single source of truth for "may this room receive a message": the
+`ALLOWED_SEND_ROOMS` baseline unioned with the file, deduplicated, sorted. Both
+the Matrix client and the MCP send gate hold the same instance, so they cannot
+disagree.
+
+The file is read at most once per second and only when the allowlist is
+consulted — on the next send, or the next `rooms`/`doctor` run. There is no
+watcher goroutine, so there is nothing to leak, and no restart to forget. A
+re-read compares the bytes it gets with the bytes it has instead of trusting
+`mtime`, because timestamp resolution varies by filesystem (`/tmp` on this
+machine truncates to the millisecond, the checkout does not) and a same-size
+rewrite inside one tick would otherwise go unnoticed. An unreadable file keeps
+the last known list and logs the problem once, and a malformed line is a
+warning that names its line number and is otherwise skipped — never a crash.
+
+`Add` and `Remove` rewrite the file through a temporary file in the same
+directory plus a `rename`, so a concurrent reader sees either the old file or the
+new one. They create the directory, keep the existing comments and ordering, and
+report whether anything changed. An empty result is still read-only: the store
+exposes no way to make the gate permissive.
 
 ### matrix
 
@@ -248,7 +478,9 @@ func New(cfg *config.Config, logger *log.Logger) (*Client, error)
 
 `New` performs no network I/O: authentication, optional crypto setup, and the
 sync loop all begin on the first `Sync` call, so downstream code can be tested
-against a mock `MatrixService` with no homeserver in the loop.
+against a mock `MatrixService` with no homeserver in the loop. It does build the
+`allowlist.Store`, which only stats and reads a local file, and that store is
+reachable through `Client.Allowlist()` so the MCP layer gates on the same one.
 
 Behavioral guarantees:
 
@@ -260,6 +492,17 @@ Behavioral guarantees:
 - Events where `evt.Sender == client.UserID` are filtered out before reaching
   `OnEventType` handlers registered through `Client.OnEventType`.
 - `Client.RoomName(roomID)` resolves cached room names without network I/O.
+- With `MATRIX_AUTO_JOIN_INVITES=true`, an invitation whose inviter passes
+  `MATRIX_INVITE_ALLOWLIST` (empty list = anyone) is accepted automatically and
+  logged. The decision is made on the sync goroutine and the join request runs
+  off it, deduplicated per room and joined by `Close`, so a slow or hanging join
+  cannot stall the sync loop. Auto-join is a *sync listener* rather than an
+  event handler on purpose: it is installed before `DontProcessOldEvents`, so
+  the invitations carried by the first sync response — the ones that arrive
+  while the bot is restarting — are accepted too. Refusals are logged and the
+  invitation is left pending.
+- `SendText` checks the `allowlist.Store`, not the static env slice, so a room
+  enrolled in the file is sendable by the running process.
 - `Messages` pages backward through `/messages` until it has the requested
   number of convertible messages or the room is exhausted. A page of raw events
   in a busy room is mostly `m.room.member`, edits and reactions, so a single
@@ -336,7 +579,14 @@ type TriggerReader interface {
 
 func New(svc matrix.MatrixService, prober RoomProber, recent TriggerReader,
     allowed []string) *mcp.Server
+
+func NewWithAllowlist(svc matrix.MatrixService, prober RoomProber,
+    recent TriggerReader, allow allowlist.List) *mcp.Server
 ```
+
+`New` is the fixed-list form; `NewWithAllowlist` is what the binary uses, with
+the client's own `allowlist.Store`, so `rooms allow` takes effect without a
+restart.
 
 `New` builds an `mcp.Server` with exactly four tools:
 
@@ -360,11 +610,13 @@ the room; failing that, when any joined member's localpart contains
 keeps the room. The room `name` is the room name, falling back to the
 canonical alias, then to `unnamed`.
 
-Sending is gated by an unexported `sendGate` type that combines the allow-list
-and a token bucket (one message per 3 seconds across all rooms). An empty
-`ALLOWED_SEND_ROOMS` rejects every send with a read-only error; a room not in
-a non-empty list is rejected without consuming the token; a throttled call
-returns `rate limited, retry in Ns` rather than blocking. The access token is
+Sending is gated by an unexported `sendGate` type that combines the live
+allowlist and a token bucket (one message per 3 seconds across all rooms). An
+empty allowlist rejects every send with a read-only error; a room that is not in
+a non-empty allowlist is rejected without consuming the token; a throttled call
+returns `rate limited, retry in Ns` rather than blocking. The allowlist is
+consulted per send, so a room added by `rooms allow` becomes sendable in the
+running process. The access token is
 never logged and never appears in an error or tool result.
 
 Matrix accepting an event does not prove the bridge forwarded it. When a
@@ -395,10 +647,50 @@ must be set in the bridge's config, and the sending account must be permitted
 to relay through the bridge bot. Without it the bridge has no WhatsApp login to
 speak for the sender and reports "not logged in".
 
+### cli
+
+```go
+package cli
+
+type RoomService interface {
+    JoinedRooms(ctx context.Context) ([]matrix.Room, error)
+    IsBridged(ctx context.Context, roomID string) bool
+    WhoAmI(ctx context.Context) (userID, deviceID string, err error)
+    Close() error
+}
+
+type Deps struct {
+    Stdout     io.Writer
+    Stderr     io.Writer
+    Getenv     func(string) string
+    NewClient  func(*config.Config, *log.Logger) (RoomService, error)
+    HTTPClient *http.Client
+}
+
+func DefaultDeps(stdout, stderr io.Writer) Deps
+func Run(ctx context.Context, args []string, deps Deps) int
+```
+
+`Run` returns the process exit code (`0` ok, `1` failed, `2` usage) and takes
+every process edge through `Deps`, so the commands are tested against a fake
+`RoomService`, a fake environment and an `httptest` server; no test touches a
+real homeserver. Every subcommand is bounded by one context timeout, so an
+unreachable homeserver produces an error rather than a terminal that never comes
+back. Human output goes to stdout; diagnostics, warnings and the Matrix client's
+own logger go to stderr, exactly like the server.
+
+Room queries resolve in this order: exact room ID, exact name
+(case-insensitive), then a case-insensitive substring of the name or the ID.
+Multiple candidates are an error that lists them, never a guess. `--index N` uses
+the row number printed by `rooms`, which comes from `JoinedRooms` sorted by name,
+so the numbers are stable between the listing and the follow-up command.
+
 ### cmd/server
 
 `cmd/server` loads the config, builds the Matrix client and dispatcher, starts
-the sync loop in a managed goroutine, and serves the MCP server. With
+the sync loop in a managed goroutine, and serves the MCP server. With no
+arguments that is all it does; any argument is dispatched to `cli.Run` instead,
+so `rooms` and `doctor` exit rather than fall through to serving. With
 `MCP_TRANSPORT=stdio` (the default) it serves `mcp.StdioTransport` on
 stdin/stdout; with `MCP_TRANSPORT=http` it serves
 `mcp.NewStreamableHTTPHandler` on `HTTP_ADDR` behind an `http.Server` with
