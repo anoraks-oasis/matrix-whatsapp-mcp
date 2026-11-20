@@ -83,6 +83,15 @@ type MatrixService interface {
 	// Sync runs the sync loop and blocks until ctx is cancelled (returning
 	// nil) or a fatal error such as an invalid access token occurs.
 	Sync(ctx context.Context) error
+	// SearchMessages searches message bodies, using the homeserver's search
+	// index when it has one and a bounded per-room scan when it does not.
+	SearchMessages(ctx context.Context, req SearchRequest) (SearchOutcome, error)
+	// MessageContext returns one event with the messages around it and its
+	// reply and edit relations resolved.
+	MessageContext(ctx context.Context, roomID, eventID string, before, after int) (ContextOutcome, error)
+	// Participants lists the joined members of a room and marks the ones the
+	// WhatsApp bridge owns.
+	Participants(ctx context.Context, roomID string) ([]Participant, error)
 	// Close releases resources. Cancel the Sync context first.
 	Close() error
 }
@@ -114,6 +123,14 @@ var (
 	// ErrStalePageToken is returned when the homeserver rejects a token this
 	// process issued, for example because the timeline moved past it.
 	ErrStalePageToken = errors.New("matrix: page token is no longer valid")
+	// ErrEmptyQuery is returned when a search has no search term.
+	ErrEmptyQuery = errors.New("matrix: search query is empty")
+	// ErrEventNotFound is returned when a well-formed event ID is not in the
+	// room, including when the room itself is unknown.
+	ErrEventNotFound = errors.New("matrix: event not found in room")
+	// ErrNotAMessage is returned when an event exists but carries no message to
+	// read the context of, such as a membership or state event.
+	ErrNotAMessage = errors.New("matrix: event is not a message")
 )
 
 // BridgeNoticeError reports a message that Matrix accepted but the bridge
@@ -169,6 +186,12 @@ type Client struct {
 	cli *mautrix.Client
 
 	crypto atomic.Pointer[cryptohelper.CryptoHelper]
+
+	// searchUnavailable and contextUnavailable remember that the homeserver
+	// does not implement /search or /context, so a search or a context call
+	// does not pay for a doomed request every time.
+	searchUnavailable  atomic.Bool
+	contextUnavailable atomic.Bool
 
 	syncing   atomic.Bool
 	initMu    sync.Mutex
@@ -359,8 +382,7 @@ func (c *Client) IsBridged(ctx context.Context, roomID string) bool {
 			}
 		}
 		if member := evt.Content.AsMember(); member != nil && member.Membership == event.MembershipJoin {
-			localpart, _, err := id.UserID(evt.GetStateKey()).Parse()
-			if err == nil && strings.Contains(strings.ToLower(localpart), "whatsapp") {
+			if classifyBridgeUser(evt.GetStateKey()) != "" {
 				return true
 			}
 		}
