@@ -91,8 +91,10 @@ func NewWithAllowlist(svc matrix.MatrixService, prober RoomProber, recent Trigge
 	}, s.handleListRooms)
 
 	mcp.AddTool(mcpServer, &mcp.Tool{
-		Name:        "read_messages",
-		Description: "Read recent messages from a room, oldest first.",
+		Name: "read_messages",
+		Description: "Read messages from a room, oldest first. Without a cursor this returns the newest messages; pass before with the next_token of an earlier result " +
+			"to page further back, and follow next_token while has_more is true. Every message carries its relations: the event it replies to, the event it edits, " +
+			"mentioned user IDs, and whether the room redacted it.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, s.handleReadMessages)
 
@@ -128,16 +130,27 @@ type roomResult struct {
 type readMessagesInput struct {
 	RoomID string `json:"room_id" jsonschema:"the Matrix room ID to read messages from"`
 	Limit  int    `json:"limit,omitempty" jsonschema:"maximum number of messages to return; default 20, clamped to 1..100"`
+	Before string `json:"before,omitempty" jsonschema:"opaque pagination token: the next_token of an earlier read_messages result, which reads the page of messages older than that one. Omit it to start at the newest message. Treat it as opaque - it is not an event ID - and a token that is malformed or was issued by a previous server process is an error rather than an empty page"`
 }
 
 type messageResult struct {
-	EventID   string `json:"event_id" jsonschema:"the Matrix event ID"`
-	RoomID    string `json:"room_id" jsonschema:"the Matrix room ID"`
-	Sender    string `json:"sender" jsonschema:"the sender Matrix user ID"`
-	Body      string `json:"body" jsonschema:"the message body; media events with no text body carry a bracketed type marker such as [image] or [file]"`
-	MsgType   string `json:"msgtype" jsonschema:"the message type, for example m.text, m.notice or m.image"`
-	Timestamp int64  `json:"timestamp" jsonschema:"unix milliseconds when the message was sent"`
-	Encrypted bool   `json:"encrypted" jsonschema:"whether the event was encrypted; an undecryptable body is a fixed placeholder"`
+	EventID   string   `json:"event_id" jsonschema:"the Matrix event ID"`
+	RoomID    string   `json:"room_id" jsonschema:"the Matrix room ID"`
+	Sender    string   `json:"sender" jsonschema:"the sender Matrix user ID"`
+	Body      string   `json:"body" jsonschema:"the message body; media events with no text body carry a bracketed type marker such as [image] or [file]; a redacted message has an empty body"`
+	MsgType   string   `json:"msgtype" jsonschema:"the message type, for example m.text, m.notice or m.image"`
+	Timestamp int64    `json:"timestamp" jsonschema:"unix milliseconds when the message was sent"`
+	Encrypted bool     `json:"encrypted" jsonschema:"whether the event was encrypted; an undecryptable body is a fixed placeholder"`
+	ReplyTo   string   `json:"reply_to,omitempty" jsonschema:"the event ID this message replies to, present even when that message is outside this page. Carried from both the m.relates_to.m.in_reply_to and the flat m.relates_to.event_id shape"`
+	EditOf    string   `json:"edit_of,omitempty" jsonschema:"the event ID this message replaces (rel_type m.replace). An edit stays in the stream with this field set, so a client can apply it to the original instead of showing a duplicate"`
+	Mentions  []string `json:"mentions,omitempty" jsonschema:"user IDs the message mentions (m.mentions.user_ids); absent when it mentions nobody"`
+	Redacted  bool     `json:"redacted" jsonschema:"true when the room has redacted (deleted) this message; its body is empty and the deleted text is never returned"`
+}
+
+type readMessagesResult struct {
+	Messages  []messageResult `json:"messages" jsonschema:"the messages in this page, oldest first"`
+	NextToken string          `json:"next_token,omitempty" jsonschema:"opaque token to pass back as before to read the next older page; absent when the room's history ends here"`
+	HasMore   bool            `json:"has_more" jsonschema:"whether the homeserver has more events behind this page, so a next_token is present. A later page can still contain no messages when the remaining events are membership or other non-message events"`
 }
 
 type recentTriggersInput struct {
@@ -206,14 +219,18 @@ func (s *Server) probeRoom(ctx context.Context, r matrix.Room) roomResult {
 	return res
 }
 
-func (s *Server) handleReadMessages(ctx context.Context, _ *mcp.CallToolRequest, in readMessagesInput) (*mcp.CallToolResult, []messageResult, error) {
-	msgs, err := s.matrix.Messages(ctx, in.RoomID, clampLimit(in.Limit))
+func (s *Server) handleReadMessages(ctx context.Context, _ *mcp.CallToolRequest, in readMessagesInput) (*mcp.CallToolResult, readMessagesResult, error) {
+	page, err := s.matrix.Messages(ctx, in.RoomID, clampLimit(in.Limit), in.Before)
 	if err != nil {
-		return nil, nil, err
+		return nil, readMessagesResult{}, err
 	}
-	out := make([]messageResult, 0, len(msgs))
-	for _, m := range msgs {
-		out = append(out, messageResult{
+	out := readMessagesResult{
+		Messages:  make([]messageResult, 0, len(page.Messages)),
+		NextToken: page.NextToken,
+		HasMore:   page.HasMore,
+	}
+	for _, m := range page.Messages {
+		out.Messages = append(out.Messages, messageResult{
 			EventID:   m.EventID,
 			RoomID:    m.RoomID,
 			Sender:    m.Sender,
@@ -221,11 +238,15 @@ func (s *Server) handleReadMessages(ctx context.Context, _ *mcp.CallToolRequest,
 			MsgType:   m.MsgType,
 			Timestamp: m.Timestamp,
 			Encrypted: m.Encrypted,
+			ReplyTo:   m.ReplyTo,
+			EditOf:    m.EditOf,
+			Mentions:  m.Mentions,
+			Redacted:  m.Redacted,
 		})
 	}
 	// The Matrix API returns newest first; the tool contract is chronological.
-	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
-		out[i], out[j] = out[j], out[i]
+	for i, j := 0, len(out.Messages)-1; i < j; i, j = i+1, j-1 {
+		out.Messages[i], out.Messages[j] = out.Messages[j], out.Messages[i]
 	}
 	return nil, out, nil
 }

@@ -39,22 +39,43 @@ type Room struct {
 // placeholder rather than ciphertext. A media event (m.image, m.video, ...)
 // that carries no text body gets a bracketed type marker such as "[image]" so
 // callers never see a silently blank message; see placeholderBody.
+//
+// ReplyTo, EditOf, Mentions and Redacted are the relations that let a client
+// read the stream as a conversation. ReplyTo carries the parent event ID even
+// when the parent is outside the page the caller asked for, so a reply is never
+// orphaned. A redacted message keeps its place in the stream with Redacted true
+// and an empty Body: the deleted text is never returned.
 type Message struct {
-	EventID   string `json:"event_id"`
-	RoomID    string `json:"room_id"`
-	Sender    string `json:"sender"`
-	Body      string `json:"body"`
-	MsgType   string `json:"msgtype"`
-	Timestamp int64  `json:"timestamp"`
-	Encrypted bool   `json:"encrypted"`
+	EventID   string   `json:"event_id"`
+	RoomID    string   `json:"room_id"`
+	Sender    string   `json:"sender"`
+	Body      string   `json:"body"`
+	MsgType   string   `json:"msgtype"`
+	Timestamp int64    `json:"timestamp"`
+	Encrypted bool     `json:"encrypted"`
+	ReplyTo   string   `json:"reply_to,omitempty"`
+	EditOf    string   `json:"edit_of,omitempty"`
+	Mentions  []string `json:"mentions,omitempty"`
+	Redacted  bool     `json:"redacted"`
+}
+
+// MessagePage is one page of a room's history, in the order the homeserver
+// hands it out (newest first). NextToken is an opaque token for the next older
+// page and is empty when the room's history is exhausted.
+type MessagePage struct {
+	Messages  []Message `json:"messages"`
+	NextToken string    `json:"next_token,omitempty"`
+	HasMore   bool      `json:"has_more"`
 }
 
 // MatrixService is the surface the MCP layer depends on.
 type MatrixService interface {
 	// JoinedRooms lists the rooms the account has joined, sorted by name.
 	JoinedRooms(ctx context.Context) ([]Room, error)
-	// Messages returns up to limit recent messages of a room, newest first.
-	Messages(ctx context.Context, roomID string, limit int) ([]Message, error)
+	// Messages returns up to limit messages of a room, newest first. before is
+	// an opaque token from an earlier page; an empty token starts at the
+	// newest message.
+	Messages(ctx context.Context, roomID string, limit int, before string) (MessagePage, error)
 	// SendText sends a plain-text message and returns the new event ID. It
 	// fails closed with ErrSendNotAllowed unless the room is allow-listed.
 	SendText(ctx context.Context, roomID, text string) (string, error)
@@ -83,6 +104,12 @@ var (
 	// ErrNotBridged is returned when the bridge reported that the message was
 	// not forwarded, even though Matrix accepted the event.
 	ErrNotBridged = errors.New("matrix: bridge did not bridge the message")
+	// ErrInvalidPageToken is returned when a before token is malformed, was
+	// modified, belongs to another room, or was issued by a previous process.
+	ErrInvalidPageToken = errors.New("matrix: invalid page token")
+	// ErrStalePageToken is returned when the homeserver rejects a token this
+	// process issued, for example because the timeline moved past it.
+	ErrStalePageToken = errors.New("matrix: page token is no longer valid")
 )
 
 // BridgeNoticeError reports a message that Matrix accepted but the bridge
@@ -145,6 +172,7 @@ type Client struct {
 	namesMu   sync.RWMutex
 	names     map[string]string
 	allow     *allowlist.Store
+	pages     *pageSigner
 	joinMu    sync.Mutex
 	joining   map[id.RoomID]struct{}
 	bgCtx     context.Context
@@ -182,6 +210,11 @@ func New(cfg *config.Config, logger *log.Logger) (*Client, error) {
 	}
 	cli.Syncer = syncer
 
+	pages, err := newPageSigner()
+	if err != nil {
+		return nil, err
+	}
+
 	bgCtx, bgCancel := context.WithCancel(context.Background())
 	c := &Client{
 		cfg:      cfg,
@@ -189,6 +222,7 @@ func New(cfg *config.Config, logger *log.Logger) (*Client, error) {
 		cli:      cli,
 		names:    make(map[string]string),
 		allow:    allowlist.New(cfg.AllowedSendRooms, cfg.AllowlistFile, logger),
+		pages:    pages,
 		joining:  make(map[id.RoomID]struct{}),
 		bgCtx:    bgCtx,
 		bgCancel: bgCancel,
@@ -368,14 +402,24 @@ func (c *Client) JoinedRooms(ctx context.Context) ([]Room, error) {
 
 // Messages implements MatrixService. A limit outside 1..100 is clamped. It
 // pages backward through /messages until it has limit convertible messages or
-// the room is exhausted, because the raw event stream is dominated by
-// membership, edit and reaction events that convert to nothing. Paging is
-// bounded by maxMessagePages and maxMessageRawFactor so a huge or noisy room
-// cannot make the call unbounded. Messages are returned in the order the
-// homeserver hands them out (newest first).
-func (c *Client) Messages(ctx context.Context, roomID string, limit int) ([]Message, error) {
+// the page it started from is exhausted, because the raw event stream is
+// dominated by membership, edit and reaction events that convert to nothing.
+// Paging is bounded by maxMessagePages and maxMessageRawFactor so a huge or
+// noisy room cannot make the call unbounded, whether the caller supplies a
+// token or not.
+//
+// before is a token from an earlier page. Without one the call starts at the
+// newest message, which is the pre-pagination behaviour. A token is bound to
+// the room it was issued for and signed by this process, so a malformed,
+// foreign or hand-edited token is an ErrInvalidPageToken rather than an empty
+// page; a token the homeserver no longer accepts is ErrStalePageToken.
+//
+// Messages are returned in the order the homeserver hands them out (newest
+// first). NextToken is set when there is more history behind this page, and is
+// exactly what the caller passes back as before.
+func (c *Client) Messages(ctx context.Context, roomID string, limit int, before string) (MessagePage, error) {
 	if !config.ValidRoomID(roomID) {
-		return nil, ErrInvalidRoomID
+		return MessagePage{}, ErrInvalidRoomID
 	}
 	switch {
 	case limit <= 0:
@@ -384,31 +428,54 @@ func (c *Client) Messages(ctx context.Context, roomID string, limit int) ([]Mess
 		limit = maxMsgLimit
 	}
 
+	from := ""
+	if before != "" {
+		var err error
+		from, err = c.pages.verify(roomID, before)
+		if err != nil {
+			return MessagePage{}, err
+		}
+	}
+
 	out := make([]Message, 0, limit)
 	rawBudget := maxMessageRawFactor * limit
-	from := ""
-	for page := 0; page < maxMessagePages && len(out) < limit && rawBudget > 0; page++ {
+	next := ""
+	for page := 0; ; page++ {
+		// Stop without consuming the token of the page we have not read yet:
+		// from is the start of the next older page.
+		if page >= maxMessagePages || rawBudget <= 0 || len(out) >= limit {
+			next = from
+			break
+		}
 		want := min(limit-len(out), rawBudget)
 		resp, err := c.cli.Messages(ctx, id.RoomID(roomID), from, "", mautrix.DirectionBackward, nil, want)
 		if err != nil {
-			return nil, fmt.Errorf("matrix: fetch messages: %w", err)
+			if from != "" && isStalePageError(err) {
+				return MessagePage{}, fmt.Errorf("%w: the homeserver rejected it; call again without before", ErrStalePageToken)
+			}
+			return MessagePage{}, fmt.Errorf("matrix: fetch messages: %w", err)
 		}
 		rawBudget -= len(resp.Chunk)
 		for _, evt := range resp.Chunk {
 			evt.RoomID = id.RoomID(roomID)
 			if msg, ok := c.convert(ctx, evt); ok {
 				out = append(out, msg)
-				if len(out) == limit {
-					break
-				}
 			}
 		}
+		// The homeserver omits end at the start of the timeline, and an empty
+		// chunk means it has nothing older to give.
 		if len(resp.Chunk) == 0 || resp.End == "" {
+			next = ""
 			break
 		}
 		from = resp.End
 	}
-	return out, nil
+
+	token, err := c.pages.sign(roomID, next)
+	if err != nil {
+		return MessagePage{}, err
+	}
+	return MessagePage{Messages: out, NextToken: token, HasMore: token != ""}, nil
 }
 
 func (c *Client) convert(ctx context.Context, evt *event.Event) (Message, bool) {
@@ -417,6 +484,13 @@ func (c *Client) convert(ctx context.Context, evt *event.Event) (Message, bool) 
 	case event.EventMessage:
 	case event.EventEncrypted:
 		encrypted = true
+	default:
+		return Message{}, false
+	}
+	if evt.Unsigned.RedactedBecause != nil {
+		return redactedMessage(evt, encrypted), true
+	}
+	if encrypted {
 		decrypted := c.decrypt(ctx, evt)
 		if decrypted == nil {
 			return Message{
@@ -428,8 +502,6 @@ func (c *Client) convert(ctx context.Context, evt *event.Event) (Message, bool) 
 		if evt.Type != event.EventMessage {
 			return Message{}, false
 		}
-	default:
-		return Message{}, false
 	}
 	if evt.Content.Parsed == nil {
 		if err := evt.Content.ParseRaw(evt.Type); err != nil {
@@ -440,6 +512,7 @@ func (c *Client) convert(ctx context.Context, evt *event.Event) (Message, bool) 
 	if msg == nil {
 		return Message{}, false
 	}
+	replyTo, editOf, mentions := relationFields(msg)
 	return Message{
 		EventID:   evt.ID.String(),
 		RoomID:    evt.RoomID.String(),
@@ -448,7 +521,51 @@ func (c *Client) convert(ctx context.Context, evt *event.Event) (Message, bool) 
 		MsgType:   string(msg.MsgType),
 		Timestamp: evt.Timestamp,
 		Encrypted: encrypted,
+		ReplyTo:   replyTo,
+		EditOf:    editOf,
+		Mentions:  mentions,
 	}, true
+}
+
+// redactedMessage reports a message the room has deleted. It keeps its place in
+// the stream — the event ID, sender and timestamp are still true — and carries
+// no body: the server has already stripped the content, and returning anything
+// from it would hand back text a participant chose to delete.
+func redactedMessage(evt *event.Event, encrypted bool) Message {
+	return Message{
+		EventID:   evt.ID.String(),
+		RoomID:    evt.RoomID.String(),
+		Sender:    evt.Sender.String(),
+		Timestamp: evt.Timestamp,
+		Encrypted: encrypted,
+		Redacted:  true,
+	}
+}
+
+// relationFields extracts what a message answers, replaces, or mentions. Both
+// reply shapes count as a reply: the reply form m.relates_to
+// .m.in_reply_to.event_id that mautrix-whatsapp emits, and the flat
+// m.relates_to.event_id that other clients send. An m.replace relation is an
+// edit, so it fills editOf instead of replyTo and the edit stays in the stream
+// for a client to apply; any other relation names its parent in the flat field,
+// so a thread reply that carries no m.in_reply_to still points at its root.
+func relationFields(msg *event.MessageEventContent) (replyTo, editOf string, mentions []string) {
+	if rel := msg.RelatesTo; rel != nil {
+		switch {
+		case rel.Type == event.RelReplace:
+			editOf = rel.EventID.String()
+		case rel.InReplyTo != nil && rel.InReplyTo.EventID != "":
+			replyTo = rel.InReplyTo.EventID.String()
+		default:
+			replyTo = rel.EventID.String()
+		}
+	}
+	if msg.Mentions != nil {
+		for _, userID := range msg.Mentions.UserIDs {
+			mentions = append(mentions, userID.String())
+		}
+	}
+	return replyTo, editOf, mentions
 }
 
 // placeholderBody substitutes a short bracketed marker for a media event that

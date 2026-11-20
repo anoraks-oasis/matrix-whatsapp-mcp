@@ -2,6 +2,7 @@ package matrix
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"io"
 	"log"
@@ -246,14 +247,15 @@ func TestMessagesClampsLimitAndConverts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := c.Messages(context.Background(), "not-a-room", 20); !errors.Is(err, ErrInvalidRoomID) {
+	if _, err := c.Messages(context.Background(), "not-a-room", 20, ""); !errors.Is(err, ErrInvalidRoomID) {
 		t.Fatalf("Messages(invalid room) = %v, want ErrInvalidRoomID", err)
 	}
 
-	msgs, err := c.Messages(context.Background(), "!r:test", 500)
+	page, err := c.Messages(context.Background(), "!r:test", 500, "")
 	if err != nil {
 		t.Fatalf("Messages: %v", err)
 	}
+	msgs := page.Messages
 	if len(msgs) != 2 {
 		t.Fatalf("Messages returned %d messages, want 2", len(msgs))
 	}
@@ -264,7 +266,7 @@ func TestMessagesClampsLimitAndConverts(t *testing.T) {
 		t.Fatalf("converted message wrong: %+v", msgs[0])
 	}
 
-	if _, err := c.Messages(context.Background(), "!r:test", 0); err != nil {
+	if _, err := c.Messages(context.Background(), "!r:test", 0, ""); err != nil {
 		t.Fatalf("Messages(limit=0): %v", err)
 	}
 
@@ -384,7 +386,7 @@ func TestRoomIDValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := c.Messages(context.Background(), domainlessRoomID, 10); err != nil {
+	if _, err := c.Messages(context.Background(), domainlessRoomID, 10, ""); err != nil {
 		t.Fatalf("Messages(%q) = %v, want success", domainlessRoomID, err)
 	}
 	if _, err := c.SendText(context.Background(), domainlessRoomID, "hi"); err != nil {
@@ -393,7 +395,7 @@ func TestRoomIDValidation(t *testing.T) {
 
 	// The 255-byte cap is inclusive.
 	boundary := "!" + strings.Repeat("x", 254)
-	if _, err := c.Messages(context.Background(), boundary, 10); err != nil {
+	if _, err := c.Messages(context.Background(), boundary, 10, ""); err != nil {
 		t.Fatalf("Messages(%d-byte room ID) = %v, want success", len(boundary), err)
 	}
 
@@ -408,7 +410,7 @@ func TestRoomIDValidation(t *testing.T) {
 		"!" + strings.Repeat("x", 255),
 	}
 	for _, roomID := range rejected {
-		if _, err := c.Messages(context.Background(), roomID, 10); !errors.Is(err, ErrInvalidRoomID) {
+		if _, err := c.Messages(context.Background(), roomID, 10, ""); !errors.Is(err, ErrInvalidRoomID) {
 			t.Errorf("Messages(%q) = %v, want ErrInvalidRoomID", roomID, err)
 		}
 		if _, err := c.SendText(context.Background(), roomID, "hi"); !errors.Is(err, ErrInvalidRoomID) {
@@ -503,10 +505,11 @@ func TestMessagesPagesPastNonMessageEvents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	msgs, err := c.Messages(context.Background(), "!r:test", 4)
+	page, err := c.Messages(context.Background(), "!r:test", 4, "")
 	if err != nil {
 		t.Fatalf("Messages: %v", err)
 	}
+	msgs := page.Messages
 	var got []string
 	for _, m := range msgs {
 		got = append(got, m.EventID)
@@ -542,10 +545,11 @@ func TestMessagesPaginationIsBounded(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		msgs, err := c.Messages(context.Background(), "!r:test", 2)
+		page, err := c.Messages(context.Background(), "!r:test", 2, "")
 		if err != nil {
 			t.Fatalf("Messages: %v", err)
 		}
+		msgs := page.Messages
 		if len(msgs) != 0 {
 			t.Fatalf("Messages = %+v, want none (only member events)", msgs)
 		}
@@ -568,7 +572,7 @@ func TestMessagesPaginationIsBounded(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := c.Messages(context.Background(), "!r:test", 2); err != nil {
+		if _, err := c.Messages(context.Background(), "!r:test", 2, ""); err != nil {
 			t.Fatalf("Messages: %v", err)
 		}
 		want := (maxMessageRawFactor * 2) / 5
@@ -593,10 +597,11 @@ func TestMessagesMediaPlaceholder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	msgs, err := c.Messages(context.Background(), "!r:test", 10)
+	result, err := c.Messages(context.Background(), "!r:test", 10, "")
 	if err != nil {
 		t.Fatalf("Messages: %v", err)
 	}
+	msgs := result.Messages
 	if len(msgs) != 5 {
 		t.Fatalf("Messages returned %d messages, want 5", len(msgs))
 	}
@@ -1128,4 +1133,329 @@ func TestWhoAmIReportsTokenOwner(t *testing.T) {
 	if userID != "@bot:test" || deviceID != "DEVICE" {
 		t.Fatalf("WhoAmI = %q/%q, want @bot:test/DEVICE", userID, deviceID)
 	}
+}
+
+// TestMessagesPaginationRoundTrip is the whole feature in one test: a call
+// without a token starts at the newest message, its next_token reads the page
+// behind it, and the last page reports that there is nothing older.
+func TestMessagesPaginationRoundTrip(t *testing.T) {
+	srv, requests := messagesServer(t, func(n int) (string, string) {
+		switch n {
+		case 0:
+			return textEvent("$m3", 300, "three") + "," + textEvent("$m4", 400, "four"), "page2"
+		case 1:
+			return textEvent("$m1", 100, "one") + "," + textEvent("$m2", 200, "two"), ""
+		default:
+			t.Errorf("unexpected /messages request %d", n+1)
+			return "", ""
+		}
+	})
+	defer srv.Close()
+
+	c, err := New(testConfig(srv.URL), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	first, err := c.Messages(ctx, "!r:test", 2, "")
+	if err != nil {
+		t.Fatalf("first page: %v", err)
+	}
+	if ids := eventIDs(first.Messages); strings.Join(ids, ",") != "$m3,$m4" {
+		t.Fatalf("first page = %v, want the newest two messages [$m3 $m4]", ids)
+	}
+	if !first.HasMore {
+		t.Fatal("first page has_more = false, want true while the token exists")
+	}
+	if first.NextToken == "" {
+		t.Fatal("first page returned no next_token, want one for older history")
+	}
+
+	second, err := c.Messages(ctx, "!r:test", 2, first.NextToken)
+	if err != nil {
+		t.Fatalf("second page: %v", err)
+	}
+	if ids := eventIDs(second.Messages); strings.Join(ids, ",") != "$m1,$m2" {
+		t.Fatalf("second page = %v, want the older two messages [$m1 $m2]", ids)
+	}
+	if second.HasMore || second.NextToken != "" {
+		t.Fatalf("last page = has_more %t, next_token %q; want the end of history",
+			second.HasMore, second.NextToken)
+	}
+
+	reqs := requests()
+	if len(reqs) != 2 {
+		t.Fatalf("/messages requests = %d (%+v), want 2", len(reqs), reqs)
+	}
+	if reqs[0].from != "" {
+		t.Fatalf("first request from = %q, want the newest page (empty from)", reqs[0].from)
+	}
+	if reqs[1].from != "page2" {
+		t.Fatalf("second request from = %q, want the token's homeserver cursor page2", reqs[1].from)
+	}
+}
+
+// TestMessagesLastPageHasNoToken covers the boundary case where the newest page
+// is also the oldest: exactly limit messages and no end token must not promise
+// a page that does not exist.
+func TestMessagesLastPageHasNoToken(t *testing.T) {
+	page := textEvent("$m1", 100, "one") + "," + textEvent("$m2", 200, "two")
+	srv, _ := messagesServer(t, func(int) (string, string) { return page, "" })
+	defer srv.Close()
+
+	c, err := New(testConfig(srv.URL), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.Messages(context.Background(), "!r:test", 2, "")
+	if err != nil {
+		t.Fatalf("Messages: %v", err)
+	}
+	if len(got.Messages) != 2 {
+		t.Fatalf("Messages returned %d messages, want 2", len(got.Messages))
+	}
+	if got.HasMore || got.NextToken != "" {
+		t.Fatalf("has_more = %t, next_token = %q; want none when the room ends at this page",
+			got.HasMore, got.NextToken)
+	}
+}
+
+// TestMessagesRejectsBadPageTokens proves a bad token is a typed error rather
+// than a silent empty page, and that it never reaches the homeserver: a token
+// is unvalidated input on the next call.
+func TestMessagesRejectsBadPageTokens(t *testing.T) {
+	srv, requests := messagesServer(t, func(int) (string, string) { return "", "" })
+	defer srv.Close()
+
+	c, err := New(testConfig(srv.URL), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	valid, err := c.pages.sign("!r:test", "cursor1")
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	otherRoom, err := c.pages.sign("!other:test", "cursor1")
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	// A token from a previous process: same shape, different key.
+	restarted, err := newPageSigner()
+	if err != nil {
+		t.Fatalf("newPageSigner: %v", err)
+	}
+	fromRestart, err := restarted.sign("!r:test", "cursor1")
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	body, sig, _ := strings.Cut(valid, ".")
+	raw, err := base64.RawURLEncoding.DecodeString(body)
+	if err != nil {
+		t.Fatalf("decode signed body: %v", err)
+	}
+	raw[len(raw)-2] ^= 0x01
+	tampered := base64.RawURLEncoding.EncodeToString(raw) + "." + sig
+
+	cases := []struct {
+		name  string
+		token string
+	}{
+		{"garbage", "not-a-token"},
+		{"base64 body with no signature", body},
+		{"bad signature encoding", body + ".!!!"},
+		{"other room", otherRoom},
+		{"tampered payload", tampered},
+		{"issued by a previous process", fromRestart},
+		{"oversized", strings.Repeat("a", pageTokenMaxLen+1)},
+		{"empty payload", "." + sig},
+	}
+	for _, tc := range cases {
+		_, err := c.Messages(context.Background(), "!r:test", 5, tc.token)
+		if !errors.Is(err, ErrInvalidPageToken) {
+			t.Fatalf("%s: Messages = %v, want ErrInvalidPageToken", tc.name, err)
+		}
+	}
+	if n := len(requests()); n != 0 {
+		t.Fatalf("%d /messages requests were issued for invalid tokens, want 0", n)
+	}
+
+	// The same token is fine for the room it was issued for, so the refusals
+	// above are about validity and not about rejecting tokens in general.
+	if _, err := c.Messages(context.Background(), "!r:test", 5, valid); err != nil {
+		t.Fatalf("Messages with a valid token = %v, want success", err)
+	}
+}
+
+// TestMessagesStaleTokenIsTyped covers the token this process issued but the
+// homeserver will not honour: the caller gets a specific error it can act on,
+// while an ordinary /messages failure stays a plain error.
+func TestMessagesStaleTokenIsTyped(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/messages") {
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Query().Get("from") != "" {
+			w.WriteHeader(http.StatusBadRequest)
+			io.WriteString(w, `{"errcode":"M_INVALID_PARAM","error":"Invalid from token"}`)
+			return
+		}
+		io.WriteString(w, `{"chunk":[`+textEvent("$m1", 100, "one")+`],"end":"gone"}`)
+	}))
+	defer srv.Close()
+
+	c, err := New(testConfig(srv.URL), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := c.pages.sign("!r:test", "gone")
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	if _, err := c.Messages(context.Background(), "!r:test", 5, token); !errors.Is(err, ErrStalePageToken) {
+		t.Fatalf("Messages with a rejected token = %v, want ErrStalePageToken", err)
+	}
+	if _, err := c.Messages(context.Background(), "!r:test", 5, token); errors.Is(err, ErrInvalidPageToken) {
+		t.Fatal("a stale token was reported as invalid; the two failures need different fixes")
+	}
+}
+
+// TestMessagesBoundsApplyFromAToken proves a token cannot be used to make one
+// call unbounded: the page cap and the raw-event budget still apply.
+func TestMessagesBoundsApplyFromAToken(t *testing.T) {
+	srv, requests := messagesServer(t, func(n int) (string, string) {
+		return memberEvent("$j"+itoa(int64(n)), "@alice:test"), "next" + itoa(int64(n))
+	})
+	defer srv.Close()
+
+	c, err := New(testConfig(srv.URL), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := c.pages.sign("!r:test", "start")
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	got, err := c.Messages(context.Background(), "!r:test", 2, token)
+	if err != nil {
+		t.Fatalf("Messages: %v", err)
+	}
+	if len(got.Messages) != 0 {
+		t.Fatalf("Messages = %+v, want none (only member events)", got.Messages)
+	}
+	reqs := requests()
+	if len(reqs) != maxMessagePages {
+		t.Fatalf("/messages requests = %d, want %d (page cap still applies)", len(reqs), maxMessagePages)
+	}
+	if reqs[0].from != "start" {
+		t.Fatalf("first request from = %q, want the token's cursor", reqs[0].from)
+	}
+	if !got.HasMore || got.NextToken == "" {
+		t.Fatalf("bounded page = has_more %t, token %q; want a token to continue from", got.HasMore, got.NextToken)
+	}
+}
+
+// TestPageTokensAreOpaqueAndLoggable pins the token's outward properties: a
+// log-safe alphabet, a bounded length, and no readable room ID or cursor, so a
+// token can be logged and paste without leaking where it points.
+func TestPageTokensAreOpaqueAndLoggable(t *testing.T) {
+	c, err := New(testConfig("http://127.0.0.1:1"), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := c.pages.sign("!secret-room:test", "t123-456")
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	if len(token) > 200 {
+		t.Fatalf("token length = %d, want a short token", len(token))
+	}
+	for _, r := range token {
+		switch {
+		case r >= 'A' && r <= 'Z', r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+		default:
+			t.Fatalf("token %q contains %q, want only base64url characters and '.'", token, r)
+		}
+	}
+	for _, leaked := range []string{"secret-room", "!secret", "t123-456"} {
+		if strings.Contains(token, leaked) {
+			t.Fatalf("token %q carries %q in clear", token, leaked)
+		}
+	}
+}
+
+// TestMessagesRelations covers what a transcript needs to be read as a
+// conversation: both reply shapes, an edit, a mention list, and a redacted
+// message that keeps its place with no text.
+func TestMessagesRelations(t *testing.T) {
+	page := strings.Join([]string{
+		// The shape mautrix-whatsapp sends for a reply: no rel_type, only
+		// m.in_reply_to. "$parent" is deliberately not in this page.
+		`{"type":"m.room.message","event_id":"$reply","sender":"@wa:test","origin_server_ts":200,` +
+			`"content":{"msgtype":"m.text","body":"answering","m.relates_to":{"m.in_reply_to":{"event_id":"$parent"}}}}`,
+		// The flat shape other clients send for a reply.
+		`{"type":"m.room.message","event_id":"$flat","sender":"@a:test","origin_server_ts":201,` +
+			`"content":{"msgtype":"m.text","body":"flat reply","m.relates_to":{"event_id":"$parent2"}}}`,
+		// An edit: rel_type m.replace, with the in_reply_to some clients add.
+		`{"type":"m.room.message","event_id":"$edit","sender":"@a:test","origin_server_ts":202,` +
+			`"content":{"msgtype":"m.text","body":"* corrected","m.relates_to":{"rel_type":"m.replace","event_id":"$orig","m.in_reply_to":{"event_id":"$orig"}}}}`,
+		// A mention list.
+		`{"type":"m.room.message","event_id":"$mention","sender":"@a:test","origin_server_ts":203,` +
+			`"content":{"msgtype":"m.text","body":"hey you","m.mentions":{"user_ids":["@bot:test","@b:test"]}}}`,
+		// A redacted message: content stripped, redaction recorded in unsigned.
+		`{"type":"m.room.message","event_id":"$gone","sender":"@a:test","origin_server_ts":204,"content":{},` +
+			`"unsigned":{"redacted_because":{"type":"m.room.redaction","event_id":"$red","sender":"@a:test","origin_server_ts":205,"content":{}}}}`,
+		textEvent("$plain", 206, "nothing special"),
+	}, ",")
+	srv, _ := messagesServer(t, func(int) (string, string) { return page, "" })
+	defer srv.Close()
+
+	c, err := New(testConfig(srv.URL), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.Messages(context.Background(), "!r:test", 10, "")
+	if err != nil {
+		t.Fatalf("Messages: %v", err)
+	}
+	byID := make(map[string]Message, len(got.Messages))
+	for _, m := range got.Messages {
+		byID[m.EventID] = m
+	}
+	if len(byID) != 6 {
+		t.Fatalf("Messages returned %d messages, want 6: %+v", len(byID), got.Messages)
+	}
+
+	if m := byID["$reply"]; m.ReplyTo != "$parent" || m.EditOf != "" || m.Body != "answering" {
+		t.Fatalf("$reply = %+v, want reply_to $parent and its body", m)
+	}
+	if m := byID["$flat"]; m.ReplyTo != "$parent2" {
+		t.Fatalf("$flat = %+v, want reply_to $parent2 from the flat shape", m)
+	}
+	if m := byID["$edit"]; m.EditOf != "$orig" || m.ReplyTo != "" {
+		t.Fatalf("$edit = %+v, want edit_of $orig and no reply_to (an edit is not a reply)", m)
+	}
+	if m := byID["$edit"]; m.Body != "* corrected" {
+		t.Fatalf("$edit body = %q, want the edit kept in the stream for the client to apply", m.Body)
+	}
+	if m := byID["$mention"]; strings.Join(m.Mentions, ",") != "@bot:test,@b:test" {
+		t.Fatalf("$mention = %+v, want both mentioned user IDs", m)
+	}
+	if m := byID["$gone"]; !m.Redacted || m.Body != "" || m.MsgType != "" {
+		t.Fatalf("$gone = %+v, want redacted true with no body and no type", m)
+	}
+	if m := byID["$plain"]; m.Redacted || m.ReplyTo != "" || m.EditOf != "" || len(m.Mentions) != 0 {
+		t.Fatalf("$plain = %+v, want no relations", m)
+	}
+}
+
+// eventIDs is the event ID of every message, in order.
+func eventIDs(msgs []Message) []string {
+	out := make([]string, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, m.EventID)
+	}
+	return out
 }

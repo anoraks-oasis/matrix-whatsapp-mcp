@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"path/filepath"
@@ -19,34 +20,55 @@ import (
 )
 
 // fakeMatrix is an in-memory MatrixService. Each method records its arguments
-// so handler tests can assert what was passed through the MCP boundary.
+// so handler tests can assert what was passed through the MCP boundary. The
+// recording is mutex-guarded because the idempotency test drives concurrent
+// calls through one server.
 type fakeMatrix struct {
-	rooms     []matrix.Room
-	roomsErr  error
-	msgs      []matrix.Message
-	msgsErr   error
-	msgsRoom  []string
-	msgsLimit []int
-	sentRoom  []string
-	sentText  []string
-	sentID    string
-	sentErr   error
+	mu         sync.Mutex
+	rooms      []matrix.Room
+	roomsErr   error
+	msgs       []matrix.Message
+	msgsNext   string
+	msgsMore   bool
+	msgsErr    error
+	msgsRoom   []string
+	msgsLimit  []int
+	msgsBefore []string
+	sentRoom   []string
+	sentText   []string
+	sentID     string
+	sentErr    error
 }
 
 func (f *fakeMatrix) JoinedRooms(context.Context) ([]matrix.Room, error) {
 	return f.rooms, f.roomsErr
 }
 
-func (f *fakeMatrix) Messages(_ context.Context, roomID string, limit int) ([]matrix.Message, error) {
+func (f *fakeMatrix) Messages(_ context.Context, roomID string, limit int, before string) (matrix.MessagePage, error) {
+	f.mu.Lock()
 	f.msgsRoom = append(f.msgsRoom, roomID)
 	f.msgsLimit = append(f.msgsLimit, limit)
-	return f.msgs, f.msgsErr
+	f.msgsBefore = append(f.msgsBefore, before)
+	page := matrix.MessagePage{Messages: f.msgs, NextToken: f.msgsNext, HasMore: f.msgsMore}
+	err := f.msgsErr
+	f.mu.Unlock()
+	return page, err
 }
 
 func (f *fakeMatrix) SendText(_ context.Context, roomID, text string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.sentRoom = append(f.sentRoom, roomID)
 	f.sentText = append(f.sentText, text)
 	return f.sentID, f.sentErr
+}
+
+// sends returns copies of what SendText recorded, for assertions made after the
+// calls have returned.
+func (f *fakeMatrix) sends() (rooms, texts []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.sentRoom...), append([]string(nil), f.sentText...)
 }
 
 func (f *fakeMatrix) Sync(context.Context) error { return nil }
@@ -219,12 +241,20 @@ func TestToolsListHasFourToolsWithSchemas(t *testing.T) {
 		t.Fatalf("list_rooms required = %v, want none", requiredFields(t, listRooms))
 	}
 
-	read := schemaMap(t, toolByName(t, res.Tools, "read_messages"))
+	readTool := toolByName(t, res.Tools, "read_messages")
+	read := schemaMap(t, readTool)
 	hasField(t, read, "room_id")
 	// read_messages must describe the type of every message it returns, so a
-	// media event is never a blank body with no hint about what it was.
-	for _, field := range []string{"msgtype", "encrypted", "body"} {
-		if _, ok := outputProperties(t, toolByName(t, res.Tools, "read_messages"))[field]; !ok {
+	// media event is never a blank body with no hint about what it was, and
+	// every relation that makes a reply, an edit or a deletion readable.
+	for _, field := range []string{"msgtype", "encrypted", "body", "reply_to", "edit_of", "mentions", "redacted"} {
+		if _, ok := messageProperties(t, readTool)[field]; !ok {
+			t.Fatalf("read_messages message schema has no %q property", field)
+		}
+	}
+	// Pagination lives in the output envelope, next to the messages it pages.
+	for _, field := range []string{"messages", "next_token", "has_more"} {
+		if _, ok := envelopeProperties(t, readTool)[field]; !ok {
 			t.Fatalf("read_messages output schema has no %q property", field)
 		}
 	}
@@ -236,6 +266,13 @@ func TestToolsListHasFourToolsWithSchemas(t *testing.T) {
 	if desc, _ := limit["description"].(string); !strings.Contains(desc, "default 20") || !strings.Contains(desc, "100") {
 		t.Fatalf("read_messages limit description = %q, want it to document default 20 and max 100", desc)
 	}
+	before := readProps["before"].(map[string]any)
+	if before["type"] != "string" {
+		t.Fatalf("read_messages before type = %v, want string", before["type"])
+	}
+	if desc, _ := before["description"].(string); !strings.Contains(desc, "next_token") {
+		t.Fatalf("read_messages before description = %q, want it to name next_token", desc)
+	}
 
 	recent := schemaMap(t, toolByName(t, res.Tools, "get_recent_triggers"))
 	if len(requiredFields(t, recent)) != 0 {
@@ -246,6 +283,22 @@ func TestToolsListHasFourToolsWithSchemas(t *testing.T) {
 	req := requiredFields(t, send)
 	if len(req) != 2 || req[0] != "room_id" || req[1] != "text" {
 		t.Fatalf("send_message required = %v, want [room_id text]", req)
+	}
+
+	// Annotations are part of the tool contract: readOnlyHint keeps a client
+	// from treating a read as a write, and destructiveHint/idempotentHint on
+	// send_message keep it from retrying a send that is neither.
+	for _, name := range []string{"list_rooms", "read_messages", "get_recent_triggers"} {
+		ann := toolByName(t, res.Tools, name).Annotations
+		if ann == nil {
+			t.Fatalf("%s has no annotations, want readOnlyHint true", name)
+		}
+		if !ann.ReadOnlyHint {
+			t.Fatalf("%s readOnlyHint = false, want true", name)
+		}
+		if ann.DestructiveHint != nil && *ann.DestructiveHint {
+			t.Fatalf("%s claims destructiveHint, want it unset", name)
+		}
 	}
 }
 
@@ -282,7 +335,7 @@ func TestListRoomsKeepsRoomsWithFailedProbes(t *testing.T) {
 }
 
 // outputProperties returns the properties of a tool's structured output, which
-// is an array schema in every tool here.
+// is an array schema for list_rooms and get_recent_triggers.
 func outputProperties(t *testing.T, tool *mcp.Tool) map[string]any {
 	t.Helper()
 	schema, ok := tool.OutputSchema.(map[string]any)
@@ -296,6 +349,41 @@ func outputProperties(t *testing.T, tool *mcp.Tool) map[string]any {
 	props, ok := items["properties"].(map[string]any)
 	if !ok {
 		t.Fatalf("tool %q output schema has no properties: %v", tool.Name, items)
+	}
+	return props
+}
+
+// envelopeProperties returns the properties of a tool's object-shaped output
+// (read_messages and send_message).
+func envelopeProperties(t *testing.T, tool *mcp.Tool) map[string]any {
+	t.Helper()
+	schema, ok := tool.OutputSchema.(map[string]any)
+	if !ok {
+		t.Fatalf("tool %q OutputSchema is %T, want map[string]any", tool.Name, tool.OutputSchema)
+	}
+	props, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("tool %q output schema has no properties: %v", tool.Name, schema)
+	}
+	return props
+}
+
+// messageProperties returns the schema of one message inside read_messages'
+// output envelope, so a field cannot be dropped from the message shape without
+// failing the tools/list test.
+func messageProperties(t *testing.T, tool *mcp.Tool) map[string]any {
+	t.Helper()
+	messages, ok := envelopeProperties(t, tool)["messages"].(map[string]any)
+	if !ok {
+		t.Fatalf("tool %q output schema has no messages object", tool.Name)
+	}
+	items, ok := messages["items"].(map[string]any)
+	if !ok {
+		t.Fatalf("tool %q messages schema has no items object: %v", tool.Name, messages)
+	}
+	props, ok := items["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("tool %q message schema has no properties: %v", tool.Name, items)
 	}
 	return props
 }
@@ -336,7 +424,7 @@ func TestReadMessagesOrdersAndClamps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read_messages: %v", err)
 	}
-	msgs := decodeStructured[[]messageResult](t, res)
+	msgs := decodeStructured[readMessagesResult](t, res).Messages
 	if len(msgs) != 2 || msgs[0].EventID != "$1" || msgs[1].EventID != "$2" {
 		t.Fatalf("read_messages = %+v, want [$1 $2] oldest first", msgs)
 	}
@@ -364,7 +452,7 @@ func TestReadMessagesCarriesMsgType(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("read_messages returned error: %s", resultErrorText(t, res))
 	}
-	msgs := decodeStructured[[]messageResult](t, res)
+	msgs := decodeStructured[readMessagesResult](t, res).Messages
 	if len(msgs) != 2 {
 		t.Fatalf("read_messages returned %d messages, want 2", len(msgs))
 	}
@@ -670,5 +758,109 @@ func TestSendGateUnionOfEnvAndFile(t *testing.T) {
 	}
 	if err := gate.check("!other:test"); err == nil || !strings.Contains(err.Error(), "not allowed") {
 		t.Fatalf("check of an unlisted room = %v, want a not-allowed error", err)
+	}
+}
+
+// TestReadMessagesPagination proves the tool pages history: the envelope
+// carries has_more and next_token, and the next call's before reaches the
+// Matrix layer untouched. Without a token the call still starts at the newest
+// message.
+func TestReadMessagesPagination(t *testing.T) {
+	svc := &fakeMatrix{
+		msgs:     []matrix.Message{{EventID: "$2", RoomID: "!r:test", Body: "new", Timestamp: 200}},
+		msgsNext: "token-1",
+		msgsMore: true,
+	}
+	srv := New(svc, &fakeProber{}, &fakeRecent{}, nil)
+	session, cleanup := connect(t, srv)
+	defer cleanup()
+
+	call := func(t *testing.T, args map[string]any) readMessagesResult {
+		t.Helper()
+		res, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "read_messages", Arguments: args})
+		if err != nil {
+			t.Fatalf("read_messages: %v", err)
+		}
+		if res.IsError {
+			t.Fatalf("read_messages returned error: %s", resultErrorText(t, res))
+		}
+		return decodeStructured[readMessagesResult](t, res)
+	}
+
+	first := call(t, map[string]any{"room_id": "!r:test"})
+	if first.NextToken != "token-1" || !first.HasMore {
+		t.Fatalf("first page = next_token %q, has_more %t; want the fake's token and more", first.NextToken, first.HasMore)
+	}
+	if len(first.Messages) != 1 || first.Messages[0].EventID != "$2" {
+		t.Fatalf("first page messages = %+v, want [$2]", first.Messages)
+	}
+
+	second := call(t, map[string]any{"room_id": "!r:test", "before": first.NextToken})
+	if second.NextToken != "token-1" {
+		t.Fatalf("second page next_token = %q, want the fake's token passed through", second.NextToken)
+	}
+
+	if len(svc.msgsBefore) != 2 || svc.msgsBefore[0] != "" || svc.msgsBefore[1] != "token-1" {
+		t.Fatalf("matrix saw before tokens %q, want [\"\" token-1]", svc.msgsBefore)
+	}
+}
+
+// TestReadMessagesRelations proves the relation fields cross the MCP boundary:
+// replies keep their parent, edits are marked rather than dropped, mentions are
+// listed, and a redacted message stays in the page with no body.
+func TestReadMessagesRelations(t *testing.T) {
+	svc := &fakeMatrix{msgs: []matrix.Message{
+		{EventID: "$edit", RoomID: "!r:test", Body: "* fixed", MsgType: "m.text", Timestamp: 300, EditOf: "$orig"},
+		{EventID: "$gone", RoomID: "!r:test", MsgType: "", Timestamp: 200, Redacted: true},
+		{EventID: "$reply", RoomID: "!r:test", Body: "yes", MsgType: "m.text", Timestamp: 100,
+			ReplyTo: "$parent", Mentions: []string{"@bot:test"}},
+	}}
+	srv := New(svc, &fakeProber{}, &fakeRecent{}, nil)
+	session, cleanup := connect(t, srv)
+	defer cleanup()
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "read_messages",
+		Arguments: map[string]any{"room_id": "!r:test"},
+	})
+	if err != nil {
+		t.Fatalf("read_messages: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("read_messages returned error: %s", resultErrorText(t, res))
+	}
+	msgs := decodeStructured[readMessagesResult](t, res).Messages
+	if len(msgs) != 3 {
+		t.Fatalf("read_messages returned %d messages, want 3 (a redacted one is not dropped)", len(msgs))
+	}
+	// Oldest first: the reply, then the redacted message, then the edit.
+	if msgs[0].EventID != "$reply" || msgs[0].ReplyTo != "$parent" || strings.Join(msgs[0].Mentions, ",") != "@bot:test" {
+		t.Fatalf("msgs[0] = %+v, want the reply with its parent and mention", msgs[0])
+	}
+	if msgs[1].EventID != "$gone" || !msgs[1].Redacted || msgs[1].Body != "" {
+		t.Fatalf("msgs[1] = %+v, want the redacted message with no body", msgs[1])
+	}
+	if msgs[2].EventID != "$edit" || msgs[2].EditOf != "$orig" || msgs[2].Body != "* fixed" {
+		t.Fatalf("msgs[2] = %+v, want the edit marked with edit_of and kept", msgs[2])
+	}
+}
+
+// TestReadMessagesErrorSurfaces proves a Matrix failure is reported as a tool
+// error rather than an empty page.
+func TestReadMessagesErrorSurfaces(t *testing.T) {
+	svc := &fakeMatrix{msgsErr: errors.New("boom from the homeserver")}
+	srv := New(svc, &fakeProber{}, &fakeRecent{}, nil)
+	session, cleanup := connect(t, srv)
+	defer cleanup()
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "read_messages",
+		Arguments: map[string]any{"room_id": "!r:test"},
+	})
+	if err != nil {
+		t.Fatalf("read_messages: %v", err)
+	}
+	if text := resultErrorText(t, res); !strings.Contains(text, "boom") {
+		t.Fatalf("read_messages error = %q, want the Matrix failure", text)
 	}
 }
