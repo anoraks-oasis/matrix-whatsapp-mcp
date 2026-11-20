@@ -35,12 +35,14 @@ per variable, with an example value:
 | `MATRIX_PICKLE_KEY` | no | — | `change-me-32-byte-random-string` | Crypto pickle key; required when E2EE is on. Secret. |
 | `TRIGGER_WEBHOOK_URL` | no | — | `https://example.com/hooks/wa` | Optional URL to POST incoming-message triggers (JSON, 5s timeout, 1 retry). |
 | `ALLOWED_SEND_ROOMS` | no | — (empty) | `!room1:example.com,!UBRW6WycBKpUJu3m4HP0RCMsGnUp_EwSZa2RLXHe34Y` | Comma-separated room IDs allowed to receive outbound messages; a `:server` suffix is optional. Empty = read-only (sending fails closed). |
+| `MATRIX_BRIDGE_ACK_TIMEOUT` | no | `1s` | `1s`, `500ms`, `0` | How long a send waits for the bridge's rejection notice. `0` disables the check. |
 | `MCP_TRANSPORT` | no | `stdio` | `stdio` or `http` | How the MCP server is exposed. |
 | `HTTP_ADDR` | no | `:8080` | `127.0.0.1:8080` | Listen address when `MCP_TRANSPORT=http`. |
 
 See [.env.example](.env.example) for a copy-paste template. Sending fails
 closed: unless a room is listed in `ALLOWED_SEND_ROOMS`, the server refuses to
-send to it.
+send to it, and a send the WhatsApp bridge rejects is reported as a failure
+rather than a success (see `MATRIX_BRIDGE_ACK_TIMEOUT`).
 
 ## Building and running
 
@@ -267,6 +269,9 @@ Behavioral guarantees:
   `m.file`, ...) is reported with a bracketed type marker such as `[image]`
   derived from the `msgtype` alone, never invented content. Non-empty bodies
   and text-like types (`m.text`, `m.notice`, `m.emote`) are returned verbatim.
+- `SendText` returns a `*matrix.BridgeNoticeError` (matching
+  `matrix.ErrNotBridged`) when the bridge reports the message was not forwarded
+  within `MATRIX_BRIDGE_ACK_TIMEOUT`.
 - With `MATRIX_E2EE_ENABLED=true`, `New`/first `Sync` wires
   `crypto/cryptohelper` with a SQLite store at `MATRIX_CRYPTO_DB_PATH`, and
   `SendText` refuses plaintext sends into encrypted rooms
@@ -361,6 +366,32 @@ and a token bucket (one message per 3 seconds across all rooms). An empty
 a non-empty list is rejected without consuming the token; a throttled call
 returns `rate limited, retry in Ns` rather than blocking. The access token is
 never logged and never appears in an error or tool result.
+
+Matrix accepting an event does not prove the bridge forwarded it. When a
+bridge rejects a message it posts an `m.notice` into the room whose
+`m.relates_to.event_id` is the sent event, for example:
+
+> ⚠️ Your message was not bridged: You're not logged in (relay not set and
+> receiver login is owned by @alice:example.com, not @bot:example.com)
+
+`send_message` therefore fails closed on the bridge too. After the send,
+`SendText` polls the room's newest events every 100ms for up to
+`MATRIX_BRIDGE_ACK_TIMEOUT` (default 1s) looking for a notice from another
+account that relates to the sent event. If one appears, the tool returns a
+`*matrix.BridgeNoticeError` matching `matrix.ErrNotBridged`: it names the sent
+event ID and quotes the notice, flattened to one line with control characters
+removed. No notice within the window means normal success. With the timeout
+set to `0` the guard is off entirely and the send issues no extra request.
+
+Raise `MATRIX_BRIDGE_ACK_TIMEOUT` if your bridge is slow to post its notice:
+the guard can only report what it sees inside the window. It also only matches
+notices that carry `m.relates_to` pointing at the sent event, which is what
+mautrix-whatsapp emits.
+
+The usual cause of a rejection notice is relay mode: `bridge.relay.enabled`
+must be set in the bridge's config, and the sending account must be permitted
+to relay through the bridge bot. Without it the bridge has no WhatsApp login to
+speak for the sender and reports "not logged in".
 
 ### cmd/server
 
