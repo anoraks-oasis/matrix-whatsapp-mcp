@@ -14,3 +14,10 @@
 /server
 /matrix-whatsapp-mcp.exe
 /server.exe
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

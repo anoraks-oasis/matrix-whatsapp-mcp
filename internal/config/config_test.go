@@ -251,7 +251,7 @@ func TestInviteAllowedWithEmptyAllowlist(t *testing.T) {
 // neither fmt verb can reach the struct's fields directly.
 func TestConfigStringRedactsSecrets(t *testing.T) {
 	const (
-		token     = "syt_access_token_value_that_must_not_leak"
+		token     = "matrix-access-token-value-that-must-not-leak"
 		pickleKey = "pickle-key-value-that-must-not-leak"
 		webhook   = "https://hooks.example.com/services/T000/B000/secret-path"
 	)
