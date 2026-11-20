@@ -36,8 +36,10 @@ type fakeMatrix struct {
 	msgsBefore []string
 	sentRoom   []string
 	sentText   []string
+	sentReply  []string
 	sentID     string
 	sentErr    error
+	sendDelay  time.Duration
 }
 
 func (f *fakeMatrix) JoinedRooms(context.Context) ([]matrix.Room, error) {
@@ -55,20 +57,24 @@ func (f *fakeMatrix) Messages(_ context.Context, roomID string, limit int, befor
 	return page, err
 }
 
-func (f *fakeMatrix) SendText(_ context.Context, roomID, text string) (string, error) {
+func (f *fakeMatrix) SendText(_ context.Context, roomID, text, replyTo string) (string, error) {
+	if f.sendDelay > 0 {
+		time.Sleep(f.sendDelay)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.sentRoom = append(f.sentRoom, roomID)
 	f.sentText = append(f.sentText, text)
+	f.sentReply = append(f.sentReply, replyTo)
 	return f.sentID, f.sentErr
 }
 
 // sends returns copies of what SendText recorded, for assertions made after the
 // calls have returned.
-func (f *fakeMatrix) sends() (rooms, texts []string) {
+func (f *fakeMatrix) sends() (rooms, texts, replies []string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]string(nil), f.sentRoom...), append([]string(nil), f.sentText...)
+	return append([]string(nil), f.sentRoom...), append([]string(nil), f.sentText...), append([]string(nil), f.sentReply...)
 }
 
 func (f *fakeMatrix) Sync(context.Context) error { return nil }
@@ -279,10 +285,33 @@ func TestToolsListHasFourToolsWithSchemas(t *testing.T) {
 		t.Fatalf("get_recent_triggers required = %v, want none", requiredFields(t, recent))
 	}
 
-	send := schemaMap(t, toolByName(t, res.Tools, "send_message"))
+	sendTool := toolByName(t, res.Tools, "send_message")
+	send := schemaMap(t, sendTool)
 	req := requiredFields(t, send)
 	if len(req) != 2 || req[0] != "room_id" || req[1] != "text" {
 		t.Fatalf("send_message required = %v, want [room_id text]", req)
+	}
+	sendProps := send["properties"].(map[string]any)
+	for _, field := range []string{"reply_to", "idempotency_key"} {
+		prop, ok := sendProps[field].(map[string]any)
+		if !ok {
+			t.Fatalf("send_message schema has no %q property", field)
+		}
+		if prop["type"] != "string" {
+			t.Fatalf("send_message %s type = %v, want string", field, prop["type"])
+		}
+		if desc, _ := prop["description"].(string); desc == "" {
+			t.Fatalf("send_message %s has no description", field)
+		}
+	}
+	if key := sendProps["idempotency_key"].(map[string]any); !strings.Contains(key["description"].(string), "128") {
+		t.Fatalf("idempotency_key description = %q, want it to document the 128-character cap", key["description"])
+	}
+	sendOut := envelopeProperties(t, sendTool)
+	for _, field := range []string{"event_id", "deduplicated"} {
+		if _, ok := sendOut[field]; !ok {
+			t.Fatalf("send_message output schema has no %q property", field)
+		}
 	}
 
 	// Annotations are part of the tool contract: readOnlyHint keeps a client
@@ -299,6 +328,20 @@ func TestToolsListHasFourToolsWithSchemas(t *testing.T) {
 		if ann.DestructiveHint != nil && *ann.DestructiveHint {
 			t.Fatalf("%s claims destructiveHint, want it unset", name)
 		}
+	}
+
+	ann := sendTool.Annotations
+	if ann == nil {
+		t.Fatal("send_message has no annotations")
+	}
+	if ann.DestructiveHint == nil || !*ann.DestructiveHint {
+		t.Fatalf("send_message destructiveHint = %v, want true", ann.DestructiveHint)
+	}
+	if ann.IdempotentHint {
+		t.Fatal("send_message idempotentHint = true, want false (only a keyed retry is idempotent)")
+	}
+	if ann.ReadOnlyHint {
+		t.Fatal("send_message readOnlyHint = true, want false")
 	}
 }
 
@@ -862,5 +905,242 @@ func TestReadMessagesErrorSurfaces(t *testing.T) {
 	}
 	if text := resultErrorText(t, res); !strings.Contains(text, "boom") {
 		t.Fatalf("read_messages error = %q, want the Matrix failure", text)
+	}
+}
+
+func TestSendMessageReplyThreading(t *testing.T) {
+	svc := &fakeMatrix{sentID: "$sent"}
+	srv := New(svc, &fakeProber{}, &fakeRecent{}, []string{"!ok:test"})
+	session, cleanup := connect(t, srv)
+	defer cleanup()
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "send_message",
+		Arguments: map[string]any{"room_id": "!ok:test", "text": "hello", "reply_to": "$parent"},
+	})
+	if err != nil {
+		t.Fatalf("send_message: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("send_message returned error: %s", resultErrorText(t, res))
+	}
+	if got := decodeStructured[sendMessageResult](t, res); got.EventID != "$sent" || got.Deduplicated {
+		t.Fatalf("send_message = %+v, want $sent and not deduplicated", got)
+	}
+	rooms, texts, replies := svc.sends()
+	if len(rooms) != 1 || rooms[0] != "!ok:test" || texts[0] != "hello" || replies[0] != "$parent" {
+		t.Fatalf("matrix saw rooms=%v texts=%v replies=%v, want one reply to $parent", rooms, texts, replies)
+	}
+}
+
+// TestSendMessageRejectsMalformedReply covers the local check: a malformed
+// reply target is refused before anything is sent and before the rate-limit
+// token is spent, so the corrected call goes through immediately.
+func TestSendMessageRejectsMalformedReply(t *testing.T) {
+	svc := &fakeMatrix{sentID: "$sent"}
+	srv := New(svc, &fakeProber{}, &fakeRecent{}, []string{"!ok:test"})
+	session, cleanup := connect(t, srv)
+	defer cleanup()
+
+	for _, bad := range []string{"not-an-event", "abc", "$", "$a b"} {
+		res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+			Name:      "send_message",
+			Arguments: map[string]any{"room_id": "!ok:test", "text": "hello", "reply_to": bad},
+		})
+		if err != nil {
+			t.Fatalf("send_message(reply_to=%q): %v", bad, err)
+		}
+		if text := resultErrorText(t, res); !strings.Contains(text, "event ID") {
+			t.Fatalf("malformed reply error = %q, want it to name the event ID shape", text)
+		}
+	}
+	if rooms, _, _ := svc.sends(); len(rooms) != 0 {
+		t.Fatalf("a malformed reply target reached matrix: %v", rooms)
+	}
+
+	// A rejected malformed reply must not consume the rate-limit token.
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "send_message",
+		Arguments: map[string]any{"room_id": "!ok:test", "text": "hello", "reply_to": "$parent"},
+	})
+	if err != nil {
+		t.Fatalf("corrected send: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("corrected send was rejected: %s", resultErrorText(t, res))
+	}
+}
+
+// TestSendMessageIdempotency covers the retry contract: an identical call
+// replays the first event ID without a second send, while a different message
+// under the same key is an error rather than a second post.
+func TestSendMessageIdempotency(t *testing.T) {
+	t.Run("same key and text replays the original", func(t *testing.T) {
+		svc := &fakeMatrix{sentID: "$first"}
+		srv := New(svc, &fakeProber{}, &fakeRecent{}, []string{"!ok:test"})
+		session, cleanup := connect(t, srv)
+		defer cleanup()
+
+		send := func(t *testing.T) sendMessageResult {
+			t.Helper()
+			res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+				Name:      "send_message",
+				Arguments: map[string]any{"room_id": "!ok:test", "text": "hello", "idempotency_key": "k1"},
+			})
+			if err != nil {
+				t.Fatalf("send_message: %v", err)
+			}
+			if res.IsError {
+				t.Fatalf("send_message returned error: %s", resultErrorText(t, res))
+			}
+			return decodeStructured[sendMessageResult](t, res)
+		}
+
+		first := send(t)
+		if first.EventID != "$first" || first.Deduplicated {
+			t.Fatalf("first send = %+v, want the new event and deduplicated false", first)
+		}
+		// The retry must not need a rate-limit token either, which is why the
+		// dedup lookup happens before the gate.
+		second := send(t)
+		if second.EventID != "$first" || !second.Deduplicated {
+			t.Fatalf("retry = %+v, want the original $first with deduplicated true", second)
+		}
+		if _, texts, _ := svc.sends(); len(texts) != 1 {
+			t.Fatalf("matrix saw %d sends, want exactly 1 (the retry was deduplicated)", len(texts))
+		}
+	})
+
+	t.Run("same key with different text is an error", func(t *testing.T) {
+		svc := &fakeMatrix{sentID: "$first"}
+		srv := New(svc, &fakeProber{}, &fakeRecent{}, []string{"!ok:test"})
+		session, cleanup := connect(t, srv)
+		defer cleanup()
+
+		if _, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+			Name:      "send_message",
+			Arguments: map[string]any{"room_id": "!ok:test", "text": "hello", "idempotency_key": "k1"},
+		}); err != nil {
+			t.Fatalf("first send: %v", err)
+		}
+		res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+			Name:      "send_message",
+			Arguments: map[string]any{"room_id": "!ok:test", "text": "something else", "idempotency_key": "k1"},
+		})
+		if err != nil {
+			t.Fatalf("second send: %v", err)
+		}
+		if text := resultErrorText(t, res); !strings.Contains(text, "idempotency key already used") {
+			t.Fatalf("conflict error = %q, want it to name the reused key", text)
+		}
+		if _, texts, _ := svc.sends(); len(texts) != 1 {
+			t.Fatalf("matrix saw %d sends, want exactly 1", len(texts))
+		}
+	})
+
+	t.Run("same key with a different room is an error", func(t *testing.T) {
+		svc := &fakeMatrix{sentID: "$first"}
+		srv := New(svc, &fakeProber{}, &fakeRecent{}, []string{"!ok:test", "!ok2:test"})
+		session, cleanup := connect(t, srv)
+		defer cleanup()
+
+		if _, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+			Name:      "send_message",
+			Arguments: map[string]any{"room_id": "!ok:test", "text": "hello", "idempotency_key": "k1"},
+		}); err != nil {
+			t.Fatalf("first send: %v", err)
+		}
+		res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+			Name:      "send_message",
+			Arguments: map[string]any{"room_id": "!ok2:test", "text": "hello", "idempotency_key": "k1"},
+		})
+		if err != nil {
+			t.Fatalf("second send: %v", err)
+		}
+		if text := resultErrorText(t, res); !strings.Contains(text, "idempotency key already used") {
+			t.Fatalf("conflict error = %q, want it to name the reused key", text)
+		}
+		if rooms, _, _ := svc.sends(); len(rooms) != 1 {
+			t.Fatalf("matrix saw %d sends, want exactly 1", len(rooms))
+		}
+	})
+
+	t.Run("over-long key is rejected", func(t *testing.T) {
+		svc := &fakeMatrix{sentID: "$first"}
+		srv := New(svc, &fakeProber{}, &fakeRecent{}, []string{"!ok:test"})
+		session, cleanup := connect(t, srv)
+		defer cleanup()
+
+		res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+			Name: "send_message",
+			Arguments: map[string]any{"room_id": "!ok:test", "text": "hello",
+				"idempotency_key": strings.Repeat("k", maxIdempotencyKeyLen+1)},
+		})
+		if err != nil {
+			t.Fatalf("send_message: %v", err)
+		}
+		if text := resultErrorText(t, res); !strings.Contains(text, "128") {
+			t.Fatalf("over-long key error = %q, want it to name the 128-character cap", text)
+		}
+		if rooms, _, _ := svc.sends(); len(rooms) != 0 {
+			t.Fatalf("an over-long key still reached matrix: %v", rooms)
+		}
+	})
+}
+
+// TestSendMessageIdempotencyConcurrent proves the key is claimed atomically: N
+// simultaneous retries of one message produce exactly one send, and every
+// caller gets that send's event ID. Run under -race, it also proves the cache
+// itself is race-free.
+func TestSendMessageIdempotencyConcurrent(t *testing.T) {
+	svc := &fakeMatrix{sentID: "$once", sendDelay: 20 * time.Millisecond}
+	srv := New(svc, &fakeProber{}, &fakeRecent{}, []string{"!ok:test"})
+	session, cleanup := connect(t, srv)
+	defer cleanup()
+
+	const callers = 8
+	var wg sync.WaitGroup
+	results := make([]sendMessageResult, callers)
+	errs := make([]error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+				Name:      "send_message",
+				Arguments: map[string]any{"room_id": "!ok:test", "text": "hello", "idempotency_key": "same-key"},
+			})
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			if res.IsError {
+				errs[i] = errors.New("tool error")
+				return
+			}
+			results[i] = decodeStructured[sendMessageResult](t, res)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("caller %d: %v", i, err)
+		}
+	}
+	fresh := 0
+	for i, got := range results {
+		if got.EventID != "$once" {
+			t.Fatalf("caller %d got event %q, want the one send's $once", i, got.EventID)
+		}
+		if !got.Deduplicated {
+			fresh++
+		}
+	}
+	if fresh != 1 {
+		t.Fatalf("%d callers saw a fresh send, want exactly 1", fresh)
+	}
+	if _, texts, _ := svc.sends(); len(texts) != 1 {
+		t.Fatalf("matrix saw %d sends, want exactly 1 for 8 concurrent retries", len(texts))
 	}
 }

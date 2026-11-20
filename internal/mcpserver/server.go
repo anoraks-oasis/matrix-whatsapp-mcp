@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -58,6 +59,7 @@ type Server struct {
 	prober RoomProber
 	recent TriggerReader
 	gate   *sendGate
+	sends  *idempotencyCache
 }
 
 // New builds the MCP server with its four tools wired to the given Matrix
@@ -76,6 +78,7 @@ func NewWithAllowlist(svc matrix.MatrixService, prober RoomProber, recent Trigge
 		prober: prober,
 		recent: recent,
 		gate:   newSendGateWith(allow, sendInterval),
+		sends:  newIdempotencyCache(),
 	}
 
 	mcpServer := mcp.NewServer(&mcp.Implementation{Name: Name, Version: Version}, &mcp.ServerOptions{
@@ -107,6 +110,7 @@ func NewWithAllowlist(svc matrix.MatrixService, prober RoomProber, recent Trigge
 	mcp.AddTool(mcpServer, &mcp.Tool{
 		Name: "send_message",
 		Description: "Send a plain-text message to a room. Fails closed unless the room is allow-listed, and is rate-limited to one message every 3 seconds. " +
+			"Set reply_to to answer a specific message, so the room shows it as a quote; set idempotency_key to make a retry safe. " +
 			"A message can be accepted by Matrix and still be rejected by the WhatsApp bridge; when the bridge posts its rejection notice within the acknowledgement window, " +
 			"the send fails with that notice instead of reporting success. The usual cause is relay mode (bridge.relay.enabled) not being configured for the sender's account.",
 		Annotations: &mcp.ToolAnnotations{
@@ -169,12 +173,15 @@ type triggerResult struct {
 }
 
 type sendMessageInput struct {
-	RoomID string `json:"room_id" jsonschema:"the Matrix room ID to send the message to"`
-	Text   string `json:"text" jsonschema:"the plain-text message body"`
+	RoomID         string `json:"room_id" jsonschema:"the Matrix room ID to send the message to"`
+	Text           string `json:"text" jsonschema:"the plain-text message body"`
+	ReplyTo        string `json:"reply_to,omitempty" jsonschema:"optional event ID of the message this one answers, for example $abc123. It must be a Matrix event ID ($ followed by the ID) or the call is rejected before anything is sent. The room must still be allow-listed; the replied-to message can be in any room"`
+	IdempotencyKey string `json:"idempotency_key,omitempty" jsonschema:"optional key of at most 128 characters that makes a retry safe. A second call with the same key, room and text within 10 minutes returns the first event ID with deduplicated true and sends nothing; the same key with a different room or text is an error. Keys are held in memory only, so a restart forgets them"`
 }
 
 type sendMessageResult struct {
-	EventID string `json:"event_id" jsonschema:"the Matrix event ID of the sent message"`
+	EventID      string `json:"event_id" jsonschema:"the Matrix event ID of the sent message, or of the original send when the call was deduplicated"`
+	Deduplicated bool   `json:"deduplicated" jsonschema:"true when an earlier send with the same idempotency_key was returned instead of sending again"`
 }
 
 func (s *Server) handleListRooms(ctx context.Context, _ *mcp.CallToolRequest, _ listRoomsInput) (*mcp.CallToolResult, []roomResult, error) {
@@ -272,12 +279,42 @@ func (s *Server) handleSendMessage(ctx context.Context, _ *mcp.CallToolRequest, 
 	if strings.TrimSpace(in.Text) == "" {
 		return nil, sendMessageResult{}, errors.New("text must not be empty or whitespace-only")
 	}
+	// A malformed reply target is rejected here, before the rate-limit token is
+	// spent or an idempotency key is claimed: nothing is sent and the caller can
+	// retry the same call with a corrected ID.
+	if in.ReplyTo != "" && !matrix.ValidEventID(in.ReplyTo) {
+		return nil, sendMessageResult{}, fmt.Errorf("%w: reply_to must be a Matrix event ID, a $ sigil followed by the ID", matrix.ErrInvalidEventID)
+	}
+	if utf8.RuneCountInString(in.IdempotencyKey) > maxIdempotencyKeyLen {
+		return nil, sendMessageResult{}, fmt.Errorf("idempotency_key must be at most %d characters", maxIdempotencyKeyLen)
+	}
+
+	// The key is claimed before the rate limiter so that a retry of a send that
+	// already went through returns the original event ID instead of
+	// "rate limited", and so that a concurrent duplicate waits for the first
+	// send rather than racing it to the homeserver.
+	var claim *sendClaim
+	if in.IdempotencyKey != "" {
+		c, err := s.sends.claim(ctx, in.IdempotencyKey, in.RoomID, in.Text)
+		if err != nil {
+			return nil, sendMessageResult{}, err
+		}
+		if c.replayed {
+			return nil, sendMessageResult{EventID: c.eventID, Deduplicated: true}, nil
+		}
+		claim = c
+		defer s.sends.release(claim)
+	}
+
 	if err := s.gate.check(in.RoomID); err != nil {
 		return nil, sendMessageResult{}, err
 	}
-	eventID, err := s.matrix.SendText(ctx, in.RoomID, in.Text)
+	eventID, err := s.matrix.SendText(ctx, in.RoomID, in.Text, in.ReplyTo)
 	if err != nil {
 		return nil, sendMessageResult{}, err
+	}
+	if claim != nil {
+		s.sends.settle(claim, eventID)
 	}
 	return nil, sendMessageResult{EventID: eventID}, nil
 }

@@ -3,6 +3,7 @@ package matrix
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -156,7 +157,7 @@ func TestSendTextNotAllowedNeverReachesServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = c.SendText(context.Background(), "!not-allowed:test", "hello")
+	_, err = c.SendText(context.Background(), "!not-allowed:test", "hello", "")
 	if !errors.Is(err, ErrSendNotAllowed) {
 		t.Fatalf("SendText = %v, want ErrSendNotAllowed", err)
 	}
@@ -191,7 +192,7 @@ func TestSendTextAllowedRoomIssuesPut(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	eventID, err := c.SendText(context.Background(), "!ok:test", "hello world")
+	eventID, err := c.SendText(context.Background(), "!ok:test", "hello world", "")
 	if err != nil {
 		t.Fatalf("SendText: %v", err)
 	}
@@ -219,7 +220,7 @@ func TestSendTextEmptyMessage(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, text := range []string{"", "   ", "\t\n"} {
-		if _, err := c.SendText(context.Background(), "!ok:test", text); !errors.Is(err, ErrEmptyMessage) {
+		if _, err := c.SendText(context.Background(), "!ok:test", text, ""); !errors.Is(err, ErrEmptyMessage) {
 			t.Fatalf("SendText(%q) = %v, want ErrEmptyMessage", text, err)
 		}
 	}
@@ -389,7 +390,7 @@ func TestRoomIDValidation(t *testing.T) {
 	if _, err := c.Messages(context.Background(), domainlessRoomID, 10, ""); err != nil {
 		t.Fatalf("Messages(%q) = %v, want success", domainlessRoomID, err)
 	}
-	if _, err := c.SendText(context.Background(), domainlessRoomID, "hi"); err != nil {
+	if _, err := c.SendText(context.Background(), domainlessRoomID, "hi", ""); err != nil {
 		t.Fatalf("SendText(%q) = %v, want success", domainlessRoomID, err)
 	}
 
@@ -413,7 +414,7 @@ func TestRoomIDValidation(t *testing.T) {
 		if _, err := c.Messages(context.Background(), roomID, 10, ""); !errors.Is(err, ErrInvalidRoomID) {
 			t.Errorf("Messages(%q) = %v, want ErrInvalidRoomID", roomID, err)
 		}
-		if _, err := c.SendText(context.Background(), roomID, "hi"); !errors.Is(err, ErrInvalidRoomID) {
+		if _, err := c.SendText(context.Background(), roomID, "hi", ""); !errors.Is(err, ErrInvalidRoomID) {
 			t.Errorf("SendText(%q) = %v, want ErrInvalidRoomID", roomID, err)
 		}
 	}
@@ -706,7 +707,7 @@ func TestSendTextBridgeNoticeFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	start := time.Now()
-	eventID, err := c.SendText(context.Background(), "!ok:test", "hello world")
+	eventID, err := c.SendText(context.Background(), "!ok:test", "hello world", "")
 	if err == nil {
 		t.Fatalf("SendText = %q, nil; want a bridge rejection error", eventID)
 	}
@@ -749,7 +750,7 @@ func TestSendTextNoNoticeSucceeds(t *testing.T) {
 		t.Fatal(err)
 	}
 	start := time.Now()
-	eventID, err := c.SendText(context.Background(), "!ok:test", "hello world")
+	eventID, err := c.SendText(context.Background(), "!ok:test", "hello world", "")
 	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("SendText: %v, want success when no bridge notice appears", err)
@@ -778,7 +779,7 @@ func TestSendTextAckDisabledIssuesNoExtraRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	start := time.Now()
-	if _, err := c.SendText(context.Background(), "!ok:test", "hello world"); err != nil {
+	if _, err := c.SendText(context.Background(), "!ok:test", "hello world", ""); err != nil {
 		t.Fatalf("SendText: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
@@ -827,7 +828,7 @@ func TestSendTextLiveBridgeNoticeShape(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	eventID, err := c.SendText(context.Background(), "!ok:test", "hello world")
+	eventID, err := c.SendText(context.Background(), "!ok:test", "hello world", "")
 	if err == nil {
 		t.Fatalf("SendText = %q, nil; want the live bridge rejection to surface", eventID)
 	}
@@ -1103,7 +1104,7 @@ func TestSendTextAllowsRoomFromAllowlistFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	eventID, err := c.SendText(context.Background(), "!file-only:test", "hello")
+	eventID, err := c.SendText(context.Background(), "!file-only:test", "hello", "")
 	if err != nil {
 		t.Fatalf("SendText to a file-allow-listed room: %v", err)
 	}
@@ -1448,6 +1449,136 @@ func TestMessagesRelations(t *testing.T) {
 	}
 	if m := byID["$plain"]; m.Redacted || m.ReplyTo != "" || m.EditOf != "" || len(m.Mentions) != 0 {
 		t.Fatalf("$plain = %+v, want no relations", m)
+	}
+}
+
+// TestSendTextReplyCarriesInReplyTo pins the request body for a threaded send:
+// the bridge renders a quote from m.relates_to.m.in_reply_to, not from the flat
+// relation.
+func TestSendTextReplyCarriesInReplyTo(t *testing.T) {
+	var mu sync.Mutex
+	var gotBody map[string]any
+	var sends int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/state/m.room.encryption"):
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{"errcode":"M_NOT_FOUND","error":"Not found"}`)
+		case strings.Contains(r.URL.Path, "/send/m.room.message/"):
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			sends++
+			mu.Unlock()
+			var decoded map[string]any
+			if err := json.Unmarshal(body, &decoded); err != nil {
+				t.Errorf("send body is not JSON: %v", err)
+			}
+			mu.Lock()
+			gotBody = decoded
+			mu.Unlock()
+			io.WriteString(w, `{"event_id":"$sent"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c, err := New(testConfig(srv.URL, "!ok:test"), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventID, err := c.SendText(context.Background(), "!ok:test", "hello", "$parent")
+	if err != nil {
+		t.Fatalf("SendText reply: %v", err)
+	}
+	if eventID != "$sent" {
+		t.Fatalf("SendText = %q, want $sent", eventID)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if sends != 1 {
+		t.Fatalf("issued %d sends, want 1", sends)
+	}
+	if gotBody["msgtype"] != "m.text" || gotBody["body"] != "hello" {
+		t.Fatalf("send body = %+v, want m.text/hello", gotBody)
+	}
+	rel, ok := gotBody["m.relates_to"].(map[string]any)
+	if !ok {
+		t.Fatalf("send body = %+v, want an m.relates_to relation", gotBody)
+	}
+	if rel["event_id"] != nil {
+		t.Fatalf("m.relates_to = %+v, want the reply shape and no flat event_id", rel)
+	}
+	reply, ok := rel["m.in_reply_to"].(map[string]any)
+	if !ok || reply["event_id"] != "$parent" {
+		t.Fatalf("m.relates_to = %+v, want m.in_reply_to.event_id $parent", rel)
+	}
+}
+
+// TestSendTextReplyKeepsBridgeAckGuard proves the reply path does not bypass
+// the guard: Matrix accepting a threaded message still does not mean the bridge
+// forwarded it.
+func TestSendTextReplyKeepsBridgeAckGuard(t *testing.T) {
+	fake := &bridgeAckServer{}
+	fake.setMessages(`{"type":"m.room.message","event_id":"$n1","sender":"@wa:test","origin_server_ts":2,` +
+		`"content":{"msgtype":"m.notice","body":"not bridged","m.relates_to":{"m.in_reply_to":{"event_id":"$send1"}}}}`)
+	srv := fake.start(t)
+
+	c, err := New(testConfigWithAck(srv.URL, 250*time.Millisecond, "!ok:test"), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventID, err := c.SendText(context.Background(), "!ok:test", "hello", "$parent")
+	if !errors.Is(err, ErrNotBridged) {
+		t.Fatalf("SendText reply = %q, %v; want ErrNotBridged to still apply", eventID, err)
+	}
+}
+
+// TestSendTextRejectsMalformedReplyBeforeSending covers the local validation:
+// a reply target that is not an event ID must not spend a request.
+func TestSendTextRejectsMalformedReplyBeforeSending(t *testing.T) {
+	var hit atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit.Store(true)
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	c, err := New(testConfig(srv.URL, "!ok:test"), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"not-an-event", "abc", "$", "$a b", "$a\tb", "$" + strings.Repeat("x", 255)} {
+		if _, err := c.SendText(context.Background(), "!ok:test", "hi", bad); !errors.Is(err, ErrInvalidEventID) {
+			t.Fatalf("SendText(reply_to=%q) = %v, want ErrInvalidEventID", bad, err)
+		}
+	}
+	if hit.Load() {
+		t.Fatal("a malformed reply target reached the homeserver")
+	}
+}
+
+func TestValidEventID(t *testing.T) {
+	for _, tc := range []struct {
+		id   string
+		want bool
+	}{
+		{"$abc123", true},
+		{"$yXXiCBRYgaKwxnPTokViHJLeaZ8gOhnk3iQIcYBX8i0", true},
+		{"$143273582443PhrSn:example.org", true}, // v1 event IDs carry a server part
+		{"$" + strings.Repeat("x", 254), true},   // 255 bytes inclusive
+		{"", false},
+		{"$", false},
+		{"abc", false},
+		{"!room:test", false},
+		{"$a b", false},
+		{"$a\nb", false},
+		{"$" + strings.Repeat("x", 255), false},
+	} {
+		if got := ValidEventID(tc.id); got != tc.want {
+			t.Fatalf("ValidEventID(%q) = %t, want %t", tc.id, got, tc.want)
+		}
 	}
 }
 

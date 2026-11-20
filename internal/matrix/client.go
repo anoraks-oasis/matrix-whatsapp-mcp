@@ -76,9 +76,10 @@ type MatrixService interface {
 	// an opaque token from an earlier page; an empty token starts at the
 	// newest message.
 	Messages(ctx context.Context, roomID string, limit int, before string) (MessagePage, error)
-	// SendText sends a plain-text message and returns the new event ID. It
-	// fails closed with ErrSendNotAllowed unless the room is allow-listed.
-	SendText(ctx context.Context, roomID, text string) (string, error)
+	// SendText sends a plain-text message and returns the new event ID. When
+	// replyTo is set the message is sent as a reply to that event. It fails
+	// closed with ErrSendNotAllowed unless the room is allow-listed.
+	SendText(ctx context.Context, roomID, text, replyTo string) (string, error)
 	// Sync runs the sync loop and blocks until ctx is cancelled (returning
 	// nil) or a fatal error such as an invalid access token occurs.
 	Sync(ctx context.Context) error
@@ -93,6 +94,9 @@ var (
 	ErrRoomEncrypted = errors.New("matrix: room is encrypted and MATRIX_E2EE_ENABLED is false")
 	// ErrInvalidRoomID is returned for room IDs rejected by config.ValidRoomID.
 	ErrInvalidRoomID = errors.New("matrix: invalid room ID")
+	// ErrInvalidEventID is returned for reply targets that are not well-formed
+	// Matrix event IDs.
+	ErrInvalidEventID = errors.New("matrix: invalid event ID")
 	// ErrEmptyMessage is returned when the text to send is empty.
 	ErrEmptyMessage = errors.New("matrix: message text is empty")
 	// ErrAlreadySyncing is returned when Sync is called twice concurrently.
@@ -143,6 +147,9 @@ const (
 	// A busy room is mostly membership, edit and reaction events, so a single
 	// page can yield almost no messages.
 	maxMessageRawFactor = 5
+
+	// maxEventIDLen is the Matrix spec's 255-byte cap on event IDs.
+	maxEventIDLen = 255
 
 	// bridgeAckPollInterval is how often the bridge-ack guard re-reads a room
 	// while waiting for the bridge's notice.
@@ -604,8 +611,30 @@ func (c *Client) decrypt(ctx context.Context, evt *event.Event) *event.Event {
 	return decrypted
 }
 
-// SendText implements MatrixService.
-func (c *Client) SendText(ctx context.Context, roomID, text string) (string, error) {
+// ValidEventID reports whether eventID is a well-formed Matrix event ID: a "$"
+// sigil, at most 255 bytes, and no whitespace or control characters. A server
+// suffix is not required — bridges hand out event IDs without one — and nothing
+// weaker is accepted, because a reply target that is not an event ID would be
+// sent to the homeserver and fail there instead of here.
+func ValidEventID(eventID string) bool {
+	if len(eventID) < 2 || len(eventID) > maxEventIDLen || eventID[0] != '$' {
+		return false
+	}
+	for _, r := range eventID {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// SendText implements MatrixService. When replyTo is set the message is sent
+// with m.relates_to.m.in_reply_to, the shape WhatsApp's bridge renders as a
+// quote; an event ID that is not a well-formed Matrix event ID is rejected
+// before anything reaches the homeserver. Everything after the send — the
+// allowlist, the encryption check and the bridge-ack guard — is identical for
+// a reply and a plain send.
+func (c *Client) SendText(ctx context.Context, roomID, text, replyTo string) (string, error) {
 	if !config.ValidRoomID(roomID) {
 		return "", ErrInvalidRoomID
 	}
@@ -615,10 +644,17 @@ func (c *Client) SendText(ctx context.Context, roomID, text string) (string, err
 	if strings.TrimSpace(text) == "" {
 		return "", ErrEmptyMessage
 	}
+	if replyTo != "" && !ValidEventID(replyTo) {
+		return "", ErrInvalidEventID
+	}
 	if err := c.prepareEncryption(ctx, id.RoomID(roomID)); err != nil {
 		return "", err
 	}
-	resp, err := c.cli.SendText(ctx, id.RoomID(roomID), text)
+	content := &event.MessageEventContent{MsgType: event.MsgText, Body: text}
+	if replyTo != "" {
+		content.RelatesTo = &event.RelatesTo{InReplyTo: &event.InReplyTo{EventID: id.EventID(replyTo)}}
+	}
+	resp, err := c.cli.SendMessageEvent(ctx, id.RoomID(roomID), event.EventMessage, content)
 	if err != nil {
 		return "", fmt.Errorf("matrix: send message: %w", err)
 	}
