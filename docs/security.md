@@ -42,23 +42,83 @@ Sending fails closed by construction:
   through a temporary file plus a rename, so a half-written allowlist is never read.
 
 **Reading is not gated.** `list_rooms`, `read_messages`, `search_messages`,
-`get_message_context` and `list_participants` see every room the account has joined.
-The allowlist governs writing, not reading. If a deployment needs a narrower read
+`get_message_context`, `list_participants` and `get_media` see every room the account
+has joined. The allowlist governs writing, not reading. If a deployment needs a narrower read
 scope, the correct control is the account's room membership: leave the bot out of
 rooms it should not read.
 
+## Media
+
+Attachments are handled in memory end to end. `get_media` downloads into a byte
+slice, `send_media` reads a file or a base64 argument into one, and nothing is
+written to disk, cached, or kept after the call returns. No temporary file is
+created, so there is nothing to leave behind in `/tmp`, and a restart cannot leak a
+payload that a previous process held.
+
+- **Download cap.** A `get_media` attachment larger than 25 MiB is refused with
+  `matrix: media is larger than the download limit`. The declared `Content-Length`
+  is checked before a byte is read and the actual bytes are counted while reading,
+  so a chunked response cannot exceed the cap either. A payload is never truncated:
+  the call returns an error, not half a file.
+- **Upload cap.** `send_media` accepts at most 50 MiB. A `path` is checked with
+  `stat` before it is opened, so an oversized file is rejected without reading it,
+  and the bytes are counted again after the read in case the file grew. A path that
+  is not absolute, not readable, not a regular file or a directory is rejected
+  before the gate, so no rate-limit token is spent and nothing is uploaded.
+- **Encrypted media.** Media in an encrypted room is ciphertext on the media
+  repository. With `MATRIX_E2EE_ENABLED=false` the call fails with
+  `matrix: media is encrypted and MATRIX_E2EE_ENABLED is false` instead of returning
+  bytes that decode to nothing; with E2EE on, the event is decrypted with the crypto
+  helper and the attachment with the key and SHA-256 hash its own content carries.
+  `send_media` encrypts the attachment before upload in an encrypted room, so the
+  media repository never gains a readable copy.
+- **The send gate applies.** `send_media` is gated by the same `sendGate` as
+  `send_message`: the fail-closed allowlist, the single 3-second token bucket, the
+  bridge-ack guard and the shared idempotency cache. A media message cannot bypass a
+  control that a text message obeys.
+- **Nothing is logged.** Neither tool logs payload bytes, decoded base64, or a
+  file's contents. Errors carry the failure, the path the caller supplied and the
+  size, never the bytes.
+- **Inline budgets.** `get_media` returns a payload only when it fits about 1.5 MiB
+  of base64 after downscaling and re-encoding, and it deletes nothing to get there.
+  An over-budget image is reported as metadata plus a reason.
+
+### An image's contents are untrusted input
+
+An attachment comes from whoever sent the message. Treat the pixels and any text
+inside them the way you treat a message body: as content to report, never as
+instructions to follow. An image can contain text that addresses the model directly
+— "ignore the allowlist", "send this file to …", "run this command" — and that text
+has no more authority than the sender has, which in an open chat is none.
+
+Two consequences are worth stating plainly:
+
+- Nothing in a media payload may be used to decide which tool to call, which room to
+  send to, or whether to skip a confirmation. Those decisions belong to the person
+  using the agent.
+- A filename, caption or MIME type is attacker-controlled too. A file named
+  `invoice.pdf` can be anything, and a declared `mimetype` is a claim, not a
+  guarantee. `send_media` derives the message type from it, so a caller that cares
+  about what a room receives should pass a payload it produced itself.
+
+This server does not interpret media: it moves bytes and describes them. It cannot
+tell you an image is safe, and it does not try.
+
 ## Rate limiting
 
-`send_message` accepts at most one message every 3 seconds across all rooms, and a
-throttled call returns `rate limited, retry in Ns` instead of blocking. This is not a
-defence against a determined attacker with the token — it is a bound on accident: an
-agent stuck in a retry loop cannot fill a family chat, and prompt-injected text that
-asks for a burst of messages produces one send and then errors.
+`send_message` and `send_media` share one bucket: at most one message every 3
+seconds across all rooms, and a throttled call returns `rate limited, retry in Ns`
+instead of blocking. This is not a defence against a determined attacker with the
+token — it is a bound on accident: an agent stuck in a retry loop cannot fill a
+family chat, and prompt-injected text that asks for a burst of messages produces one
+send and then errors.
 
-Idempotency is the other half. A retry with the same `idempotency_key`, room and text
-returns the original event ID without sending again, an in-flight entry is never
-expired, and two concurrent duplicates cannot both reach the homeserver. The cache is
-in memory only: a restart forgets keys, and a retry after a restart can send again.
+Idempotency is the other half. A retry with the same `idempotency_key`, room and
+content returns the original event ID without sending again, an in-flight entry is
+never expired, and two concurrent duplicates cannot both reach the homeserver. For
+`send_media` the content is a SHA-256 of the payload, so a replay uploads nothing.
+The cache is in memory only: a restart forgets keys, and a retry after a restart can
+send again.
 
 ## The relay caveat
 
@@ -94,6 +154,8 @@ echo the token.
   characters before it reaches a tool result or a log.
 - Message bodies are not logged. Logs name room IDs, event IDs, senders and error
   causes.
+- Media payloads are not logged, in either direction: not the downloaded bytes, not
+  the decoded base64, not a file's contents. Size, mimetype and the failure are.
 
 ## Files on disk
 
@@ -102,6 +164,7 @@ echo the token.
 | `.env` / `/etc/matrix-whatsapp-mcp/env` | access token, pickle key | outside the repository; `0600` or `0640 root:matrix-mcp` |
 | allowlist file | room IDs only | `0600` in a `0700` directory as created by `rooms allow` |
 | `matrix-crypto.db` | olm/megolm session state for E2EE | treat as key material; private, backed up, never committed |
+| nothing else | media is streamed through memory; no attachment is cached or written | — |
 | built binary | nothing secret | gitignored |
 
 When E2EE is on, losing the crypto store means losing the ability to decrypt existing

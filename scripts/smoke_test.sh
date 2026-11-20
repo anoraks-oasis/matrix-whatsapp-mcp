@@ -107,15 +107,15 @@ run_stdio_round_trip() {
 		"$BIN" 2>/dev/null
 }
 
-# 4. Offline stdio round trip: assert all seven tool names come back.
+# 4. Offline stdio round trip: assert all nine tool names come back.
 info "running offline stdio JSON-RPC round trip"
 stdio_out="$(run_stdio_round_trip)"
-for tool in list_rooms read_messages search_messages get_message_context list_participants get_recent_triggers send_message; do
+for tool in list_rooms read_messages search_messages get_message_context list_participants get_media get_recent_triggers send_message send_media; do
 	if ! grep -qF "\"name\":\"$tool\"" <<<"$stdio_out"; then
 		fail "tools/list response is missing $tool: $stdio_out"
 	fi
 done
-pass "stdio round trip returned all seven tools"
+pass "stdio round trip returned all nine tools"
 
 # 5. Authenticated section: only when a real token is present. Never printed.
 if [ -n "${MATRIX_HOMESERVER:-}" ] && [ -n "${MATRIX_USER_ID:-}" ] && [ -n "${MATRIX_ACCESS_TOKEN:-}" ]; then

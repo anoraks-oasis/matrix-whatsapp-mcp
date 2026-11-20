@@ -14,7 +14,7 @@ flowchart TB
     mtx["internal/matrix<br/>mautrix client, reads, sends"]
     allow["internal/allowlist<br/>env ∪ file"]
     trig["internal/trigger<br/>ring buffer, webhook"]
-    mcp["internal/mcpserver<br/>seven tools, send gate"]
+    mcp["internal/mcpserver<br/>nine tools, send gate"]
     cli["internal/cli<br/>rooms, doctor"]
   end
   mcp --> mtx
@@ -40,10 +40,10 @@ flowchart TB
 | `cmd/server` | Entrypoint. No arguments: load config, build the client and dispatcher, serve MCP. Any argument: run a CLI subcommand and exit. |
 | `internal/config` | Reads and validates the environment into `Config`. Errors name the variable and never its value. `ValidRoomID` is the one room-ID rule used everywhere. |
 | `internal/logger` | The process-wide logger, writing to stderr. |
-| `internal/matrix` | The mautrix wrapper: sync, room names, paginated reads, relations, search, message context, participants, sends, bridge-ack guard, E2EE setup. Exposed to everything above as the `MatrixService` interface. |
+| `internal/matrix` | The mautrix wrapper: sync, room names, paginated reads, relations, search, message context, participants, media download and upload, sends, bridge-ack guard, E2EE setup. Exposed to everything above as the `MatrixService` interface. |
 | `internal/allowlist` | The effective send allowlist: the `ALLOWED_SEND_ROOMS` baseline unioned with a plain-text file that is re-read as it changes. |
 | `internal/trigger` | Turns `m.room.message` events into triggers, keeps the newest 100, and optionally POSTs them to a webhook. |
-| `internal/mcpserver` | The MCP server: seven tool handlers, the send gate (allowlist plus rate limit), the idempotency cache. |
+| `internal/mcpserver` | The MCP server: nine tool handlers, the send gate (allowlist plus rate limit), the idempotency cache, and the in-memory image handling `get_media` needs. |
 | `internal/cli` | `rooms`, `rooms allow`/`rooms deny`, `doctor`. Every process edge is injectable, so the commands are tested without a homeserver or a terminal. |
 
 The `MatrixService` interface is the seam: the MCP layer and the CLI are written
@@ -129,6 +129,46 @@ bounded scan when the endpoint is missing; `get_message_context` uses `/context`
 falls back to walking `/messages` within a fixed budget. Both remember a missing
 endpoint for the life of the process. Full bounds and error semantics are in
 [tools.md](tools.md).
+
+## Media
+
+`get_media` is a read path with its own shape: it fetches one event, reads the
+attachment descriptor from `content.url` or `content.file` plus `content.info`, and
+downloads the payload into memory. Nothing is cached and nothing touches disk.
+
+```
+get_media
+  → event_id validation (matrix.ValidEventID) before any request
+  → GET /rooms/{roomId}/event/{eventId}
+  → m.room.encrypted? decrypt with the crypto helper, or refuse when E2EE is off
+  → attachment descriptor: mxc URI, mimetype, filename, size, w/h/duration
+  → GET /_matrix/client/v1/media/download/{serverName}/{mediaId}, capped at 25 MiB
+  → content.file? decrypt with the key and SHA-256 embedded in the event
+  → images: decode, fit max_dimension (256..4096, default 1568), re-encode within
+    about 1.5 MiB of base64 — JPEG quality 85..35, then 3/4 dimension steps to 64 px
+  → text block with the metadata, plus an image or audio block when it fits
+```
+
+The caller gets one `text` block holding the metadata JSON and, when the payload
+qualifies, a second content block with the bytes; an over-budget or non-renderable
+payload returns the text block with a `reason` instead of a truncated file.
+Decoding, scaling and re-encoding live in `internal/mcpserver` (with
+`golang.org/x/image/draw` for Catmull-Rom scaling); the download, decryption and the
+25 MiB cap live in `internal/matrix`.
+
+`send_media` reuses the send path below, with the payload read from a file or base64
+and uploaded first:
+
+```
+send_media
+  → exactly one of path / data_base64, absolutism, readability, regular file, 50 MiB
+  → idempotency claim keyed by SHA-256 of the payload (a replay uploads nothing)
+  → send gate: effective allowlist, then the same one-token-per-3-seconds bucket
+  → media encryption when the room is encrypted (content.file rather than content.url)
+  → POST /_matrix/media/v3/upload
+  → POST /rooms/{roomId}/send/m.room.message with m.image|m.video|m.audio|m.file
+  → bridge-ack guard, then settle the idempotency key
+```
 
 ## The send path
 
@@ -225,7 +265,9 @@ unbounded fan-out.
 | `search_messages` scan | 10 rooms, 50 messages per room |
 | `get_message_context` fallback | 5 pages × 100 raw events |
 | `list_participants` | 10-second call, 8 concurrent profile lookups of 2 seconds each |
-| `send_message` | one send per 3 seconds; bridge-ack poll bounded by `MATRIX_BRIDGE_ACK_TIMEOUT` |
+| `send_message`, `send_media` | one send per 3 seconds, shared between them; bridge-ack poll bounded by `MATRIX_BRIDGE_ACK_TIMEOUT` |
+| `get_media` | 25 MiB download cap; images downscaled to `max_dimension` and re-encoded within about 1.5 MiB of base64 |
+| `send_media` | 50 MiB upload cap |
 | `Sync` | 30-second auto-join; backoff capped at 1 minute |
 | CLI commands | 30-second command budget, 20-second bridged-probe phase |
 | HTTP server | 5s read-header, 30s read, 120s idle, 10s graceful shutdown |

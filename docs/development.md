@@ -75,7 +75,7 @@ It builds the binary with `-tags goolm` into a temporary directory and:
    serving MCP and hang on stdin;
 4. performs a real stdio JSON-RPC round trip — `initialize`, `notifications/initialized`,
    `tools/list` — against a throwaway `127.0.0.1:9` configuration and asserts all
-   seven tool names come back;
+   nine tool names come back;
 5. only when `MATRIX_HOMESERVER`, `MATRIX_USER_ID` and `MATRIX_ACCESS_TOKEN` are all
    set, checks `/versions` reachability and an authenticated `list_rooms` call.
 
@@ -132,7 +132,7 @@ internal/logger/       the stderr logger
 internal/matrix/       mautrix wrapper: sync, reads, search, context, send, E2EE
 internal/allowlist/    env ∪ file send allowlist, atomic edits
 internal/trigger/      m.room.message → ring buffer + webhook
-internal/mcpserver/    seven tools, send gate, idempotency cache
+internal/mcpserver/    nine tools, send gate, idempotency cache, in-memory media
 internal/cli/          rooms, rooms allow|deny, doctor
 scripts/smoke_test.sh  end-to-end smoke checks
 deploy/                systemd unit

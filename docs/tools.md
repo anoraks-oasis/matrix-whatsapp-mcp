@@ -1,7 +1,9 @@
 # Tool reference
 
-Seven tools, six that only read and one that sends. Every tool is registered with a
-JSON schema, a description, and MCP annotations; every result is structured JSON.
+Nine tools, seven that only read and two that send or upload. Every tool is
+registered with a JSON schema, a description, and MCP annotations; every result is
+structured JSON, and `get_media` additionally returns the payload as an MCP content
+block.
 A call that cannot be answered fails as an MCP error with a message that names the
 reason — no tool returns an empty result to mean "something went wrong".
 
@@ -22,8 +24,8 @@ and anything above 100 means 100. `limit_before` and `limit_after` on
 and an explicit `0` means none (see that tool).
 
 **Reading is not gated by the send allowlist.** `ALLOWED_SEND_ROOMS` and the
-allowlist file govern `send_message` only. The read tools see every room the
-account has joined.
+allowlist file govern the two writing tools, `send_message` and `send_media`. The
+read tools, `get_media` included, see every room the account has joined.
 
 ## The message object
 
@@ -43,6 +45,15 @@ this one shape.
 | `edit_of` | string, optional | Event ID this event replaces (`rel_type: m.replace`). The edit stays in the stream with this field set, so a client can apply it to the original instead of showing a duplicate. An edit fills `edit_of`, not `reply_to`. |
 | `mentions` | array of strings, optional | User IDs from `m.mentions.user_ids`; absent when nobody is mentioned. |
 | `redacted` | boolean | True when the room has redacted the message. The event keeps its ID, sender and timestamp, and the body is empty: the removed text is never returned. |
+| `mimetype` | string, optional | MIME type of the attachment, from `content.info.mimetype`. Absent when the message carries no attachment. |
+| `filename` | string, optional | The filename the sender set (`content.filename`). Absent when it set none; many clients put the filename in `body` instead, which is why `body` is never rewritten. |
+| `size_bytes` | integer, optional | The attachment size the sender declared (`content.info.size`), in bytes. |
+| `width` / `height` | integer, optional | Pixel dimensions the sender declared (`content.info.w` / `content.info.h`), typically for an image or a video. |
+| `duration_ms` | integer, optional | The duration the sender declared (`content.info.duration`), in milliseconds, typically for audio or a video. |
+| `mxc_uri` | string, optional | The attachment's content URI: `content.url` for plaintext media, `content.file.url` for encrypted media. Pass it back to the homeserver's media API, or use `get_media` to fetch the bytes. |
+
+The media fields are additive: a message with no attachment omits all seven, and the
+`body` placeholder (`[image]`, `[audio]`, …) is unchanged.
 
 ## list_rooms
 
@@ -241,6 +252,88 @@ Lists every joined member of a room.
   leaves that one name empty and the member still listed.
 - **Annotations:** `readOnlyHint: true`.
 
+## get_media
+
+Fetches one message's attachment and returns it inline. The result is a **content
+array**, which is how text and an image arrive in one response: a `text` block
+carrying the metadata as JSON, followed by an `image` or `audio` block when the
+payload qualifies.
+
+| Input | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `room_id` | yes | — | The room the event belongs to. |
+| `event_id` | yes | — | Matrix event ID; validated before any request. |
+| `max_dimension` | no | 1568 | Longest edge an inline image may keep, clamped to 256..4096. An omitted or zero value means the default. |
+
+**Metadata.** The first block's text is this JSON, and the same object is the tool's
+structured content:
+
+| Field | Meaning |
+| --- | --- |
+| `mimetype` | The MIME type the message declares; when it declares none, the type the homeserver served; when that is only `application/octet-stream`, the type the bytes themselves indicate. Used to choose the content block. |
+| `filename` | The filename the sender set, when it set one. |
+| `size_bytes` | The size of the payload that was downloaded; for encrypted media, the decrypted size. |
+| `width` / `height` | The image's pixel size: the returned image after downscaling, or the source image when its payload did not fit. |
+| `duration_ms` | The duration the sender declared, when it declared one. |
+| `mxc_uri` | The attachment's content URI. |
+| `encrypted` | True when the attachment was end-to-end encrypted and was decrypted before being returned. |
+| `downscaled` | True when the returned image was resized or re-encoded smaller for `max_dimension` or the inline budget. |
+| `included` | True when a second content block carries the payload. False means the text block is the whole answer. |
+| `reason` | Present when `included` is false: why the payload was not included. |
+
+**Reading path.** The event is read with `GET /rooms/{roomId}/event/{eventId}` and its
+attachment descriptor comes from `content.url` (plaintext media) or `content.file`
+(encrypted media) plus `content.info`. The bytes come from the media repository and
+are held in memory only: nothing is cached and nothing is written to disk.
+
+**How a payload is chosen.** Only images and audio become content blocks; a video, a
+document and anything else returns metadata and text only, because base64-ing them
+would spend the whole result on something no client renders.
+
+| Payload | Result |
+| --- | --- |
+| `image/*` the standard library can decode (JPEG, PNG, GIF) | `image` block; downscaled and re-encoded to fit the budgets |
+| `audio/*` within the inline budget | `audio` block, bytes unchanged |
+| `audio/*` over the budget | metadata and text only, with `reason` |
+| anything else | metadata and text only, with `reason` |
+
+**Budgets.** All three are enforced, and none of them truncates a payload: if a
+payload does not fit, the call returns its metadata and a reason.
+
+| Budget | Value | Behaviour |
+| --- | --- | --- |
+| Download | 25 MiB (`matrix.MaxMediaDownloadBytes`) | A larger attachment is refused with `matrix: media is larger than the download limit`, checked against the declared length before a byte is read and against the actual bytes while reading. Nothing is truncated. |
+| `max_dimension` | default 1568, clamped to 256..4096 | An image whose long edge is longer is scaled down with Catmull-Rom interpolation, preserving the aspect ratio. |
+| Inline payload | about 1.5 MiB of base64 | The re-encoder lowers JPEG quality (85, 75, 65, 55, 45, 35) and then shrinks the image by 3/4 steps down to a 64-pixel long edge. PNG is kept where it fits; otherwise the image becomes JPEG, with transparency flattened onto white. An image that still does not fit returns metadata and a `reason`. |
+
+An image already inside both the dimension and the budget is returned byte for byte:
+re-encoding a small JPEG would only lose quality, and re-encoding a GIF would drop
+its animation.
+
+**Encryption.** Media in an encrypted room is encrypted at rest by the media
+repository, so it is decrypted here: the event is decrypted with the crypto helper,
+then the attachment with the key its own `content.file` carries, including the SHA-256
+integrity check. With `MATRIX_E2EE_ENABLED=false`, encrypted media is refused with
+`matrix: media is encrypted and MATRIX_E2EE_ENABLED is false` rather than returned as
+ciphertext.
+
+**Errors** are typed, because "no payload" from a download failure would claim
+something different:
+
+| Situation | Error |
+| --- | --- |
+| `event_id` is not a Matrix event ID | `matrix: invalid event ID`, before any request |
+| `room_id` is not a valid room ID | `matrix: invalid room ID`, before any request |
+| the event is not in the room (`M_NOT_FOUND`) | `matrix: event not found in room` |
+| the event exists but carries no attachment | `matrix: event carries no media attachment` |
+| the event is `m.room.encrypted` and E2EE is off | `matrix: media is encrypted and MATRIX_E2EE_ENABLED is false` |
+| E2EE is on but the attachment cannot be decrypted | `matrix: encrypted media could not be decrypted` |
+| the download is refused or fails | `matrix: media download failed` |
+| the attachment is over 25 MiB | `matrix: media is larger than the download limit` |
+| an unsupported image format or encryption algorithm | `matrix: unsupported media codec` |
+
+**Annotations:** `readOnlyHint: true`.
+
 ## get_recent_triggers
 
 Returns the incoming-message triggers this process has seen, newest first.
@@ -316,6 +409,81 @@ instead of posting plaintext.
 
 **Annotations:** `destructiveHint: true`, `idempotentHint: false`, `readOnlyHint: false`.
 
+## send_media
+
+Uploads one attachment and sends it as a single media message.
+
+| Input | Required | Default | Notes |
+| --- | --- | --- | --- |
+| `room_id` | yes | — | Must be on the send allowlist. |
+| `path` | one of | — | Absolute path of a local file. It must exist, be readable, be a regular file and be at most 50 MiB. Pass exactly one of `path` and `data_base64`. |
+| `data_base64` | one of | — | The payload as standard base64, at most 50 MiB once decoded. `mimetype` is required alongside it. |
+| `mimetype` | with `data_base64` | — | The payload's MIME type, for example `image/jpeg`. With `path` it overrides the type detected from the file, which is otherwise taken from the extension and then sniffed from the bytes. |
+| `caption` | no | — | Sent as the message body, which WhatsApp shows under the media. When empty the filename is used, so the event always has a textual representation. |
+| `filename` | no | base name of `path`, else `upload` | Recorded on the message and sent as the upload's filename. |
+| `reply_to` | no | — | Event ID to answer, sent as `m.relates_to.m.in_reply_to`. A malformed one is rejected before anything is uploaded. |
+| `idempotency_key` | no | — | At most 128 characters. Makes a retry safe. |
+
+**Output:** `{event_id, deduplicated, msgtype, mxc_uri}`. `event_id` is the sent
+event's ID, or the original send's when the call was deduplicated; `mxc_uri` is
+absent on a replay because nothing was uploaded.
+
+**Message type.** The MIME type decides how the bridge renders it in WhatsApp:
+
+| MIME type | `msgtype` |
+| --- | --- |
+| `image/*` | `m.image` |
+| `video/*` | `m.video` |
+| `audio/*` | `m.audio` |
+| anything else | `m.file` |
+
+The message records `body` (the caption, or the filename), `filename`, and
+`info.mimetype` with `info.size`. An outgoing image or video also carries
+`info.w`/`info.h` read from its header, so the preview is laid out correctly.
+
+**The gate.** `send_media` goes through exactly the same gate as `send_message`,
+which is the point: a media message is no less a message to the people in the chat.
+
+1. The room is checked against the effective allowlist — `ALLOWED_SEND_ROOMS` unioned
+   with `MATRIX_ALLOWLIST_FILE`, consulted per send. Both empty rejects every upload
+   and every send with the read-only error; a room outside a non-empty list is
+   rejected without consuming the rate-limit token. The Matrix layer checks the same
+   store again before uploading.
+2. One token bucket grants at most one message every 3 seconds across all rooms, and
+   it is the same bucket `send_message` draws from: a text message and a media message
+   cannot be sent within 3 seconds of each other. A throttled call returns
+   `rate limited, retry in Ns` instead of blocking.
+3. After the send, the bridge-ack guard watches for the bridge's rejection notice
+   exactly as `send_message` does, and fails the call with the notice rather than
+   reporting a message as delivered that WhatsApp refused.
+
+Everything that can be rejected without the homeserver is rejected before the gate:
+a payload source that is neither `path` nor `data_base64` (or both), a path that is
+not absolute, unreadable, a directory or not a regular file, invalid base64, a
+`data_base64` call without `mimetype`, a payload over 50 MiB, a malformed `reply_to`
+and an over-long `idempotency_key`. Nothing is uploaded and no rate-limit token is
+spent for any of them.
+
+**Idempotency.** The cache is the same one `send_message` uses, so the key namespace is
+shared, but a media entry is identified by a SHA-256 of the payload plus the filename,
+mimetype, caption and reply target. A retry with the same key and the same bytes
+returns the first event ID with `deduplicated: true` and **uploads nothing**; the same
+key with different bytes is the usual conflict error, never a second upload. The
+10-minute window, the in-memory lifetime and the 256-entry cap are the ones described
+under `send_message`, and `idempotentHint` is `false` for the same reason: only a
+keyed retry is idempotent.
+
+**Encryption.** With E2EE on and an encrypted room, the attachment is encrypted
+before upload and the event carries `content.file`, so the media repository never
+holds a readable copy. With E2EE off, an encrypted room is refused with
+`matrix: room is encrypted and MATRIX_E2EE_ENABLED is false`, exactly as a text send
+is.
+
+**Logging.** The payload bytes are never logged, and neither is a file's contents;
+errors name the failure, the file path and the size, never the bytes.
+
+**Annotations:** `destructiveHint: true`, `idempotentHint: false`, `readOnlyHint: false`.
+
 ## Annotations
 
 | Tool | `readOnlyHint` | `destructiveHint` | `idempotentHint` |
@@ -325,8 +493,10 @@ instead of posting plaintext.
 | `search_messages` | true | — | — |
 | `get_message_context` | true | — | — |
 | `list_participants` | true | — | — |
+| `get_media` | true | — | — |
 | `get_recent_triggers` | true | — | — |
 | `send_message` | false | true | false |
+| `send_media` | false | true | false |
 
 `openWorldHint` is left unset on every tool, which means true: each one reaches a
 real homeserver and, through it, real people.
@@ -357,4 +527,16 @@ Inspect a message before answering it:
 
 ```json
 {"name": "get_message_context", "arguments": {"room_id": "!family:example.com", "event_id": "$targetEventID", "limit_before": 3, "limit_after": 0}}
+```
+
+Read the photo in a message, downscaled to 1024 pixels on its long edge:
+
+```json
+{"name": "get_media", "arguments": {"room_id": "!family:example.com", "event_id": "$photoEventID", "max_dimension": 1024}}
+```
+
+Send a photo with a caption, answering an earlier message:
+
+```json
+{"name": "send_media", "arguments": {"room_id": "!family:example.com", "path": "/home/me/Pictures/dinner.jpg", "caption": "here it is", "reply_to": "$questionEventID", "idempotency_key": "photo-dinner-1"}}
 ```

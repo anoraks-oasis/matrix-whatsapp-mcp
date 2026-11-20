@@ -4,7 +4,7 @@
 
 # matrix-whatsapp-mcp
 
-A single Go binary that keeps a Matrix `/sync` listener on a mautrix/whatsapp bridge and exposes the conversation to a Model Context Protocol client through seven tools, over stdio or Streamable HTTP.
+A single Go binary that keeps a Matrix `/sync` listener on a mautrix/whatsapp bridge and exposes the conversation to a Model Context Protocol client through nine tools, over stdio or Streamable HTTP.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Go 1.26+](https://img.shields.io/badge/go-1.26%2B-00ADD8.svg)](go.mod)
@@ -13,7 +13,7 @@ A single Go binary that keeps a Matrix `/sync` listener on a mautrix/whatsapp br
 
 ## What it does
 
-The binary logs into a Matrix homeserver as an ordinary account, syncs bridged rooms, and answers MCP tool calls about them: list rooms, read a page of history, search it, read the messages around one event, list a room's participants, replay the incoming-message triggers it has seen, and send a reply. Sending is disabled by default and fails closed: only rooms on an allowlist can receive a message. It also listens for room invitations and can join them on its own, so a newly bridged chat becomes usable without opening Element.
+The binary logs into a Matrix homeserver as an ordinary account, syncs bridged rooms, and answers MCP tool calls about them: list rooms, read a page of history, search it, read the messages around one event, list a room's participants, fetch an attachment, replay the incoming-message triggers it has seen, and send a reply or a photo. Sending is disabled by default and fails closed: only rooms on an allowlist can receive a message. It also listens for room invitations and can join them on its own, so a newly bridged chat becomes usable without opening Element.
 
 ```mermaid
 flowchart LR
@@ -28,17 +28,19 @@ flowchart LR
 **Read**
 
 - `list_rooms` — every joined room, its display name, and a best-effort flag for whether it comes from WhatsApp.
-- `read_messages` — one page of a room's history, oldest first, behind an opaque `next_token`. Each message carries `reply_to`, `edit_of`, `mentions` and `redacted`, so a client reads a conversation instead of isolated events.
+- `read_messages` — one page of a room's history, oldest first, behind an opaque `next_token`. Each message carries `reply_to`, `edit_of`, `mentions` and `redacted`, so a client reads a conversation instead of isolated events, plus `mimetype`, `filename`, `size_bytes`, `width`, `height`, `duration_ms` and `mxc_uri` when it has an attachment.
 - `search_messages` — the homeserver's own search index first; when it has none, a bounded scan of the 50 newest messages in at most 10 rooms, with `truncated`, `scanned_rooms`, `scanned_events` and `source` reporting what actually happened.
 - `get_message_context` — one message with up to 50 messages on each side, and `reply_to`/`edit_of` resolved to full messages.
 - `list_participants` — joined members with `bridged` and `bridge_kind` (`whatsapp_contact`, `whatsapp_bot`, or empty).
+- `get_media` — one message's attachment, returned as a text block with its metadata (mimetype, filename, size, dimensions, whether it was downscaled, mxc URI) plus an `image` or `audio` content block when the payload fits about 1.5 MiB of base64. Images are downscaled to `max_dimension` (default 1568) and re-encoded; a 25 MiB download cap applies, and nothing is cached or written to disk.
 - `get_recent_triggers` — the newest 100 incoming messages the process has seen, newest first.
 
 **Write**
 
 - `send_message` — plain text, optionally as a reply (`reply_to`) and optionally idempotent (`idempotency_key`, 10-minute window).
+- `send_media` — an image, video, voice note or file from an absolute path or base64 data, with a caption that WhatsApp shows under it, the same `reply_to` and `idempotency_key` handling, and a 50 MiB upload cap.
 - Fail-closed allowlist: an empty allowlist makes the server read-only, and a room missing from a non-empty one is rejected.
-- One message per 3 seconds across all rooms, with the retry delay in the error.
+- One message per 3 seconds across all rooms, shared by both sending tools, with the retry delay in the error.
 - Bridge-ack guard: a message the WhatsApp bridge refuses is reported as a failure with the bridge's own notice, not as success.
 
 **Operate**
@@ -148,8 +150,10 @@ What the client sees:
 - `search_messages` → `{results: [...], truncated, scanned_rooms, scanned_events, source}`
 - `get_message_context` → `{events_before, event, events_after, reply_to?, edit_of?, source, truncated}`
 - `list_participants` → `{participants: [{user_id, display_name, membership, bridged, bridge_kind}]}`
+- `get_media` → a `text` block with the metadata JSON, plus an `image` or `audio` block when the payload qualifies
 - `get_recent_triggers` → `[{event_id, room_id, room_name, sender, body, msgtype, timestamp}]`, newest first
 - `send_message` → `{event_id, deduplicated}`
+- `send_media` → `{event_id, deduplicated, msgtype, mxc_uri}`
 
 The full contract — every input, clamp, annotation and error — is in [docs/tools.md](docs/tools.md).
 
