@@ -129,3 +129,117 @@ func TestLoadBridgeAckTimeout(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadEnrollmentDefaults(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("HOME", "/home/tester")
+
+	cfg, err := LoadFrom(minimalEnv(nil))
+	if err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	if cfg.AutoJoinInvites {
+		t.Fatal("AutoJoinInvites default = true, want false")
+	}
+	if len(cfg.InviteAllowlist) != 0 {
+		t.Fatalf("InviteAllowlist default = %v, want empty", cfg.InviteAllowlist)
+	}
+	want := "/home/tester/.config/matrix-whatsapp-mcp/allow.txt"
+	if cfg.AllowlistFile != want {
+		t.Fatalf("AllowlistFile = %q, want %q", cfg.AllowlistFile, want)
+	}
+}
+
+func TestAllowlistFilePath(t *testing.T) {
+	cases := []struct {
+		name string
+		env  map[string]string
+		want string
+	}{
+		{
+			name: "explicit path wins",
+			env:  map[string]string{"MATRIX_ALLOWLIST_FILE": "/etc/mw/rooms.txt", "XDG_CONFIG_HOME": "/xdg"},
+			want: "/etc/mw/rooms.txt",
+		},
+		{
+			name: "xdg config home",
+			env:  map[string]string{"XDG_CONFIG_HOME": "/xdg"},
+			want: "/xdg/matrix-whatsapp-mcp/allow.txt",
+		},
+		{
+			name: "home fallback",
+			env:  map[string]string{"HOME": "/home/tester", "XDG_CONFIG_HOME": ""},
+			want: "/home/tester/.config/matrix-whatsapp-mcp/allow.txt",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", "")
+			if got := allowlistFilePath(envFrom(tc.env)); got != tc.want {
+				t.Fatalf("allowlistFilePath = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadAutoJoinInvites(t *testing.T) {
+	for raw, want := range map[string]bool{"true": true, "TRUE": true, "1": true, "false": false, "0": false} {
+		cfg, err := LoadFrom(minimalEnv(map[string]string{"MATRIX_AUTO_JOIN_INVITES": raw}))
+		if err != nil {
+			t.Fatalf("LoadFrom(MATRIX_AUTO_JOIN_INVITES=%q): %v", raw, err)
+		}
+		if cfg.AutoJoinInvites != want {
+			t.Fatalf("AutoJoinInvites for %q = %t, want %t", raw, cfg.AutoJoinInvites, want)
+		}
+	}
+
+	for _, raw := range []string{"yes-please", "on?", "2"} {
+		_, err := LoadFrom(minimalEnv(map[string]string{"MATRIX_AUTO_JOIN_INVITES": raw}))
+		if err == nil {
+			t.Fatalf("LoadFrom(MATRIX_AUTO_JOIN_INVITES=%q) = nil error, want a validation error", raw)
+		}
+		var verr *VarError
+		if !errors.As(err, &verr) || verr.Var != "MATRIX_AUTO_JOIN_INVITES" {
+			t.Fatalf("LoadFrom(MATRIX_AUTO_JOIN_INVITES=%q) = %v, want a MATRIX_AUTO_JOIN_INVITES VarError", raw, err)
+		}
+	}
+}
+
+func TestLoadInviteAllowlist(t *testing.T) {
+	cfg, err := LoadFrom(minimalEnv(map[string]string{
+		"MATRIX_INVITE_ALLOWLIST": " @alice:example.com , @bob:example.com ,, ",
+	}))
+	if err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	if len(cfg.InviteAllowlist) != 2 {
+		t.Fatalf("InviteAllowlist = %v, want 2 entries", cfg.InviteAllowlist)
+	}
+	if !cfg.InviteAllowed("@alice:example.com") || !cfg.InviteAllowed("@BOB:example.com") {
+		t.Fatalf("InviteAllowed rejected a listed inviter: %v", cfg.InviteAllowlist)
+	}
+	if cfg.InviteAllowed("@mallory:example.com") {
+		t.Fatal("InviteAllowed accepted an unlisted inviter with a non-empty allow-list")
+	}
+
+	for _, entry := range []string{"alice", "@alice", "alice@example.com"} {
+		_, err := LoadFrom(minimalEnv(map[string]string{"MATRIX_INVITE_ALLOWLIST": entry}))
+		if err == nil {
+			t.Fatalf("LoadFrom(MATRIX_INVITE_ALLOWLIST=%q) = nil error, want a validation error", entry)
+		}
+		var verr *VarError
+		if !errors.As(err, &verr) || verr.Var != "MATRIX_INVITE_ALLOWLIST" {
+			t.Fatalf("LoadFrom(MATRIX_INVITE_ALLOWLIST=%q) = %v, want a MATRIX_INVITE_ALLOWLIST VarError", entry, err)
+		}
+	}
+}
+
+func TestInviteAllowedWithEmptyAllowlist(t *testing.T) {
+	cfg, err := LoadFrom(minimalEnv(nil))
+	if err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	if !cfg.InviteAllowed("@anyone:anywhere.example") {
+		t.Fatal("InviteAllowed with an empty allow-list = false, want true (accept from anyone)")
+	}
+}

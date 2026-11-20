@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -67,14 +68,41 @@ type Config struct {
 	AllowedSendRooms []string
 	Transport        Transport
 	HTTPAddr         string
+	// AutoJoinInvites makes the client accept room invitations without a
+	// manual join.
+	AutoJoinInvites bool
+	// InviteAllowlist restricts AutoJoinInvites to invitations from these
+	// user IDs. Empty means accept invitations from anyone.
+	InviteAllowlist []string
+	// AllowlistFile is the room-ID file unioned into AllowedSendRooms. It is
+	// always a path; the file itself need not exist.
+	AllowlistFile string
 	// BridgeAckTimeout is how long SendText waits for a bridge notice that
 	// reports the message was not bridged. Zero disables the wait.
 	BridgeAckTimeout time.Duration
 }
 
-// ReadOnly reports whether sending is disabled. It is true unless at least one
-// room is allow-listed, so the default fails closed.
+// ReadOnly reports whether sending is disabled by the environment allow-list
+// alone. The server's effective allow-list also includes AllowlistFile, so this
+// is only a lower bound: config.ReadOnly can be true while a file-added room is
+// still sendable.
 func (c *Config) ReadOnly() bool { return len(c.AllowedSendRooms) == 0 }
+
+// InviteAllowed reports whether an invitation from userID may be accepted
+// automatically. An empty allow-list accepts any inviter; entries are compared
+// case-insensitively because the localpart is what people get wrong when
+// copying a user ID by hand.
+func (c *Config) InviteAllowed(userID string) bool {
+	if len(c.InviteAllowlist) == 0 {
+		return true
+	}
+	for _, allowed := range c.InviteAllowlist {
+		if strings.EqualFold(allowed, userID) {
+			return true
+		}
+	}
+	return false
+}
 
 // SendAllowed reports whether sending to roomID is permitted.
 func (c *Config) SendAllowed(roomID string) bool {
@@ -108,9 +136,10 @@ func ValidRoomID(roomID string) bool {
 
 // String implements fmt.Stringer with secrets redacted.
 func (c *Config) String() string {
-	return fmt.Sprintf("Config{Homeserver:%s UserID:%s AccessToken:%s E2EEEnabled:%t CryptoDBPath:%s PickleKey:%s TriggerWebhook:%s AllowedSendRooms:%d Transport:%s HTTPAddr:%s BridgeAckTimeout:%s}",
+	return fmt.Sprintf("Config{Homeserver:%s UserID:%s AccessToken:%s E2EEEnabled:%t CryptoDBPath:%s PickleKey:%s TriggerWebhook:%s AllowedSendRooms:%d Transport:%s HTTPAddr:%s BridgeAckTimeout:%s AutoJoinInvites:%t InviteAllowlist:%d AllowlistFile:%s}",
 		c.Homeserver, c.UserID, redact(c.AccessToken), c.E2EEEnabled, c.CryptoDBPath, redact(c.PickleKey),
-		redactURL(c.TriggerWebhook), len(c.AllowedSendRooms), c.Transport, c.HTTPAddr, c.BridgeAckTimeout)
+		redactURL(c.TriggerWebhook), len(c.AllowedSendRooms), c.Transport, c.HTTPAddr, c.BridgeAckTimeout,
+		c.AutoJoinInvites, len(c.InviteAllowlist), c.AllowlistFile)
 }
 
 // GoString implements fmt.GoStringer so %#v cannot leak secrets either.
@@ -152,13 +181,14 @@ func LoadFrom(getenv func(string) string) (*Config, error) {
 	}
 
 	cfg := &Config{
-		Homeserver:   required("MATRIX_HOMESERVER"),
-		UserID:       required("MATRIX_USER_ID"),
-		AccessToken:  required("MATRIX_ACCESS_TOKEN"),
-		CryptoDBPath: get("MATRIX_CRYPTO_DB_PATH"),
-		PickleKey:    get("MATRIX_PICKLE_KEY"),
-		Transport:    TransportStdio,
-		HTTPAddr:     defaultHTTPAddr,
+		Homeserver:    required("MATRIX_HOMESERVER"),
+		UserID:        required("MATRIX_USER_ID"),
+		AccessToken:   required("MATRIX_ACCESS_TOKEN"),
+		CryptoDBPath:  get("MATRIX_CRYPTO_DB_PATH"),
+		PickleKey:     get("MATRIX_PICKLE_KEY"),
+		Transport:     TransportStdio,
+		HTTPAddr:      defaultHTTPAddr,
+		AllowlistFile: allowlistFilePath(getenv),
 
 		BridgeAckTimeout: defaultBridgeAckTimeout,
 	}
@@ -193,6 +223,26 @@ func LoadFrom(getenv func(string) string) (*Config, error) {
 		} else {
 			cfg.BridgeAckTimeout = d
 		}
+	}
+
+	if v := get("MATRIX_AUTO_JOIN_INVITES"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			fail("MATRIX_AUTO_JOIN_INVITES", ErrInvalid, "must be a boolean")
+		}
+		cfg.AutoJoinInvites = b
+	}
+
+	for _, u := range strings.Split(get("MATRIX_INVITE_ALLOWLIST"), ",") {
+		u = strings.TrimSpace(u)
+		if u == "" {
+			continue
+		}
+		if !validUserID(u) {
+			fail("MATRIX_INVITE_ALLOWLIST", ErrInvalid, "entries must be user IDs like @alice:example.com")
+			break
+		}
+		cfg.InviteAllowlist = append(cfg.InviteAllowlist, u)
 	}
 
 	if v := get("TRIGGER_WEBHOOK_URL"); v != "" {
@@ -230,6 +280,30 @@ func LoadFrom(getenv func(string) string) (*Config, error) {
 		return nil, errors.Join(errs...)
 	}
 	return cfg, nil
+}
+
+// allowlistFilePath resolves MATRIX_ALLOWLIST_FILE, defaulting to
+// $XDG_CONFIG_HOME/matrix-whatsapp-mcp/allow.txt with ~/.config as the XDG
+// fallback. An empty result means no home directory could be determined, in
+// which case only ALLOWED_SEND_ROOMS applies.
+func allowlistFilePath(getenv func(string) string) string {
+	if p := strings.TrimSpace(getenv("MATRIX_ALLOWLIST_FILE")); p != "" {
+		return p
+	}
+	base := strings.TrimSpace(getenv("XDG_CONFIG_HOME"))
+	if base == "" {
+		home := strings.TrimSpace(getenv("HOME"))
+		if home == "" {
+			if h, err := os.UserHomeDir(); err == nil {
+				home = h
+			}
+		}
+		if home == "" {
+			return ""
+		}
+		base = filepath.Join(home, ".config")
+	}
+	return filepath.Join(base, "matrix-whatsapp-mcp", "allow.txt")
 }
 
 func validHTTPURL(s string) bool {
