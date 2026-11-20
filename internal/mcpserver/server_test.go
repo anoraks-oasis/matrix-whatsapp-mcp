@@ -62,6 +62,15 @@ type fakeMatrix struct {
 	parts     []matrix.Participant
 	partsErr  error
 
+	mediaRoom  []string
+	mediaEvent []string
+	mediaAtt   matrix.MediaAttachment
+	mediaErr   error
+
+	mediaSends   []mediaSendCall
+	mediaSendID  string
+	mediaSendErr error
+
 	// blockUntilDone makes every read method wait for its context to end and
 	// return the context's error, which is how the cancellation tests observe
 	// that a handler neither swallows cancellation nor retries past it.
@@ -162,6 +171,56 @@ func (f *fakeMatrix) contextCalls() (before, after []int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]int(nil), f.ctxBef...), append([]int(nil), f.ctxAft...)
+}
+
+// mediaSendCall records one SendMedia argument set. The payload is copied so a
+// caller mutating its buffer after the call cannot change what a test asserts.
+type mediaSendCall struct {
+	roomID  string
+	media   matrix.MediaUpload
+	caption string
+	replyTo string
+}
+
+func (f *fakeMatrix) Media(ctx context.Context, roomID, eventID string) (matrix.MediaAttachment, error) {
+	if err := f.waitCtx(ctx); err != nil {
+		return matrix.MediaAttachment{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.mediaRoom = append(f.mediaRoom, roomID)
+	f.mediaEvent = append(f.mediaEvent, eventID)
+	return f.mediaAtt, f.mediaErr
+}
+
+func (f *fakeMatrix) mediaCalls() (rooms, events []string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.mediaRoom...), append([]string(nil), f.mediaEvent...)
+}
+
+func (f *fakeMatrix) SendMedia(ctx context.Context, roomID string, media matrix.MediaUpload, caption, replyTo string) (matrix.MediaSendResult, error) {
+	if err := f.waitCtx(ctx); err != nil {
+		return matrix.MediaSendResult{}, err
+	}
+	media.Data = append([]byte(nil), media.Data...)
+	f.mu.Lock()
+	f.mediaSends = append(f.mediaSends, mediaSendCall{roomID: roomID, media: media, caption: caption, replyTo: replyTo})
+	id, sendErr := f.mediaSendID, f.mediaSendErr
+	f.mu.Unlock()
+	if sendErr != nil {
+		return matrix.MediaSendResult{}, sendErr
+	}
+	if id == "" {
+		id = "$media"
+	}
+	return matrix.MediaSendResult{EventID: id, MsgType: string(matrix.MediaMessageType(media.MimeType)), MXCURI: "mxc://test/uploaded"}, nil
+}
+
+func (f *fakeMatrix) mediaSent() []mediaSendCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]mediaSendCall(nil), f.mediaSends...)
 }
 
 func (f *fakeMatrix) Participants(ctx context.Context, roomID string) ([]matrix.Participant, error) {
@@ -335,7 +394,7 @@ func hasField(t *testing.T, schema map[string]any, name string) []string {
 	return nil
 }
 
-func TestToolsListHasSevenToolsWithSchemas(t *testing.T) {
+func TestToolsListHasNineToolsWithSchemas(t *testing.T) {
 	srv := New(&fakeMatrix{}, &fakeProber{}, &fakeRecent{}, nil)
 	session, cleanup := connect(t, srv)
 	defer cleanup()
@@ -344,8 +403,8 @@ func TestToolsListHasSevenToolsWithSchemas(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListTools: %v", err)
 	}
-	if len(res.Tools) != 7 {
-		t.Fatalf("ListTools returned %d tools, want 7", len(res.Tools))
+	if len(res.Tools) != 9 {
+		t.Fatalf("ListTools returned %d tools, want 9", len(res.Tools))
 	}
 	names := make(map[string]bool, len(res.Tools))
 	for _, tool := range res.Tools {
@@ -353,7 +412,7 @@ func TestToolsListHasSevenToolsWithSchemas(t *testing.T) {
 	}
 	for _, want := range []string{
 		"list_rooms", "read_messages", "search_messages", "get_message_context",
-		"list_participants", "get_recent_triggers", "send_message",
+		"list_participants", "get_media", "get_recent_triggers", "send_message", "send_media",
 	} {
 		if !names[want] {
 			t.Fatalf("ListTools missing %q (got %v)", want, names)
@@ -371,7 +430,10 @@ func TestToolsListHasSevenToolsWithSchemas(t *testing.T) {
 	// read_messages must describe the type of every message it returns, so a
 	// media event is never a blank body with no hint about what it was, and
 	// every relation that makes a reply, an edit or a deletion readable.
-	for _, field := range []string{"msgtype", "encrypted", "body", "reply_to", "edit_of", "mentions", "redacted"} {
+	for _, field := range []string{
+		"msgtype", "encrypted", "body", "reply_to", "edit_of", "mentions", "redacted",
+		"mimetype", "filename", "size_bytes", "width", "height", "duration_ms", "mxc_uri",
+	} {
 		if _, ok := messageProperties(t, readTool)[field]; !ok {
 			t.Fatalf("read_messages message schema has no %q property", field)
 		}
@@ -459,6 +521,7 @@ func TestToolsListHasSevenToolsWithSchemas(t *testing.T) {
 	for _, field := range []string{
 		"event_id", "room_id", "sender", "body", "msgtype", "timestamp", "encrypted",
 		"reply_to", "edit_of", "mentions", "redacted", "room_name",
+		"mimetype", "filename", "size_bytes", "width", "height", "duration_ms", "mxc_uri",
 	} {
 		if _, ok := hitProps[field]; !ok {
 			t.Fatalf("search_messages result has no %q property (a match carries the whole message plus its room)", field)
@@ -522,6 +585,75 @@ func TestToolsListHasSevenToolsWithSchemas(t *testing.T) {
 		t.Fatalf("bridge_kind description = %q, want it to name both bridge kinds", desc)
 	}
 
+	// get_media: the room and event are required, the dimension bound is
+	// optional, and the input schema documents every budget the handler
+	// enforces.
+	mediaTool := toolByName(t, res.Tools, "get_media")
+	mediaSchema := schemaMap(t, mediaTool)
+	mediaReq := requiredFields(t, mediaSchema)
+	if len(mediaReq) != 2 || mediaReq[0] != "room_id" || mediaReq[1] != "event_id" {
+		t.Fatalf("get_media required = %v, want [room_id event_id]", mediaReq)
+	}
+	mediaProps := mediaSchema["properties"].(map[string]any)
+	maxDim, ok := mediaProps["max_dimension"].(map[string]any)
+	if !ok || maxDim["type"] != "integer" {
+		t.Fatalf("get_media max_dimension = %v, want an integer", mediaProps["max_dimension"])
+	}
+	if desc, _ := maxDim["description"].(string); !strings.Contains(desc, "1568") || !strings.Contains(desc, "256") || !strings.Contains(desc, "4096") {
+		t.Fatalf("get_media max_dimension description = %q, want the default and clamp", desc)
+	}
+	mediaDesc := mediaTool.Description
+	for _, want := range []string{"1568", "1.5", "25", "mxc URI", "downscaled", "reason"} {
+		if !strings.Contains(mediaDesc, want) {
+			t.Fatalf("get_media description = %q, want it to state %q", mediaDesc, want)
+		}
+	}
+	mediaOut := envelopeProperties(t, mediaTool)
+	for _, field := range []string{
+		"mimetype", "filename", "size_bytes", "width", "height", "duration_ms",
+		"mxc_uri", "encrypted", "downscaled", "included", "reason",
+	} {
+		if _, ok := mediaOut[field]; !ok {
+			t.Fatalf("get_media output schema has no %q property", field)
+		}
+	}
+
+	// send_media: one room, one of two payload sources, and the same
+	// idempotency contract send_message documents.
+	sendMediaTool := toolByName(t, res.Tools, "send_media")
+	sendMediaSchema := schemaMap(t, sendMediaTool)
+	if req := requiredFields(t, sendMediaSchema); len(req) != 1 || req[0] != "room_id" {
+		t.Fatalf("send_media required = %v, want [room_id]", req)
+	}
+	sendMediaProps := sendMediaSchema["properties"].(map[string]any)
+	for _, field := range []string{"path", "data_base64", "mimetype", "caption", "filename", "reply_to", "idempotency_key"} {
+		prop, ok := sendMediaProps[field].(map[string]any)
+		if !ok {
+			t.Fatalf("send_media schema has no %q property", field)
+		}
+		if prop["type"] != "string" {
+			t.Fatalf("send_media %s type = %v, want string", field, prop["type"])
+		}
+		if desc, _ := prop["description"].(string); desc == "" {
+			t.Fatalf("send_media %s has no description", field)
+		}
+	}
+	if key := sendMediaProps["idempotency_key"].(map[string]any); !strings.Contains(key["description"].(string), "128") {
+		t.Fatalf("send_media idempotency_key description = %q, want the 128-character cap", key["description"])
+	}
+	sendMediaDesc := sendMediaTool.Description
+	for _, want := range []string{"m.image", "m.video", "m.audio", "m.file", "allow-listed", "50", "idempotency_key"} {
+		if !strings.Contains(sendMediaDesc, want) {
+			t.Fatalf("send_media description = %q, want it to state %q", sendMediaDesc, want)
+		}
+	}
+	sendMediaOut := envelopeProperties(t, sendMediaTool)
+	for _, field := range []string{"event_id", "deduplicated", "msgtype", "mxc_uri"} {
+		if _, ok := sendMediaOut[field]; !ok {
+			t.Fatalf("send_media output schema has no %q property", field)
+		}
+	}
+
 	recent := schemaMap(t, toolByName(t, res.Tools, "get_recent_triggers"))
 	if len(requiredFields(t, recent)) != 0 {
 		t.Fatalf("get_recent_triggers required = %v, want none", requiredFields(t, recent))
@@ -559,7 +691,7 @@ func TestToolsListHasSevenToolsWithSchemas(t *testing.T) {
 	// Annotations are part of the tool contract: readOnlyHint keeps a client
 	// from treating a read as a write, and destructiveHint/idempotentHint on
 	// send_message keep it from retrying a send that is neither.
-	for _, name := range []string{"list_rooms", "read_messages", "search_messages", "get_message_context", "list_participants", "get_recent_triggers"} {
+	for _, name := range []string{"list_rooms", "read_messages", "search_messages", "get_message_context", "list_participants", "get_media", "get_recent_triggers"} {
 		ann := toolByName(t, res.Tools, name).Annotations
 		if ann == nil {
 			t.Fatalf("%s has no annotations, want readOnlyHint true", name)
@@ -584,6 +716,20 @@ func TestToolsListHasSevenToolsWithSchemas(t *testing.T) {
 	}
 	if ann.ReadOnlyHint {
 		t.Fatal("send_message readOnlyHint = true, want false")
+	}
+
+	sendMediaAnn := sendMediaTool.Annotations
+	if sendMediaAnn == nil {
+		t.Fatal("send_media has no annotations")
+	}
+	if sendMediaAnn.DestructiveHint == nil || !*sendMediaAnn.DestructiveHint {
+		t.Fatalf("send_media destructiveHint = %v, want true", sendMediaAnn.DestructiveHint)
+	}
+	if sendMediaAnn.IdempotentHint {
+		t.Fatal("send_media idempotentHint = true, want false")
+	}
+	if sendMediaAnn.ReadOnlyHint {
+		t.Fatal("send_media readOnlyHint = true, want false")
 	}
 }
 
