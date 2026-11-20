@@ -3,7 +3,9 @@
 A Go MCP server that connects to a Matrix homeserver running a mautrix/whatsapp
 bridge. It listens to incoming message events, keeps a small in-memory history,
 optionally forwards them to a webhook, and exposes MCP tools for listing rooms,
-reading messages, and sending replies (allow-list gated, fail closed).
+reading messages, searching them, reading the context around one message,
+listing a room's participants, and sending replies (allow-list gated, fail
+closed).
 
 Status: Phase E — the codebase is covered by unit and protocol tests (run under
 the race detector), a smoke script exercises the built binary end to end,
@@ -475,9 +477,63 @@ type MessagePage struct {
     HasMore   bool      `json:"has_more"`
 }
 
+type SearchRequest struct {
+    Query          string
+    RoomID         string // optional: restrict the search to one room
+    Limit          int    // clamped to 1..100, default 20
+    SinceTimestamp int64  // unix milliseconds, inclusive
+}
+
+type SearchHit struct {
+    Message
+    RoomName string `json:"room_name"`
+}
+
+type SearchOutcome struct {
+    Hits          []SearchHit
+    Truncated     bool
+    ScannedRooms  int
+    ScannedEvents int
+    Source        string // "server" or "fallback"
+}
+
+type ContextOutcome struct {
+    Before    []Message // chronological
+    Event     Message
+    After     []Message // chronological
+    ReplyTo   *Message  // the message Event answers, resolved when possible
+    EditOf    *Message  // the message Event replaces, resolved when possible
+    Source    string    // "context" or "fallback"
+    Truncated bool      // fallback budget ran out
+}
+
+type Participant struct {
+    UserID      string `json:"user_id"`
+    DisplayName string `json:"display_name"`
+    Membership  string `json:"membership"`
+    Bridged     bool   `json:"bridged"`
+    BridgeKind  string `json:"bridge_kind"` // whatsapp_contact, whatsapp_bot, or ""
+}
+
+const (
+    SearchMaxRooms      = 10
+    SearchEventsPerRoom = 50
+    ContextMaxLimit     = 50
+    ContextScanPages     = 5
+    ContextScanPageLimit = 100
+)
+
+const (
+    BridgeKindContact = "whatsapp_contact"
+    BridgeKindBot     = "whatsapp_bot"
+)
+
 type MatrixService interface {
     JoinedRooms(ctx context.Context) ([]Room, error)
     Messages(ctx context.Context, roomID string, limit int, before string) (MessagePage, error)
+    SearchMessages(ctx context.Context, req SearchRequest) (SearchOutcome, error)
+    MessageContext(ctx context.Context, roomID, eventID string, before, after int) (ContextOutcome, error)
+    Participants(ctx context.Context, roomID string) ([]Participant, error)
     SendText(ctx context.Context, roomID, text, replyTo string) (string, error)
     Sync(ctx context.Context) error
     Close() error
@@ -549,6 +605,32 @@ Behavioral guarantees:
 - `SendText` returns a `*matrix.BridgeNoticeError` (matching
   `matrix.ErrNotBridged`) when the bridge reports the message was not forwarded
   within `MATRIX_BRIDGE_ACK_TIMEOUT`.
+- `SearchMessages` asks `POST /_matrix/client/v3/search` first (keys
+  `content.body`, `order_by: recent`, room filter when one is given). An
+  endpoint refusal — `M_UNRECOGNIZED`, `M_NOT_FOUND`, `M_INVALID_PARAM`, `405`,
+  `501`, or a 404 that is not `M_NOT_FOUND` — is remembered in
+  `searchUnavailable` and answered by the bounded scan forever after, per
+  process. A network failure or an authorization error is not treated as "no
+  search endpoint": those are returned to the caller, because degrading a
+  timeout into "no matches" would be a lie.
+- The scan reads at most `SearchMaxRooms` rooms and `SearchEventsPerRoom`
+  messages per room through the same bounded `Messages` call every other read
+  uses, so one search cannot fan out further than 10 × 50 messages. It matches
+  case-insensitively on `body` with all of a multi-word query's terms required,
+  ranks newest first with a deterministic tiebreak, and reports every reason it
+  stopped: hits beyond `limit`, a room with history behind the page read, rooms
+  beyond the budget, or a room that could not be read.
+- `MessageContext` uses `/context` and falls back to a bounded `/messages` walk
+  when the endpoint does not exist. `ErrEventNotFound` and `ErrNotAMessage` are
+  distinct from an empty context, and `reply_to`/`edit_of` are resolved from the
+  window first and fetched second, so a failure to resolve one leaves it absent
+  instead of failing the call.
+- `Participants` asks for joined members only, marks them with
+  `classifyBridgeUser` — the same function `IsBridged` uses, so the room flag
+  and the member list cannot drift apart — and bounds the whole call with a
+  10-second timeout. Missing display names are filled from the profile API,
+  8 at a time and 2 seconds each, and a failed lookup leaves that one name
+  empty.
 - With `MATRIX_E2EE_ENABLED=true`, `New`/first `Sync` wires
   `crypto/cryptohelper` with a SQLite store at `MATRIX_CRYPTO_DB_PATH`, and
   `SendText` refuses plaintext sends into encrypted rooms
@@ -622,14 +704,21 @@ func NewWithAllowlist(svc matrix.MatrixService, prober RoomProber,
 the client's own `allowlist.Store`, so `rooms allow` takes effect without a
 restart.
 
-`New` builds an `mcp.Server` with exactly four tools:
+`New` builds an `mcp.Server` with seven tools: six that only read, and one that
+sends.
 
 | Tool | Inputs | Annotations |
 | --- | --- | --- |
 | `list_rooms` | none | `readOnlyHint: true` |
 | `read_messages` | `room_id` (required), `limit` (default 20, clamped 1..100), `before` (opaque token from a previous `next_token`) | `readOnlyHint: true` |
+| `search_messages` | `query` (required, non-empty, at most 512 characters), `room_id` (optional scope), `limit` (default 20, clamped 1..100), `since_timestamp` (unix millis) | `readOnlyHint: true` |
+| `get_message_context` | `room_id` (required), `event_id` (required, a Matrix event ID), `limit_before` / `limit_after` (default 10, clamped 0..50) | `readOnlyHint: true` |
+| `list_participants` | `room_id` (required) | `readOnlyHint: true` |
 | `get_recent_triggers` | `since_timestamp` (unix millis), `limit` (default 20, clamped 1..100) | `readOnlyHint: true` |
 | `send_message` | `room_id` (required), `text` (required, non-whitespace), `reply_to` (event ID), `idempotency_key` (at most 128 characters) | `destructiveHint: true`, `idempotentHint: false`, `readOnlyHint: false` |
+
+Every tool is unannotated for `openWorldHint`, which therefore defaults to true:
+each one reaches a real homeserver and, through it, real people.
 
 `read_messages` returns one page of a room's history as an object, with the
 messages oldest-first inside it:
@@ -760,6 +849,141 @@ The usual cause of a rejection notice is relay mode: `bridge.relay.enabled`
 must be set in the bridge's config, and the sending account must be permitted
 to relay through the bridge bot. Without it the bridge has no WhatsApp login to
 speak for the sender and reports "not logged in".
+
+The three remaining read tools — `search_messages`, `get_message_context` and
+`list_participants` — are described in the three sections that follow. None of
+them can write: nothing in their path reaches `sendGate`, `SendText`, or any
+homeserver endpoint other than the read ones named there.
+
+### search_messages
+
+`search_messages` answers "where did someone say this" without fanning out over
+every room in the caller's context. It uses the homeserver's own search index
+first:
+
+```
+POST /_matrix/client/v3/search
+{"search_categories":{"room_events":{"search_term":"dinner","keys":["content.body"],"order_by":"recent","filter":{"types":["m.room.message"]}}}}
+```
+
+which indexes a room's whole history and is the only path that returns old
+messages reliably. The response is `{results, truncated, scanned_rooms,
+scanned_events, source}`: each match is the `read_messages` message shape plus
+`room_name`, newest first, and every field carries a schema description.
+
+A homeserver that does not implement `/search` — `M_UNRECOGNIZED`, `M_NOT_FOUND`,
+`M_INVALID_PARAM`, `405`, `501`, or a bare 404 route — does not fail the call.
+It is scanned instead, and the refusal is remembered for the life of the process
+so later searches skip the doomed request. `source` says which path answered
+(`server` or `fallback`), because the difference matters: an index covers the
+whole room, a scan covers the recent tail.
+
+The fallback is deliberately bounded, and the bound is enforced in code rather
+than described and hoped for:
+
+| Bound | Value | Where |
+| --- | --- | --- |
+| Rooms read | 10, in the name order `JoinedRooms` returns | `matrix.SearchMaxRooms` |
+| Messages read per room | 50, newest first | `matrix.SearchEventsPerRoom` |
+| Messages read in total | 500 (10 × 50) | derived from the two above |
+
+`truncated` is true whenever the answer is partial, and the reasons are all the
+ways that can happen: more matches than `limit`, a room with history behind the
+page that was read, more rooms than the scan may read, or a room that could not
+be read. One unreadable room is skipped and logged rather than failing the
+search — but a room the caller named explicitly is an error if it cannot be read,
+because reporting "no matches" for a room nobody looked at is worse than an
+error. `scanned_rooms` and `scanned_events` report what the scan actually read,
+and are 0 when the index answered, since nothing was scanned.
+
+Matching in the scan is case-insensitive on `body`, and a multi-word query
+requires every word to appear, which is what a reader expects from a search box
+(the index applies its own word rules). `since_timestamp` keeps messages sent at
+or after that unix-millisecond time and applies to both paths; the index has no
+date filter, so it is applied to what the server returned.
+
+`query` is validated before any request: empty or whitespace-only is
+`matrix.ErrEmptyQuery`, and more than 512 characters is an error naming the cap.
+`room_id` is validated with the same `config.ValidRoomID` every other room ID
+goes through.
+
+**Read scope, stated plainly:** reading is not gated by `ALLOWED_SEND_ROOMS`.
+That was already true of `list_rooms` and `read_messages`, and search makes it
+more visible: a search with no `room_id` reads every room the account has
+joined, up to the budget above. The allowlist governs sending, not reading. If
+that asymmetry is wrong for a deployment, it needs an `ALLOWED_READ_ROOMS` of its
+own rather than a narrower search.
+
+### get_message_context
+
+`get_message_context` reads one message with its neighbourhood, which is what a
+reply needs and what a full room read is too expensive for. It returns
+`{events_before, event, events_after, reply_to, edit_of, source, truncated}`:
+
+| Field | Meaning |
+| --- | --- |
+| `event` | the target message, in exactly the `read_messages` shape |
+| `events_before` | up to `limit_before` messages before it, oldest first, message events only |
+| `events_after` | up to `limit_after` messages after it, oldest first, message events only |
+| `reply_to` | the message the target answers, resolved to a full message when it is in the window or can be fetched; absent when the target is not a reply or the message is gone. The target's own `reply_to` field still carries the bare event ID |
+| `edit_of` | the message the target replaces, resolved the same way |
+| `source` | `context` when `GET /rooms/{roomId}/context/{eventId}` answered, `fallback` when the neighbourhood was found by scanning |
+| `truncated` | true only on the fallback path, when its fixed budget ran out before the requested window was covered |
+
+`limit_before` and `limit_after` default to 10 and are clamped to 0..50. They are
+optional integers rather than plain integers so that an omitted field can mean 10
+while an explicit `0` means "show me nothing on that side"; a plain `int` could
+not tell the two apart.
+
+When the homeserver does not implement `/context`, the event is fetched with
+`GET /rooms/{roomId}/event/{eventId}` and the room's `/messages` history is
+walked backward from the newest message until the target and the requested
+window are covered, the timeline ends, or the fixed budget of 5 pages × 100 raw
+events (`matrix.ContextScanPages`, `matrix.ContextScanPageLimit`) is spent. The
+refusal is remembered per process. Resolution of `reply_to` and `edit_of`
+prefers the events already in the window and only fetches what is outside it, so
+the common case costs no extra request; a failed resolution leaves that one field
+absent rather than failing the call.
+
+The error paths are typed on purpose, because an empty context reads as "nothing
+around this message" and that is a different claim:
+
+| Situation | Error |
+| --- | --- |
+| event ID is not well formed (`$` plus the ID, at most 255 bytes) | `matrix.ErrInvalidEventID`, before any request |
+| room ID is not well formed | `matrix.ErrInvalidRoomID`, before any request |
+| the event is not in the room (`M_NOT_FOUND`) | `matrix.ErrEventNotFound` |
+| the event exists but is not a message, e.g. a membership event | `matrix.ErrNotAMessage` |
+
+### list_participants
+
+`list_participants` returns `{participants: [{user_id, display_name,
+membership, bridged, bridge_kind}]}` for every joined member of a room, sorted by
+display name and then user ID. `membership` is `join` for every entry in this
+list, because the room is asked for its joined members only.
+
+`bridged` and `bridge_kind` come from one heuristic, shared with `list_rooms` so
+a room and its members cannot disagree about what a WhatsApp ghost is:
+
+| Localpart | `bridged` | `bridge_kind` |
+| --- | --- | --- |
+| starts with `whatsapp_` (a phone-number ghost) or `whatsapp_lid-` (a LID ghost) | true | `whatsapp_contact` |
+| starts with `whatsapp` and ends with `bot` (`whatsappbot`, `whatsapp_bot`, `whatsappbridgebot`) | true | `whatsapp_bot` |
+| any other localpart containing `whatsapp` | true | `whatsapp_contact` |
+| carries bridge metadata in the member event (`uk.half-shot.bridge`, `m.bridge`, `fi.mau.bridge`) | true | `whatsapp_contact` |
+| anything else | false | empty |
+
+The loose `contains whatsapp` rule is deliberate and predates this tool: bridges
+rename ghosts, the phone number is not always the first segment, and a false
+positive costs a wrong label while a false negative makes a WhatsApp contact look
+like a person on Matrix. The room-level `m.bridge` state event still marks a room
+as bridged in `list_rooms`; it is a property of the room, not of any member.
+
+The call is bounded by a 10-second timeout (`matrix.participantTimeout`). A
+member whose event carries no display name gets a bounded profile lookup (8 in
+flight, 2 seconds each), and a lookup that fails leaves that one name empty — the
+member is still listed, which is the point: one unreadable profile must not turn
+a participant list into an error.
 
 ### cli
 
