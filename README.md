@@ -456,22 +456,34 @@ type Room struct {
 }
 
 type Message struct {
-    EventID   string `json:"event_id"`
-    RoomID    string `json:"room_id"`
-    Sender    string `json:"sender"`
-    Body      string `json:"body"`
-    MsgType   string `json:"msgtype"`
-    Timestamp int64  `json:"timestamp"` // unix milliseconds
-    Encrypted bool   `json:"encrypted"`
+    EventID   string   `json:"event_id"`
+    RoomID    string   `json:"room_id"`
+    Sender    string   `json:"sender"`
+    Body      string   `json:"body"`
+    MsgType   string   `json:"msgtype"`
+    Timestamp int64    `json:"timestamp"` // unix milliseconds
+    Encrypted bool     `json:"encrypted"`
+    ReplyTo   string   `json:"reply_to,omitempty"`
+    EditOf    string   `json:"edit_of,omitempty"`
+    Mentions  []string `json:"mentions,omitempty"`
+    Redacted  bool     `json:"redacted"`
+}
+
+type MessagePage struct {
+    Messages  []Message `json:"messages"`
+    NextToken string    `json:"next_token,omitempty"`
+    HasMore   bool      `json:"has_more"`
 }
 
 type MatrixService interface {
     JoinedRooms(ctx context.Context) ([]Room, error)
-    Messages(ctx context.Context, roomID string, limit int) ([]Message, error)
-    SendText(ctx context.Context, roomID, text string) (string, error)
+    Messages(ctx context.Context, roomID string, limit int, before string) (MessagePage, error)
+    SendText(ctx context.Context, roomID, text, replyTo string) (string, error)
     Sync(ctx context.Context) error
     Close() error
 }
+
+func ValidEventID(eventID string) bool
 
 func New(cfg *config.Config, logger *log.Logger) (*Client, error)
 ```
@@ -507,11 +519,33 @@ Behavioral guarantees:
   number of convertible messages or the room is exhausted. A page of raw events
   in a busy room is mostly `m.room.member`, edits and reactions, so a single
   page would often return far fewer messages than asked for. Paging is bounded
-  by 10 pages and by `5 x limit` raw events scanned.
+  by 10 pages and by `5 x limit` raw events scanned, whether or not a token was
+  supplied.
+- `Messages` returns a `MessagePage`. `before` is an opaque token issued by
+  `pageSigner` (`internal/matrix/pagetoken.go`): the homeserver's `/messages`
+  cursor plus the room it was issued for, signed with a per-process HMAC key and
+  encoded in base64url, so it is opaque to a caller, free of secrets, and safe to
+  log. Verification rejects a malformed, edited, foreign or previous-process
+  token with `ErrInvalidPageToken` before any request, and a cursor the
+  homeserver refuses becomes `ErrStalePageToken`. `NextToken` is empty and
+  `HasMore` false when the homeserver reports the end of the timeline.
+- Message relations are read from the event content, not guessed:
+  `m.relates_to.m.in_reply_to.event_id` and the flat `m.relates_to.event_id`
+  both fill `ReplyTo`; `rel_type: m.replace` fills `EditOf` and stays in the
+  stream; `m.mentions.user_ids` fills `Mentions`. A redacted message
+  (`unsigned.redacted_because`) is still returned, with `Redacted: true`, a
+  blank body and no msgtype — the server has already stripped the content and
+  the deleted text is never reproduced.
 - A media event with an empty `body` (`m.image`, `m.video`, `m.audio`,
   `m.file`, ...) is reported with a bracketed type marker such as `[image]`
   derived from the `msgtype` alone, never invented content. Non-empty bodies
   and text-like types (`m.text`, `m.notice`, `m.emote`) are returned verbatim.
+- `SendText` takes an optional `replyTo` and sends it as
+  `m.relates_to.m.in_reply_to`, the shape the bridge renders as a quote. A
+  reply target that is not a well-formed event ID (`matrix.ValidEventID`) is
+  rejected with `ErrInvalidEventID` before any request; the rest of the send
+  path is identical, including the allowlist, the encryption check and the
+  bridge-ack guard.
 - `SendText` returns a `*matrix.BridgeNoticeError` (matching
   `matrix.ErrNotBridged`) when the bridge reports the message was not forwarded
   within `MATRIX_BRIDGE_ACK_TIMEOUT`.
@@ -593,15 +627,86 @@ restart.
 | Tool | Inputs | Annotations |
 | --- | --- | --- |
 | `list_rooms` | none | `readOnlyHint: true` |
-| `read_messages` | `room_id` (required), `limit` (default 20, clamped 1..100) | `readOnlyHint: true` |
+| `read_messages` | `room_id` (required), `limit` (default 20, clamped 1..100), `before` (opaque token from a previous `next_token`) | `readOnlyHint: true` |
 | `get_recent_triggers` | `since_timestamp` (unix millis), `limit` (default 20, clamped 1..100) | `readOnlyHint: true` |
-| `send_message` | `room_id` (required), `text` (required, non-whitespace) | `destructiveHint: true`, `idempotentHint: false`, `readOnlyHint: false` |
+| `send_message` | `room_id` (required), `text` (required, non-whitespace), `reply_to` (event ID), `idempotency_key` (at most 128 characters) | `destructiveHint: true`, `idempotentHint: false`, `readOnlyHint: false` |
 
-`read_messages` returns events oldest-first; `get_recent_triggers` returns the
-dispatcher's ring buffer newest-first. Every returned message carries its
-`msgtype` and, on `read_messages`, its `encrypted` flag, so a media event is
-never a blank body with no hint about what it was; a media event with no text
-body reports a bracketed type marker (`[image]`, `[file]`, ...).
+`read_messages` returns one page of a room's history as an object, with the
+messages oldest-first inside it:
+
+```json
+{
+  "messages": [ ... ],
+  "has_more": true,
+  "next_token": "eyJ2IjoxLCJyIjoiIXI6dGVzdCIsImMiOiJ0MTIzIn0.aBcDeF..."
+}
+```
+
+The envelope is not cosmetic. `structuredContent` is a JSON object by spec, and
+the cursor needs somewhere to live, so a page is
+`{messages, has_more, next_token}` rather than a bare array. `get_recent_triggers`
+still returns its array of the dispatcher's ring buffer, newest-first.
+
+`next_token` is present only when there is more history behind this page;
+passing it back as `before` reads the next older page, and repeating that until
+`has_more` is `false` reads the room. A token is issued for one room and signed
+by the running process, so it cannot be guessed, hand-edited, or replayed
+against another room, and it holds no secret — it is the homeserver's `/messages`
+cursor in base64url, safe to log. A malformed or edited token, a token for
+another room, and a token minted by a previous process all fail with
+`matrix.ErrInvalidPageToken` instead of an empty page; a token the homeserver
+itself rejects fails with `matrix.ErrStalePageToken`, which means start again
+from the newest message. A restart invalidates outstanding tokens by design,
+and they expire when the homeserver forgets the position, not on a clock of
+ours. Paging stays bounded: one call still walks at most 10 `/messages` pages
+and scans at most `5 x limit` raw events, with or without a token, so a token
+cannot turn one call into an unbounded read.
+
+`has_more` reports that the homeserver has more events behind the page, not that
+the next page contains messages: the remaining events can be membership or
+reaction events, in which case the next page is empty and carries its own
+`next_token`.
+
+Every message in `read_messages` carries its relations as well as its content:
+
+| Field | Meaning |
+| --- | --- |
+| `event_id`, `room_id`, `sender`, `body`, `msgtype`, `timestamp`, `encrypted` | unchanged, as above |
+| `reply_to` | the event ID this message answers, or absent. Both shapes the bridge may use are read: the reply form `m.relates_to.m.in_reply_to.event_id`, which mautrix-whatsapp emits, and the flat `m.relates_to.event_id`. The parent need not be in the page, so a reply is never orphaned |
+| `edit_of` | the event ID this event replaces (`m.relates_to` with `rel_type: m.replace`), or absent. The edit stays in the stream with this field set, so a client can apply it to the original rather than showing a duplicate `*`-prefixed message |
+| `mentions` | user IDs from `m.mentions.user_ids`, or absent when the message mentions nobody |
+| `redacted` | `true` when the room has redacted the message. A redacted message keeps its place — event ID, sender and timestamp are still true — with an empty `body`; the deleted text is never returned |
+
+An edit fills `edit_of` and not `reply_to`, even when the client also sent
+`m.in_reply_to` pointing at the edited event: the relation is an edit, and
+reporting it as a reply would be wrong.
+
+`send_message` takes `reply_to` to answer a specific message. The reply is sent
+with `m.relates_to.m.in_reply_to`, which is what the bridge renders as a quote,
+and it goes through the same allowlist, rate limiter, encryption check and
+bridge-ack guard as any other send. The event ID must look like a Matrix event
+ID (`$` followed by the ID, at most 255 bytes, no whitespace); anything else is
+rejected before a request is made and before the rate-limit token is spent. The
+message being replied to does not have to be in the room being written to — only
+the room being written to has to be allow-listed.
+
+`send_message` also takes `idempotency_key` (at most 128 characters) so a retry
+is safe. A second call with the same key, room and text within 10 minutes
+returns the original event ID with `deduplicated: true` and sends nothing; the
+same key with a different room or text is an error, never a second send; and a
+call that arrives while the first is still in flight waits for it and returns
+its event ID rather than racing it to the homeserver. A deduplicated call does
+not consume a rate-limit token, and a send that failed releases its key so the
+retry can send. The map is in-process, capped at 256 entries with the oldest
+evicted, and has no persistence: a restart forgets every key, after which the
+same call sends again. `idempotentHint` therefore stays `false` — only a keyed
+retry is idempotent, and the default is not.
+
+`get_recent_triggers` returns the dispatcher's ring buffer newest-first. Every
+message also carries its `msgtype` and, on `read_messages`, its `encrypted`
+flag, so a media event is never a blank body with no hint about what it was; a
+media event with no text body reports a bracketed type marker (`[image]`,
+`[file]`, ...).
 
 Bridged detection in `list_rooms` is best effort and never fails the whole
 call. A room is `bridged: true` when an `m.bridge` state event is present on
@@ -618,6 +723,15 @@ returns `rate limited, retry in Ns` rather than blocking. The allowlist is
 consulted per send, so a room added by `rooms allow` becomes sendable in the
 running process. The access token is
 never logged and never appears in an error or tool result.
+
+Idempotency lives in `idempotencyCache` (`internal/mcpserver/idempotency.go`), a
+mutex-guarded map of key → `{room, text, event ID, claimed at}` with a 10-minute
+TTL and a 256-entry cap, and it runs before the gate so a retry is answered
+rather than throttled. A claim is a reservation rather than a lookup: the
+in-flight entry makes a concurrent duplicate wait for the first send and then
+replay its event ID, so two retries can never both reach the homeserver. A send
+that fails releases its key, and an over-long key (more than 128 characters) is
+rejected before anything is claimed. Nothing is written to disk.
 
 Matrix accepting an event does not prove the bridge forwarded it. When a
 bridge rejects a message it posts an `m.notice` into the room whose
