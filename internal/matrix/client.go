@@ -23,6 +23,7 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
+	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/allowlist"
 	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/config"
 )
 
@@ -121,6 +122,10 @@ const (
 	bridgeAckPollInterval = 100 * time.Millisecond
 	// bridgeAckScanLimit is how many recent events each poll examines.
 	bridgeAckScanLimit = 20
+
+	// autoJoinTimeout bounds one automatic join. The join runs off the sync
+	// loop, so a slow homeserver delays the join only.
+	autoJoinTimeout = 30 * time.Second
 )
 
 // Client is the mautrix-backed MatrixService.
@@ -139,6 +144,9 @@ type Client struct {
 	seeded    bool
 	namesMu   sync.RWMutex
 	names     map[string]string
+	allow     *allowlist.Store
+	joinMu    sync.Mutex
+	joining   map[id.RoomID]struct{}
 	bgCtx     context.Context
 	bgCancel  context.CancelFunc
 	bgWG      sync.WaitGroup
@@ -180,6 +188,8 @@ func New(cfg *config.Config, logger *log.Logger) (*Client, error) {
 		log:      logger,
 		cli:      cli,
 		names:    make(map[string]string),
+		allow:    allowlist.New(cfg.AllowedSendRooms, cfg.AllowlistFile, logger),
+		joining:  make(map[id.RoomID]struct{}),
 		bgCtx:    bgCtx,
 		bgCancel: bgCancel,
 	}
@@ -188,6 +198,14 @@ func New(cfg *config.Config, logger *log.Logger) (*Client, error) {
 			c.setName(evt.RoomID.String(), content.Name)
 		}
 	})
+	// The invite listener is registered before init installs
+	// DontProcessOldEvents, which drops the whole first sync response. Joining
+	// from the first response is what makes an invitation survive a restart:
+	// otherwise an invite that arrived while the bot was down would be seen by
+	// no handler at all and never accepted.
+	if cfg.AutoJoinInvites {
+		syncer.OnSync(c.handleInvites)
+	}
 	return c, nil
 }
 
@@ -201,6 +219,21 @@ func (c *Client) OnEventType(t event.Type, handler mautrix.EventHandler) {
 		}
 		handler(ctx, evt)
 	})
+}
+
+// Allowlist returns the effective send allowlist: ALLOWED_SEND_ROOMS unioned
+// with the allowlist file, re-read as the file changes. The MCP layer gates
+// sends on the same Store so the two can never disagree.
+func (c *Client) Allowlist() *allowlist.Store { return c.allow }
+
+// WhoAmI reports the account the access token belongs to. It is one request and
+// changes no client state, so `doctor` can call it without starting a sync.
+func (c *Client) WhoAmI(ctx context.Context) (userID, deviceID string, err error) {
+	who, err := c.cli.Whoami(ctx)
+	if err != nil {
+		return "", "", fmt.Errorf("matrix: whoami: %w", err)
+	}
+	return who.UserID.String(), who.DeviceID.String(), nil
 }
 
 // RoomName returns the cached display name of a room, or the room ID when it is
@@ -459,7 +492,7 @@ func (c *Client) SendText(ctx context.Context, roomID, text string) (string, err
 	if !config.ValidRoomID(roomID) {
 		return "", ErrInvalidRoomID
 	}
-	if !c.cfg.SendAllowed(roomID) {
+	if !c.allow.Allowed(roomID) {
 		return "", ErrSendNotAllowed
 	}
 	if strings.TrimSpace(text) == "" {
@@ -618,6 +651,90 @@ func (c *Client) prepareEncryption(ctx context.Context, roomID id.RoomID) error 
 		}
 	}
 	return nil
+}
+
+// handleInvites accepts pending room invitations. It runs as a sync listener,
+// not an event handler, for two reasons: invitation state arrives in
+// rooms.invite rather than a timeline, and this listener is installed before
+// DontProcessOldEvents, so the invitations carried by the first sync response
+// are seen too.
+func (c *Client) handleInvites(_ context.Context, resp *mautrix.RespSync, _ string) bool {
+	for roomID, invited := range resp.Rooms.Invite {
+		inviter, ok := inviteSender(invited, c.cfg.UserID)
+		if !ok {
+			continue
+		}
+		c.autoJoin(roomID, inviter)
+	}
+	return true
+}
+
+// inviteSender returns the user who invited us to room, which is the sender of
+// our own invite membership event. The event may be stripped state from
+// rooms.invite, so its content is parsed here instead of relying on the syncer
+// having done it.
+func inviteSender(room *mautrix.SyncInvitedRoom, self string) (id.UserID, bool) {
+	if room == nil {
+		return "", false
+	}
+	for _, evt := range room.BestState() {
+		if evt.Type.Type != event.StateMember.Type || evt.GetStateKey() != self {
+			continue
+		}
+		if evt.Content.Parsed == nil {
+			if err := evt.Content.ParseRaw(event.StateMember); err != nil {
+				continue
+			}
+		}
+		member := evt.Content.AsMember()
+		if member == nil || member.Membership != event.MembershipInvite || evt.Sender == "" {
+			continue
+		}
+		return evt.Sender, true
+	}
+	return "", false
+}
+
+// autoJoin joins a room in the background. The decision is made on the sync
+// goroutine but the request is not issued there, so a slow or hanging join
+// never stalls the sync loop; in-flight rooms are deduplicated because an
+// invitation can be repeated by consecutive sync responses, and every join
+// goroutine is joined by Close.
+func (c *Client) autoJoin(roomID id.RoomID, inviter id.UserID) {
+	if !c.cfg.InviteAllowed(inviter.String()) {
+		c.log.Printf("auto-join: refusing invitation to %s from %s: not in MATRIX_INVITE_ALLOWLIST", roomID, inviter)
+		return
+	}
+
+	c.joinMu.Lock()
+	_, busy := c.joining[roomID]
+	c.closeMu.Lock()
+	closed := c.closed
+	if !busy && !closed {
+		c.joining[roomID] = struct{}{}
+		c.bgWG.Add(1)
+	}
+	c.closeMu.Unlock()
+	c.joinMu.Unlock()
+	if busy || closed {
+		return
+	}
+
+	go func() {
+		defer c.bgWG.Done()
+		defer func() {
+			c.joinMu.Lock()
+			delete(c.joining, roomID)
+			c.joinMu.Unlock()
+		}()
+		ctx, cancel := context.WithTimeout(c.bgCtx, autoJoinTimeout)
+		defer cancel()
+		if _, err := c.cli.JoinRoomByID(ctx, roomID); err != nil {
+			c.log.Printf("auto-join: joining %s failed: %v", roomID, err)
+			return
+		}
+		c.log.Printf("auto-join: joined %s (invited by %s)", roomID, inviter)
+	}()
 }
 
 // Sync implements MatrixService.

@@ -7,6 +7,8 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -869,5 +871,232 @@ func TestRelatesToEventID(t *testing.T) {
 		if got := relatesToEventID(tc.rel); got != tc.want {
 			t.Fatalf("%s: relatesToEventID = %q, want %q", tc.name, got, tc.want)
 		}
+	}
+}
+
+// inviteSyncBody is the first /sync response for the auto-join tests: one
+// invitation from sender, carried by the invite state exactly as a real
+// homeserver sends it.
+func inviteSyncBody(sender string) string {
+	return `{"next_batch":"s1","rooms":{"invite":{"!invited:test":{"invite_state":{"events":[` +
+		`{"type":"m.room.member","state_key":"@bot:test","sender":"` + sender + `","content":{"membership":"invite"}},` +
+		`{"type":"m.room.name","state_key":"","sender":"` + sender + `","content":{"name":"Family"}}]}}}}}`
+}
+
+// inviteServer is a fake homeserver that sends one invitation in the first
+// /sync response and records every join request.
+type inviteServer struct {
+	sender    string
+	syncCount atomic.Int64
+	joinCount atomic.Int64
+	joinPath  atomic.Value
+}
+
+func (s *inviteServer) start(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/_matrix/client/v3/account/whoami":
+			io.WriteString(w, `{"user_id":"@bot:test","device_id":"DEVICE"}`)
+		case r.URL.Path == "/_matrix/client/v3/user/@bot:test/filter":
+			io.WriteString(w, `{"filter_id":"FILTER1"}`)
+		case r.URL.Path == "/_matrix/client/v3/joined_rooms":
+			io.WriteString(w, `{"joined_rooms":[]}`)
+		case strings.HasPrefix(r.URL.Path, "/_matrix/client/v3/rooms/") && strings.HasSuffix(r.URL.Path, "/join"):
+			s.joinCount.Add(1)
+			s.joinPath.Store(r.URL.Path)
+			io.WriteString(w, `{"room_id":"!invited:test"}`)
+		case r.URL.Path == "/_matrix/client/v3/sync":
+			if s.syncCount.Add(1) == 1 {
+				io.WriteString(w, inviteSyncBody(s.sender))
+				return
+			}
+			<-r.Context().Done()
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// runSync starts the client's sync loop and returns a stop function that
+// cancels, closes and joins it.
+func runSync(t *testing.T, c *Client) func() {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- c.Sync(ctx) }()
+	return func() {
+		cancel()
+		if err := c.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("Sync returned %v, want nil on cancellation", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("Sync did not return after cancellation")
+		}
+	}
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// TestAutoJoinAcceptsInviteFromAllowlistedInviter also proves the offline case:
+// the invitation arrives in the first sync response, which DontProcessOldEvents
+// drops for event handlers, so joining here means an invite that landed while
+// the bot was down is not lost.
+func TestAutoJoinAcceptsInviteFromAllowlistedInviter(t *testing.T) {
+	fake := &inviteServer{sender: "@alice:test"}
+	srv := fake.start(t)
+
+	cfg := testConfig(srv.URL)
+	cfg.AutoJoinInvites = true
+	cfg.InviteAllowlist = []string{"@alice:test"}
+	c, err := New(cfg, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := runSync(t, c)
+	defer stop()
+
+	waitFor(t, "the join request", func() bool { return fake.joinCount.Load() > 0 })
+	if !strings.Contains(fake.joinPath.Load().(string), "!invited:test") {
+		t.Fatalf("join path = %q, want it to target !invited:test", fake.joinPath.Load())
+	}
+	waitFor(t, "the first sync to be answered", func() bool { return fake.syncCount.Load() >= 2 })
+	if n := fake.joinCount.Load(); n != 1 {
+		t.Fatalf("issued %d join requests, want exactly 1 (repeated invitations deduplicated)", n)
+	}
+}
+
+func TestAutoJoinRefusesUnlistedInviter(t *testing.T) {
+	fake := &inviteServer{sender: "@mallory:test"}
+	srv := fake.start(t)
+
+	cfg := testConfig(srv.URL)
+	cfg.AutoJoinInvites = true
+	cfg.InviteAllowlist = []string{"@alice:test"}
+	c, err := New(cfg, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := runSync(t, c)
+	defer stop()
+
+	// The second /sync request only starts once the first response has been
+	// fully processed, so reaching it means the invitation was already judged.
+	waitFor(t, "the invitation to be processed", func() bool { return fake.syncCount.Load() >= 2 })
+	time.Sleep(100 * time.Millisecond)
+	if n := fake.joinCount.Load(); n != 0 {
+		t.Fatalf("issued %d join requests for an unlisted inviter, want 0", n)
+	}
+}
+
+func TestAutoJoinDisabledByDefaultLeavesInvitePending(t *testing.T) {
+	fake := &inviteServer{sender: "@alice:test"}
+	srv := fake.start(t)
+
+	c, err := New(testConfig(srv.URL), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := runSync(t, c)
+	defer stop()
+
+	waitFor(t, "the invitation to be processed", func() bool { return fake.syncCount.Load() >= 2 })
+	time.Sleep(100 * time.Millisecond)
+	if n := fake.joinCount.Load(); n != 0 {
+		t.Fatalf("issued %d join requests with auto-join off, want 0", n)
+	}
+}
+
+// TestAutoJoinAcceptsAnyoneWhenAllowlistIsEmpty covers the documented
+// "empty allow-list accepts from anyone" rule.
+func TestAutoJoinAcceptsAnyoneWhenAllowlistIsEmpty(t *testing.T) {
+	fake := &inviteServer{sender: "@mallory:test"}
+	srv := fake.start(t)
+
+	cfg := testConfig(srv.URL)
+	cfg.AutoJoinInvites = true
+	c, err := New(cfg, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := runSync(t, c)
+	defer stop()
+
+	waitFor(t, "the join request", func() bool { return fake.joinCount.Load() > 0 })
+}
+
+func TestSendTextAllowsRoomFromAllowlistFile(t *testing.T) {
+	var sent atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/state/m.room.encryption"):
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{"errcode":"M_NOT_FOUND","error":"Not found"}`)
+		case strings.Contains(r.URL.Path, "/send/m.room.message/"):
+			sent.Add(1)
+			io.WriteString(w, `{"event_id":"$file1"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	path := filepath.Join(t.TempDir(), "allow.txt")
+	if err := os.WriteFile(path, []byte("# enrolled from the CLI\n!file-only:test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig(srv.URL)
+	cfg.AllowlistFile = path
+
+	c, err := New(cfg, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventID, err := c.SendText(context.Background(), "!file-only:test", "hello")
+	if err != nil {
+		t.Fatalf("SendText to a file-allow-listed room: %v", err)
+	}
+	if eventID != "$file1" || sent.Load() != 1 {
+		t.Fatalf("SendText = %q with %d sends, want $file1 and one send", eventID, sent.Load())
+	}
+}
+
+func TestWhoAmIReportsTokenOwner(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/_matrix/client/v3/account/whoami" {
+			http.NotFound(w, r)
+			return
+		}
+		io.WriteString(w, `{"user_id":"@bot:test","device_id":"DEVICE"}`)
+	}))
+	defer srv.Close()
+
+	c, err := New(testConfig(srv.URL), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID, deviceID, err := c.WhoAmI(context.Background())
+	if err != nil {
+		t.Fatalf("WhoAmI: %v", err)
+	}
+	if userID != "@bot:test" || deviceID != "DEVICE" {
+		t.Fatalf("WhoAmI = %q/%q, want @bot:test/DEVICE", userID, deviceID)
 	}
 }
