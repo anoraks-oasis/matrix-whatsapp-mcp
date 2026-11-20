@@ -802,7 +802,10 @@ call. A room is `bridged: true` when an `m.bridge` state event is present on
 the room; failing that, when any joined member's localpart contains
 `whatsapp` (case-insensitive). Any probe error leaves `bridged: false` and
 keeps the room. The room `name` is the room name, falling back to the
-canonical alias, then to `unnamed`.
+canonical alias, then to `unnamed`. The probes run 8 at a time under one
+10-second deadline (`mcpserver.listRoomsTimeout`), so a large account answers
+promptly: rooms whose probes did not finish inside it are listed with
+`bridged: false` and the name the joined-rooms list carried.
 
 Sending is gated by an unexported `sendGate` type that combines the live
 allowlist and a token bucket (one message per 3 seconds across all rooms). An
@@ -816,7 +819,9 @@ never logged and never appears in an error or tool result.
 Idempotency lives in `idempotencyCache` (`internal/mcpserver/idempotency.go`), a
 mutex-guarded map of key → `{room, text, event ID, claimed at}` with a 10-minute
 TTL and a 256-entry cap, and it runs before the gate so a retry is answered
-rather than throttled. A claim is a reservation rather than a lookup: the
+rather than throttled. The TTL applies to settled entries only: an entry whose
+send is still in flight is never expired or evicted, because a hung send must
+not let a retry post the same message again. A claim is a reservation rather than a lookup: the
 in-flight entry makes a concurrent duplicate wait for the first send and then
 replay its event ID, so two retries can never both reach the homeserver. A send
 that fails releases its key, and an over-long key (more than 128 characters) is
@@ -883,7 +888,7 @@ than described and hoped for:
 
 | Bound | Value | Where |
 | --- | --- | --- |
-| Rooms read | 10, in the name order `JoinedRooms` returns | `matrix.SearchMaxRooms` |
+| Rooms read | 10, taken from the joined-room list before any of them is named | `matrix.SearchMaxRooms` |
 | Messages read per room | 50, newest first | `matrix.SearchEventsPerRoom` |
 | Messages read in total | 500 (10 × 50) | derived from the two above |
 
@@ -967,7 +972,7 @@ a room and its members cannot disagree about what a WhatsApp ghost is:
 
 | Localpart | `bridged` | `bridge_kind` |
 | --- | --- | --- |
-| starts with `whatsapp_` (a phone-number ghost) or `whatsapp_lid-` (a LID ghost) | true | `whatsapp_contact` |
+| starts with `whatsapp_` (a phone-number ghost) or `whatsapp_lid-`/`whatsapp-lid-` (a LID ghost, either separator) | true | `whatsapp_contact` |
 | starts with `whatsapp` and ends with `bot` (`whatsappbot`, `whatsapp_bot`, `whatsappbridgebot`) | true | `whatsapp_bot` |
 | any other localpart containing `whatsapp` | true | `whatsapp_contact` |
 | carries bridge metadata in the member event (`uk.half-shot.bridge`, `m.bridge`, `fi.mau.bridge`) | true | `whatsapp_contact` |
