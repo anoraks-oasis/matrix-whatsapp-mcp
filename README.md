@@ -384,9 +384,11 @@ removed. No notice within the window means normal success. With the timeout
 set to `0` the guard is off entirely and the send issues no extra request.
 
 Raise `MATRIX_BRIDGE_ACK_TIMEOUT` if your bridge is slow to post its notice:
-the guard can only report what it sees inside the window. It also only matches
-notices that carry `m.relates_to` pointing at the sent event, which is what
-mautrix-whatsapp emits.
+the guard can only report what it sees inside the window. It matches a notice
+that points at the sent event through either relation shape —
+`m.relates_to.event_id` or `m.relates_to.m.in_reply_to.event_id`; mautrix-whatsapp
+uses the reply form, so checking only the flat field misses every live
+rejection.
 
 The usual cause of a rejection notice is relay mode: `bridge.relay.enabled`
 must be set in the bridge's config, and the sending account must be permitted
