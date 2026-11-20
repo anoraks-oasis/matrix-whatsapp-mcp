@@ -29,6 +29,13 @@ const (
 	defaultLimit = 20
 	maxLimit     = 100
 
+	// maxSearchQueryLen is the longest accepted search_messages query, in
+	// characters. Past this a query is a document, not a search.
+	maxSearchQueryLen = 512
+	// defaultContextLimit is how many messages get_message_context returns on
+	// each side of the target when the caller does not say.
+	defaultContextLimit = 10
+
 	// sendInterval is the minimum time between two accepted sends across all
 	// rooms: the token bucket holds one token and refills it every sendInterval.
 	sendInterval = 3 * time.Second
@@ -102,6 +109,35 @@ func NewWithAllowlist(svc matrix.MatrixService, prober RoomProber, recent Trigge
 	}, s.handleReadMessages)
 
 	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name: "search_messages",
+		Description: fmt.Sprintf("Search message bodies case-insensitively and return the matches newest first. "+
+			"The homeserver's own search index answers when it implements /search; when it does not, the call degrades to a bounded scan of the most recent %d messages "+
+			"in each of at most %d rooms (%d messages in total) instead of failing, and truncated reports that the budget cut the search short. "+
+			"scanned_rooms and scanned_events say what the scan actually read, and are 0 when the index answered.",
+			matrix.SearchEventsPerRoom, matrix.SearchMaxRooms, matrix.SearchMaxRooms*matrix.SearchEventsPerRoom),
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+	}, s.handleSearchMessages)
+
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name: "get_message_context",
+		Description: fmt.Sprintf("Read one message with the messages around it: up to limit_before messages before it and up to limit_after after it, %d each by default and capped at %d. "+
+			"The message's reply_to and edit_of are resolved to the messages they point at, so a reply can be understood without fetching the whole room. "+
+			"Uses the room's /context endpoint and falls back to scanning the room's recent history when the homeserver does not implement it; source reports which path answered. "+
+			"An event ID that is not in the room is an error, not an empty result.",
+			defaultContextLimit, matrix.ContextMaxLimit),
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+	}, s.handleMessageContext)
+
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name: "list_participants",
+		Description: "List every joined member of a room with the display name the room reports, whether the member belongs to the WhatsApp bridge, and which kind of bridge user it is: " +
+			"whatsapp_contact for a WhatsApp ghost, whatsapp_bot for the bridge bot, and empty for a plain Matrix user. " +
+			"bridged uses the same heuristic as list_rooms: a user ID whose localpart starts with a mautrix bridge prefix such as whatsapp_ or whatsapp_lid-, any other localpart containing whatsapp, " +
+			"or a bridge marker in the member event. The call is bounded by a timeout, and a member whose profile cannot be read is still listed.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+	}, s.handleListParticipants)
+
+	mcp.AddTool(mcpServer, &mcp.Tool{
 		Name:        "get_recent_triggers",
 		Description: "Read recent incoming-message triggers from the dispatcher ring buffer, newest first.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
@@ -155,6 +191,59 @@ type readMessagesResult struct {
 	Messages  []messageResult `json:"messages" jsonschema:"the messages in this page, oldest first"`
 	NextToken string          `json:"next_token,omitempty" jsonschema:"opaque token to pass back as before to read the next older page; absent when the room's history ends here"`
 	HasMore   bool            `json:"has_more" jsonschema:"whether the homeserver has more events behind this page, so a next_token is present. A later page can still contain no messages when the remaining events are membership or other non-message events"`
+}
+
+type searchMessagesInput struct {
+	Query          string `json:"query" jsonschema:"the text to search for, matched against message bodies case-insensitively; every word of a multi-word query must appear when the bounded scan answers. It must not be empty and is capped at 512 characters"`
+	RoomID         string `json:"room_id,omitempty" jsonschema:"restrict the search to this Matrix room ID; omit it to search every joined room, up to the bounded scan budget this tool's description states"`
+	Limit          int    `json:"limit,omitempty" jsonschema:"maximum number of results to return; default 20, clamped to 1..100"`
+	SinceTimestamp int64  `json:"since_timestamp,omitempty" jsonschema:"only return messages sent at or after this unix-millisecond timestamp; omit it to search every message the search looks at"`
+}
+
+type searchHitResult struct {
+	messageResult
+	RoomName string `json:"room_name" jsonschema:"the display name of the room the match is in, falling back to the room ID when the name is not known"`
+}
+
+type searchMessagesResult struct {
+	Results       []searchHitResult `json:"results" jsonschema:"the matching messages, newest first, each in the same shape read_messages returns plus its room name; empty when nothing matched"`
+	Truncated     bool              `json:"truncated" jsonschema:"true when the search stopped at a budget instead of covering everything it was asked to search: more matches than limit, a room with history behind the page that was read, more rooms than the scan may read, or a room that could not be read. The results are then a partial answer"`
+	ScannedRooms  int               `json:"scanned_rooms" jsonschema:"how many rooms the bounded fallback scan actually read; 0 when the homeserver's search index answered, because nothing was scanned"`
+	ScannedEvents int               `json:"scanned_events" jsonschema:"how many messages the bounded fallback scan actually looked at; 0 when the homeserver's search index answered"`
+	Source        string            `json:"source" jsonschema:"which path produced the results: server when the homeserver's /search index answered, fallback when the bounded room scan did"`
+}
+
+type getMessageContextInput struct {
+	RoomID      string `json:"room_id" jsonschema:"the Matrix room ID the event belongs to"`
+	EventID     string `json:"event_id" jsonschema:"the event ID of the message to read context for, for example $abc123. It must be a Matrix event ID ($ followed by the ID) or the call is rejected before anything is requested"`
+	LimitBefore *int   `json:"limit_before,omitempty" jsonschema:"how many messages before the target to return; default 10, clamped to 0..50, and 0 returns none"`
+	LimitAfter  *int   `json:"limit_after,omitempty" jsonschema:"how many messages after the target to return; default 10, clamped to 0..50, and 0 returns none"`
+}
+
+type getMessageContextResult struct {
+	EventsBefore []messageResult `json:"events_before" jsonschema:"the messages before the target, oldest first; only message events, so membership and other state events in the window are not listed"`
+	Event        messageResult   `json:"event" jsonschema:"the target message, in the same shape read_messages returns"`
+	EventsAfter  []messageResult `json:"events_after" jsonschema:"the messages after the target, oldest first; only message events"`
+	ReplyTo      *messageResult  `json:"reply_to,omitempty" jsonschema:"the message the target replies to, resolved to its full body when it is in the window or can be fetched; absent when the target is not a reply or the message is no longer available. The target's own reply_to field carries the event ID alone"`
+	EditOf       *messageResult  `json:"edit_of,omitempty" jsonschema:"the message the target edits, resolved to its full body when it is in the window or can be fetched; absent when the target is not an edit or the message is no longer available. The target's own edit_of field carries the event ID alone"`
+	Source       string          `json:"source" jsonschema:"which path produced the context: context when the room's /context endpoint answered, fallback when the neighbourhood was found by scanning the room's recent messages"`
+	Truncated    bool            `json:"truncated" jsonschema:"true when the fallback scan ran out of its fixed budget before covering the requested window, so events_before or events_after are shorter than asked for"`
+}
+
+type listParticipantsInput struct {
+	RoomID string `json:"room_id" jsonschema:"the Matrix room ID to list the joined members of"`
+}
+
+type participantResult struct {
+	UserID      string `json:"user_id" jsonschema:"the member's Matrix user ID"`
+	DisplayName string `json:"display_name" jsonschema:"the display name the room reports for the member, or the member's profile name when the member event carries none; empty when neither could be read"`
+	Membership  string `json:"membership" jsonschema:"the membership the room reports for this member, which is join for every entry in this list"`
+	Bridged     bool   `json:"bridged" jsonschema:"true when this member belongs to the WhatsApp bridge: a ghost contact, a ghost group, or the bridge bot"`
+	BridgeKind  string `json:"bridge_kind" jsonschema:"the kind of bridge user: whatsapp_contact for a WhatsApp ghost, whatsapp_bot for the bridge bot, and empty for a plain Matrix user"`
+}
+
+type listParticipantsResult struct {
+	Participants []participantResult `json:"participants" jsonschema:"the joined members of the room, sorted by display name and then user ID"`
 }
 
 type recentTriggersInput struct {
@@ -232,28 +321,93 @@ func (s *Server) handleReadMessages(ctx context.Context, _ *mcp.CallToolRequest,
 		return nil, readMessagesResult{}, err
 	}
 	out := readMessagesResult{
-		Messages:  make([]messageResult, 0, len(page.Messages)),
+		Messages:  toMessageResults(page.Messages),
 		NextToken: page.NextToken,
 		HasMore:   page.HasMore,
-	}
-	for _, m := range page.Messages {
-		out.Messages = append(out.Messages, messageResult{
-			EventID:   m.EventID,
-			RoomID:    m.RoomID,
-			Sender:    m.Sender,
-			Body:      m.Body,
-			MsgType:   m.MsgType,
-			Timestamp: m.Timestamp,
-			Encrypted: m.Encrypted,
-			ReplyTo:   m.ReplyTo,
-			EditOf:    m.EditOf,
-			Mentions:  m.Mentions,
-			Redacted:  m.Redacted,
-		})
 	}
 	// The Matrix API returns newest first; the tool contract is chronological.
 	for i, j := 0, len(out.Messages)-1; i < j; i, j = i+1, j-1 {
 		out.Messages[i], out.Messages[j] = out.Messages[j], out.Messages[i]
+	}
+	return nil, out, nil
+}
+
+// handleSearchMessages validates the query here rather than in the Matrix
+// layer so an empty or oversized query costs no request at all, and clamps the
+// limit once at the MCP boundary so the description and the behaviour agree.
+func (s *Server) handleSearchMessages(ctx context.Context, _ *mcp.CallToolRequest, in searchMessagesInput) (*mcp.CallToolResult, searchMessagesResult, error) {
+	query := strings.TrimSpace(in.Query)
+	if query == "" {
+		return nil, searchMessagesResult{}, fmt.Errorf("%w: query must not be empty", matrix.ErrEmptyQuery)
+	}
+	if utf8.RuneCountInString(query) > maxSearchQueryLen {
+		return nil, searchMessagesResult{}, fmt.Errorf("query must be at most %d characters", maxSearchQueryLen)
+	}
+	found, err := s.matrix.SearchMessages(ctx, matrix.SearchRequest{
+		Query:          query,
+		RoomID:         in.RoomID,
+		Limit:          clampLimit(in.Limit),
+		SinceTimestamp: in.SinceTimestamp,
+	})
+	if err != nil {
+		return nil, searchMessagesResult{}, err
+	}
+	out := searchMessagesResult{
+		Results:       make([]searchHitResult, 0, len(found.Hits)),
+		Truncated:     found.Truncated,
+		ScannedRooms:  found.ScannedRooms,
+		ScannedEvents: found.ScannedEvents,
+		Source:        found.Source,
+	}
+	for _, hit := range found.Hits {
+		out.Results = append(out.Results, searchHitResult{
+			messageResult: toMessageResult(hit.Message),
+			RoomName:      hit.RoomName,
+		})
+	}
+	return nil, out, nil
+}
+
+func (s *Server) handleMessageContext(ctx context.Context, _ *mcp.CallToolRequest, in getMessageContextInput) (*mcp.CallToolResult, getMessageContextResult, error) {
+	if !matrix.ValidEventID(in.EventID) {
+		return nil, getMessageContextResult{}, fmt.Errorf("%w: event_id must be a Matrix event ID, a $ sigil followed by the ID", matrix.ErrInvalidEventID)
+	}
+	out, err := s.matrix.MessageContext(ctx, in.RoomID, in.EventID, contextLimit(in.LimitBefore), contextLimit(in.LimitAfter))
+	if err != nil {
+		return nil, getMessageContextResult{}, err
+	}
+	res := getMessageContextResult{
+		EventsBefore: toMessageResults(out.Before),
+		Event:        toMessageResult(out.Event),
+		EventsAfter:  toMessageResults(out.After),
+		Source:       out.Source,
+		Truncated:    out.Truncated,
+	}
+	if out.ReplyTo != nil {
+		reply := toMessageResult(*out.ReplyTo)
+		res.ReplyTo = &reply
+	}
+	if out.EditOf != nil {
+		edit := toMessageResult(*out.EditOf)
+		res.EditOf = &edit
+	}
+	return nil, res, nil
+}
+
+func (s *Server) handleListParticipants(ctx context.Context, _ *mcp.CallToolRequest, in listParticipantsInput) (*mcp.CallToolResult, listParticipantsResult, error) {
+	members, err := s.matrix.Participants(ctx, in.RoomID)
+	if err != nil {
+		return nil, listParticipantsResult{}, err
+	}
+	out := listParticipantsResult{Participants: make([]participantResult, 0, len(members))}
+	for _, m := range members {
+		out.Participants = append(out.Participants, participantResult{
+			UserID:      m.UserID,
+			DisplayName: m.DisplayName,
+			Membership:  m.Membership,
+			Bridged:     m.Bridged,
+			BridgeKind:  m.BridgeKind,
+		})
 	}
 	return nil, out, nil
 }
@@ -328,6 +482,49 @@ func clampLimit(limit int) int {
 	default:
 		return limit
 	}
+}
+
+// contextLimit applies the get_message_context default and clamp. A nil
+// pointer is an omitted field, which means 10; an explicit 0 means none, so the
+// two cannot be confused the way a bare int would confuse them.
+func contextLimit(v *int) int {
+	if v == nil {
+		return defaultContextLimit
+	}
+	switch {
+	case *v < 0:
+		return 0
+	case *v > matrix.ContextMaxLimit:
+		return matrix.ContextMaxLimit
+	default:
+		return *v
+	}
+}
+
+// toMessageResult is the one place a Matrix message becomes the tool shape, so
+// every tool that returns a message returns exactly the same one.
+func toMessageResult(m matrix.Message) messageResult {
+	return messageResult{
+		EventID:   m.EventID,
+		RoomID:    m.RoomID,
+		Sender:    m.Sender,
+		Body:      m.Body,
+		MsgType:   m.MsgType,
+		Timestamp: m.Timestamp,
+		Encrypted: m.Encrypted,
+		ReplyTo:   m.ReplyTo,
+		EditOf:    m.EditOf,
+		Mentions:  m.Mentions,
+		Redacted:  m.Redacted,
+	}
+}
+
+func toMessageResults(msgs []matrix.Message) []messageResult {
+	out := make([]messageResult, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, toMessageResult(m))
+	}
+	return out
 }
 
 func boolPtr(b bool) *bool { return &b }

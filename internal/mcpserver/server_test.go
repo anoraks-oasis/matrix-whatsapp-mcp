@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"path/filepath"
@@ -40,6 +41,36 @@ type fakeMatrix struct {
 	sentID     string
 	sentErr    error
 	sendDelay  time.Duration
+
+	searchReqs []matrix.SearchRequest
+	searchOut  matrix.SearchOutcome
+	searchErr  error
+
+	ctxRoom  []string
+	ctxEvent []string
+	ctxBef   []int
+	ctxAft   []int
+	ctxOut   matrix.ContextOutcome
+	ctxErr   error
+
+	partsRoom []string
+	parts     []matrix.Participant
+	partsErr  error
+
+	// blockUntilDone makes every read method wait for its context to end and
+	// return the context's error, which is how the cancellation tests observe
+	// that a handler neither swallows cancellation nor retries past it.
+	blockUntilDone bool
+}
+
+// waitCtx reports a cancelled context and, when blockUntilDone is set, waits
+// for one. Every read method starts with it.
+func (f *fakeMatrix) waitCtx(ctx context.Context) error {
+	if f.blockUntilDone {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return ctx.Err()
 }
 
 func (f *fakeMatrix) JoinedRooms(context.Context) ([]matrix.Room, error) {
@@ -79,6 +110,51 @@ func (f *fakeMatrix) sends() (rooms, texts, replies []string) {
 
 func (f *fakeMatrix) Sync(context.Context) error { return nil }
 func (f *fakeMatrix) Close() error               { return nil }
+
+func (f *fakeMatrix) SearchMessages(ctx context.Context, req matrix.SearchRequest) (matrix.SearchOutcome, error) {
+	if err := f.waitCtx(ctx); err != nil {
+		return matrix.SearchOutcome{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.searchReqs = append(f.searchReqs, req)
+	return f.searchOut, f.searchErr
+}
+
+func (f *fakeMatrix) searchCalls() []matrix.SearchRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]matrix.SearchRequest(nil), f.searchReqs...)
+}
+
+func (f *fakeMatrix) MessageContext(ctx context.Context, roomID, eventID string, before, after int) (matrix.ContextOutcome, error) {
+	if err := f.waitCtx(ctx); err != nil {
+		return matrix.ContextOutcome{}, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ctxRoom = append(f.ctxRoom, roomID)
+	f.ctxEvent = append(f.ctxEvent, eventID)
+	f.ctxBef = append(f.ctxBef, before)
+	f.ctxAft = append(f.ctxAft, after)
+	return f.ctxOut, f.ctxErr
+}
+
+func (f *fakeMatrix) contextCalls() (before, after []int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int(nil), f.ctxBef...), append([]int(nil), f.ctxAft...)
+}
+
+func (f *fakeMatrix) Participants(ctx context.Context, roomID string) ([]matrix.Participant, error) {
+	if err := f.waitCtx(ctx); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.partsRoom = append(f.partsRoom, roomID)
+	return f.parts, f.partsErr
+}
 
 // fakeProber is a RoomProber. IsBridged returns false (the documented
 // best-effort fallback) for rooms whose probe "errors"; the room must still be
@@ -195,6 +271,27 @@ func schemaMap(t *testing.T, tool *mcp.Tool) map[string]any {
 	return m
 }
 
+// nullableInteger reports whether a schema property's type accepts an integer
+// and the absence of a value, which is the shape an optional *int input gets.
+func nullableInteger(typ any) bool {
+	switch v := typ.(type) {
+	case string:
+		return v == "integer"
+	case []any:
+		integer, null := false, false
+		for _, entry := range v {
+			switch entry {
+			case "integer":
+				integer = true
+			case "null":
+				null = true
+			}
+		}
+		return integer && null
+	}
+	return false
+}
+
 func requiredFields(t *testing.T, schema map[string]any) []string {
 	t.Helper()
 	req, _ := schema["required"].([]any)
@@ -220,7 +317,7 @@ func hasField(t *testing.T, schema map[string]any, name string) []string {
 	return nil
 }
 
-func TestToolsListHasFourToolsWithSchemas(t *testing.T) {
+func TestToolsListHasSevenToolsWithSchemas(t *testing.T) {
 	srv := New(&fakeMatrix{}, &fakeProber{}, &fakeRecent{}, nil)
 	session, cleanup := connect(t, srv)
 	defer cleanup()
@@ -229,14 +326,17 @@ func TestToolsListHasFourToolsWithSchemas(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListTools: %v", err)
 	}
-	if len(res.Tools) != 4 {
-		t.Fatalf("ListTools returned %d tools, want 4", len(res.Tools))
+	if len(res.Tools) != 7 {
+		t.Fatalf("ListTools returned %d tools, want 7", len(res.Tools))
 	}
 	names := make(map[string]bool, len(res.Tools))
 	for _, tool := range res.Tools {
 		names[tool.Name] = true
 	}
-	for _, want := range []string{"list_rooms", "read_messages", "get_recent_triggers", "send_message"} {
+	for _, want := range []string{
+		"list_rooms", "read_messages", "search_messages", "get_message_context",
+		"list_participants", "get_recent_triggers", "send_message",
+	} {
 		if !names[want] {
 			t.Fatalf("ListTools missing %q (got %v)", want, names)
 		}
@@ -280,6 +380,130 @@ func TestToolsListHasFourToolsWithSchemas(t *testing.T) {
 		t.Fatalf("read_messages before description = %q, want it to name next_token", desc)
 	}
 
+	// search_messages: one required query, an optional room scope, limit and
+	// date bound, and a result envelope that says how partial the answer is.
+	searchTool := toolByName(t, res.Tools, "search_messages")
+	search := schemaMap(t, searchTool)
+	if req := requiredFields(t, search); len(req) != 1 || req[0] != "query" {
+		t.Fatalf("search_messages required = %v, want [query]", req)
+	}
+	searchProps := search["properties"].(map[string]any)
+	query, ok := searchProps["query"].(map[string]any)
+	if !ok || query["type"] != "string" {
+		t.Fatalf("search_messages query = %v, want a string", searchProps["query"])
+	}
+	if desc, _ := query["description"].(string); !strings.Contains(desc, "512") {
+		t.Fatalf("search_messages query description = %q, want the 512-character cap", desc)
+	}
+	for _, field := range []string{"room_id", "limit", "since_timestamp"} {
+		prop, ok := searchProps[field].(map[string]any)
+		if !ok {
+			t.Fatalf("search_messages schema has no %q property", field)
+		}
+		if desc, _ := prop["description"].(string); desc == "" {
+			t.Fatalf("search_messages %s has no description", field)
+		}
+	}
+	searchLimit := searchProps["limit"].(map[string]any)
+	if searchLimit["type"] != "integer" {
+		t.Fatalf("search_messages limit type = %v, want integer", searchLimit["type"])
+	}
+	if desc, _ := searchLimit["description"].(string); !strings.Contains(desc, "default 20") || !strings.Contains(desc, "100") {
+		t.Fatalf("search_messages limit description = %q, want default 20 and max 100", desc)
+	}
+	if since := searchProps["since_timestamp"].(map[string]any); since["type"] != "integer" {
+		t.Fatalf("search_messages since_timestamp type = %v, want integer", since["type"])
+	}
+	// The budget in the description must be the budget the code enforces: both
+	// numbers come from the same constants.
+	searchDesc := searchTool.Description
+	for _, want := range []string{
+		fmt.Sprint(matrix.SearchEventsPerRoom),
+		fmt.Sprint(matrix.SearchMaxRooms),
+		fmt.Sprint(matrix.SearchMaxRooms * matrix.SearchEventsPerRoom),
+		"truncated",
+	} {
+		if !strings.Contains(searchDesc, want) {
+			t.Fatalf("search_messages description = %q, want it to state %q", searchDesc, want)
+		}
+	}
+	searchOut := envelopeProperties(t, searchTool)
+	for _, field := range []string{"results", "truncated", "scanned_rooms", "scanned_events", "source"} {
+		if _, ok := searchOut[field]; !ok {
+			t.Fatalf("search_messages output schema has no %q property", field)
+		}
+	}
+	hitItems, ok := searchOut["results"].(map[string]any)["items"].(map[string]any)
+	if !ok {
+		t.Fatalf("search_messages results schema has no items object")
+	}
+	hitProps := hitItems["properties"].(map[string]any)
+	for _, field := range []string{
+		"event_id", "room_id", "sender", "body", "msgtype", "timestamp", "encrypted",
+		"reply_to", "edit_of", "mentions", "redacted", "room_name",
+	} {
+		if _, ok := hitProps[field]; !ok {
+			t.Fatalf("search_messages result has no %q property (a match carries the whole message plus its room)", field)
+		}
+	}
+
+	// get_message_context: room and event required, both limits optional so an
+	// explicit 0 can mean "none".
+	contextTool := toolByName(t, res.Tools, "get_message_context")
+	contextSchema := schemaMap(t, contextTool)
+	contextReq := requiredFields(t, contextSchema)
+	if len(contextReq) != 2 || contextReq[0] != "room_id" || contextReq[1] != "event_id" {
+		t.Fatalf("get_message_context required = %v, want [room_id event_id]", contextReq)
+	}
+	contextProps := contextSchema["properties"].(map[string]any)
+	for _, field := range []string{"limit_before", "limit_after"} {
+		prop, ok := contextProps[field].(map[string]any)
+		if !ok {
+			t.Fatalf("get_message_context schema has no %q property", field)
+		}
+		if desc, _ := prop["description"].(string); !strings.Contains(desc, "default 10") || !strings.Contains(desc, "0..50") {
+			t.Fatalf("get_message_context %s description = %q, want the default and clamp", field, desc)
+		}
+		if !nullableInteger(prop["type"]) {
+			t.Fatalf("get_message_context %s type = %v, want an optional integer", field, prop["type"])
+		}
+	}
+	contextOut := envelopeProperties(t, contextTool)
+	for _, field := range []string{"events_before", "event", "events_after", "reply_to", "edit_of", "source", "truncated"} {
+		if _, ok := contextOut[field]; !ok {
+			t.Fatalf("get_message_context output schema has no %q property", field)
+		}
+	}
+	target, ok := contextOut["event"].(map[string]any)
+	if !ok {
+		t.Fatalf("get_message_context event schema is %T, want an object", contextOut["event"])
+	}
+	if _, ok := target["properties"].(map[string]any)["event_id"]; !ok {
+		t.Fatal("get_message_context event schema carries no event_id: the target must use the message shape")
+	}
+
+	// list_participants: one required room, and every participant field in the
+	// output schema.
+	participantsTool := toolByName(t, res.Tools, "list_participants")
+	participantsSchema := schemaMap(t, participantsTool)
+	if req := requiredFields(t, participantsSchema); len(req) != 1 || req[0] != "room_id" {
+		t.Fatalf("list_participants required = %v, want [room_id]", req)
+	}
+	participantsOut := envelopeProperties(t, participantsTool)
+	pItems, ok := participantsOut["participants"].(map[string]any)["items"].(map[string]any)
+	if !ok {
+		t.Fatalf("list_participants output schema has no participants items object")
+	}
+	pProps := pItems["properties"].(map[string]any)
+	for _, field := range []string{"user_id", "display_name", "membership", "bridged", "bridge_kind"} {
+		if _, ok := pProps[field]; !ok {
+			t.Fatalf("list_participants participant schema has no %q property", field)
+		}
+	}
+	if desc, _ := pProps["bridge_kind"].(map[string]any)["description"].(string); !strings.Contains(desc, "whatsapp_contact") || !strings.Contains(desc, "whatsapp_bot") {
+		t.Fatalf("bridge_kind description = %q, want it to name both bridge kinds", desc)
+	}
+
 	recent := schemaMap(t, toolByName(t, res.Tools, "get_recent_triggers"))
 	if len(requiredFields(t, recent)) != 0 {
 		t.Fatalf("get_recent_triggers required = %v, want none", requiredFields(t, recent))
@@ -317,7 +541,7 @@ func TestToolsListHasFourToolsWithSchemas(t *testing.T) {
 	// Annotations are part of the tool contract: readOnlyHint keeps a client
 	// from treating a read as a write, and destructiveHint/idempotentHint on
 	// send_message keep it from retrying a send that is neither.
-	for _, name := range []string{"list_rooms", "read_messages", "get_recent_triggers"} {
+	for _, name := range []string{"list_rooms", "read_messages", "search_messages", "get_message_context", "list_participants", "get_recent_triggers"} {
 		ann := toolByName(t, res.Tools, name).Annotations
 		if ann == nil {
 			t.Fatalf("%s has no annotations, want readOnlyHint true", name)
