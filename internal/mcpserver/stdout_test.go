@@ -1,4 +1,4 @@
-package main
+package mcpserver
 
 import (
 	"go/ast"
@@ -11,8 +11,8 @@ import (
 )
 
 // stdoutException is the one file allowed to reach os.Stdout: the subcommand
-// dispatch in main, which hands it to `rooms`/`doctor` and exits before any MCP
-// server exists. Every other package writes to stderr or to an injected writer,
+// dispatch in cmd/server, which hands it to `rooms`/`doctor` and exits before
+// any MCP server exists. Every other package writes to stderr or to an injected writer,
 // because a stray byte on stdout corrupts the stdio JSON-RPC framing for every
 // client and no Go test or smoke script would notice.
 const stdoutException = "cmd/server/main.go"
