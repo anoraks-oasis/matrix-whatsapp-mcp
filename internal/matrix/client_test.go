@@ -16,6 +16,7 @@ import (
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 
 	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/config"
 )
@@ -629,6 +630,7 @@ type bridgeAckServer struct {
 	messages []string
 	sends    int
 	polls    int
+	sendID   string // event ID returned by the send endpoint; defaults to $send1
 }
 
 func (b *bridgeAckServer) setMessages(chunk string) {
@@ -653,8 +655,12 @@ func (b *bridgeAckServer) start(t *testing.T) *httptest.Server {
 		case strings.Contains(r.URL.Path, "/send/m.room.message/"):
 			b.mu.Lock()
 			b.sends++
+			sendID := b.sendID
 			b.mu.Unlock()
-			io.WriteString(w, `{"event_id":"$send1"}`)
+			if sendID == "" {
+				sendID = "$send1"
+			}
+			io.WriteString(w, `{"event_id":"`+sendID+`"}`)
 		case strings.Contains(r.URL.Path, "/messages"):
 			b.mu.Lock()
 			b.polls++
@@ -789,5 +795,79 @@ func TestSanitizeNoticeBoundsAndFlattens(t *testing.T) {
 	long := sanitizeNotice(strings.Repeat("x", 1000))
 	if len(long) != 303 || !strings.HasSuffix(long, "...") {
 		t.Fatalf("sanitizeNotice(1000 chars) produced %d chars, want a 300-char bound", len(long))
+	}
+}
+
+// liveNotBridgedEventID is the event ID from the live failure: the server
+// reported success, and the bridge then rejected it with a notice.
+const liveNotBridgedEventID = "$yXXiCBRYgaKwxnPTokViHJLeaZ8gOhnk3iQIcYBX8i0"
+
+// TestSendTextLiveBridgeNoticeShape replays the bridge notice captured from the
+// real homeserver byte for byte. It relates to the sent event through
+// m.relates_to.m.in_reply_to.event_id (not the flat m.relates_to.event_id),
+// carries m.mentions and an emoji, and was missed by the original matcher.
+func TestSendTextLiveBridgeNoticeShape(t *testing.T) {
+	const liveNotice = `{"body":"⚠️ Your message was not bridged: You're not logged in (relay not set and receiver login is owned by @anorak:oasis, not @mcp-bot:oasis)",` +
+		`"m.mentions":{"user_ids":["@mcp-bot:oasis"]},` +
+		`"m.relates_to":{"m.in_reply_to":{"event_id":"` + liveNotBridgedEventID + `"}},` +
+		`"msgtype":"m.notice"}`
+
+	fake := &bridgeAckServer{sendID: liveNotBridgedEventID}
+	fake.setMessages(`{"type":"m.room.message","event_id":"$notice","sender":"@whatsappbot:oasis","origin_server_ts":1763600000000,"content":` + liveNotice + `}`)
+	srv := fake.start(t)
+
+	c, err := New(testConfigWithAck(srv.URL, 250*time.Millisecond, "!ok:test"), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventID, err := c.SendText(context.Background(), "!ok:test", "hello world")
+	if err == nil {
+		t.Fatalf("SendText = %q, nil; want the live bridge rejection to surface", eventID)
+	}
+	if !errors.Is(err, ErrNotBridged) {
+		t.Fatalf("SendText error = %v, want it to match ErrNotBridged", err)
+	}
+	var noticeErr *BridgeNoticeError
+	if !errors.As(err, &noticeErr) {
+		t.Fatalf("SendText error %v is not a *BridgeNoticeError", err)
+	}
+	if noticeErr.EventID != liveNotBridgedEventID {
+		t.Fatalf("BridgeNoticeError.EventID = %q, want %q", noticeErr.EventID, liveNotBridgedEventID)
+	}
+	for _, want := range []string{
+		"Your message was not bridged",
+		"relay not set",
+		"@anorak:oasis",
+		"@mcp-bot:oasis",
+	} {
+		if !strings.Contains(noticeErr.Notice, want) {
+			t.Fatalf("BridgeNoticeError.Notice = %q, want it to contain %q", noticeErr.Notice, want)
+		}
+	}
+	if strings.ContainsAny(noticeErr.Notice, "\n\r\t") || strings.ContainsFunc(noticeErr.Notice, unicode.IsControl) {
+		t.Fatalf("BridgeNoticeError.Notice = %q, want a single line with no control characters", noticeErr.Notice)
+	}
+}
+
+// TestRelatesToEventID covers both relation shapes a bridge may emit.
+func TestRelatesToEventID(t *testing.T) {
+	flat := &event.RelatesTo{Type: event.RelReference, EventID: "$flat"}
+	reply := &event.RelatesTo{InReplyTo: &event.InReplyTo{EventID: "$reply"}}
+	both := &event.RelatesTo{EventID: "$flat", InReplyTo: &event.InReplyTo{EventID: "$reply"}}
+	for _, tc := range []struct {
+		name string
+		rel  *event.RelatesTo
+		want id.EventID
+	}{
+		{"nil", nil, ""},
+		{"flat", flat, "$flat"},
+		{"reply", reply, "$reply"},
+		{"flat wins when both are present", both, "$flat"},
+		{"empty reply", &event.RelatesTo{InReplyTo: &event.InReplyTo{}}, ""},
+		{"empty relation", &event.RelatesTo{}, ""},
+	} {
+		if got := relatesToEventID(tc.rel); got != tc.want {
+			t.Fatalf("%s: relatesToEventID = %q, want %q", tc.name, got, tc.want)
+		}
 	}
 }

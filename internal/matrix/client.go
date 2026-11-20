@@ -515,8 +515,11 @@ func (c *Client) awaitBridgeNotice(ctx context.Context, roomID string, eventID i
 }
 
 // findBridgeNotice looks for the bridge's rejection notice among the newest
-// events of a room. A notice counts when its m.relates_to.event_id is the sent
-// event and it was not sent by this account. The rule deliberately does not
+// events of a room. A notice counts when its m.relates_to points at the sent
+// event and it was not sent by this account. A bridge may express that relation
+// either as m.relates_to.event_id or as a reply, m.relates_to.m.in_reply_to
+// .event_id; mautrix-whatsapp emits the reply shape, which is why matching only
+// the flat field misses every live rejection. The rule deliberately does not
 // depend on the bridge bot's user ID, which differs per bridge deployment;
 // a false positive needs another client to reply with an m.notice to this exact
 // event, and even then the caller only gets a quoted notice, never a lost send.
@@ -539,12 +542,29 @@ func (c *Client) findBridgeNotice(ctx context.Context, roomID string, eventID id
 		if msg == nil || msg.MsgType != event.MsgNotice {
 			continue
 		}
-		if msg.RelatesTo == nil || msg.RelatesTo.EventID != eventID {
+		if relatesToEventID(msg.RelatesTo) != eventID {
 			continue
 		}
 		return sanitizeNotice(msg.Body), true, nil
 	}
 	return "", false, nil
+}
+
+// relatesToEventID returns the event a relation points at, whether the sender
+// used the flat m.relates_to.event_id or the reply form m.relates_to
+// .m.in_reply_to.event_id. Mautrix keeps the two apart: RelatesTo.EventID stays
+// empty for a reply.
+func relatesToEventID(rel *event.RelatesTo) id.EventID {
+	if rel == nil {
+		return ""
+	}
+	if rel.EventID != "" {
+		return rel.EventID
+	}
+	if rel.InReplyTo != nil {
+		return rel.InReplyTo.EventID
+	}
+	return ""
 }
 
 // sanitizeNotice renders a bridge notice as one trimmed line with no control
