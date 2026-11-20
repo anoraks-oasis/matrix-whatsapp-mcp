@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-label="matrix-whatsapp-mcp icon">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#121A1C"/>
+      <stop offset="1" stop-color="#0B1114"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="112" fill="url(#tile)"/>
+  <rect x="1.5" y="1.5" width="509" height="509" rx="110.5" fill="none" stroke="#1D3A33" stroke-width="3"/>
+
+  <g transform="translate(256 246)">
+    <path d="M-118 -110h236a36 36 0 0 1 36 36v118a36 36 0 0 1-36 36H20l-52 44 8-44h-94a36 36 0 0 1-36-36v-118a36 36 0 0 1 36-36z"
+          fill="none" stroke="#25D366" stroke-width="10" stroke-linejoin="round"/>
+
+    <g fill="#25D366">
+      <circle cx="-58" cy="-38" r="13"/>
+      <circle cx="6" cy="-10" r="13"/>
+      <circle cx="-58" cy="34" r="13"/>
+      <circle cx="70" cy="34" r="13"/>
+    </g>
+    <g stroke="#25D366" stroke-opacity="0.5" stroke-width="6" fill="none" stroke-linecap="round">
+      <path d="M-58 -38 6 -10"/>
+      <path d="M-58 -38 -58 34"/>
+      <path d="M-58 34 70 34"/>
+      <path d="M6 -10 70 34"/>
+    </g>
+  </g>
+</svg>
