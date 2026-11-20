@@ -883,10 +883,11 @@ func inviteSyncBody(sender string) string {
 		`{"type":"m.room.name","state_key":"","sender":"` + sender + `","content":{"name":"Family"}}]}}}}}`
 }
 
-// inviteServer is a fake homeserver that sends one invitation in the first
-// /sync response and records every join request.
+// inviteServer is a fake homeserver that sends one invitation in the /sync
+// response numbered inviteOn and records every join request.
 type inviteServer struct {
 	sender    string
+	inviteOn  int64
 	syncCount atomic.Int64
 	joinCount atomic.Int64
 	joinPath  atomic.Value
@@ -907,11 +908,16 @@ func (s *inviteServer) start(t *testing.T) *httptest.Server {
 			s.joinPath.Store(r.URL.Path)
 			io.WriteString(w, `{"room_id":"!invited:test"}`)
 		case r.URL.Path == "/_matrix/client/v3/sync":
-			if s.syncCount.Add(1) == 1 {
+			n := s.syncCount.Add(1)
+			switch n {
+			case s.inviteOn:
 				io.WriteString(w, inviteSyncBody(s.sender))
-				return
+			case s.inviteOn - 1:
+				io.WriteString(w, `{"next_batch":"s0"}`)
+			default:
+				// Hold the long-poll open until the test cancels the run.
+				<-r.Context().Done()
 			}
-			<-r.Context().Done()
 		default:
 			http.NotFound(w, r)
 		}
@@ -960,7 +966,7 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 // drops for event handlers, so joining here means an invite that landed while
 // the bot was down is not lost.
 func TestAutoJoinAcceptsInviteFromAllowlistedInviter(t *testing.T) {
-	fake := &inviteServer{sender: "@alice:test"}
+	fake := &inviteServer{sender: "@alice:test", inviteOn: 1}
 	srv := fake.start(t)
 
 	cfg := testConfig(srv.URL)
@@ -984,7 +990,7 @@ func TestAutoJoinAcceptsInviteFromAllowlistedInviter(t *testing.T) {
 }
 
 func TestAutoJoinRefusesUnlistedInviter(t *testing.T) {
-	fake := &inviteServer{sender: "@mallory:test"}
+	fake := &inviteServer{sender: "@mallory:test", inviteOn: 1}
 	srv := fake.start(t)
 
 	cfg := testConfig(srv.URL)
@@ -1007,7 +1013,7 @@ func TestAutoJoinRefusesUnlistedInviter(t *testing.T) {
 }
 
 func TestAutoJoinDisabledByDefaultLeavesInvitePending(t *testing.T) {
-	fake := &inviteServer{sender: "@alice:test"}
+	fake := &inviteServer{sender: "@alice:test", inviteOn: 1}
 	srv := fake.start(t)
 
 	c, err := New(testConfig(srv.URL), testLogger())
@@ -1027,7 +1033,7 @@ func TestAutoJoinDisabledByDefaultLeavesInvitePending(t *testing.T) {
 // TestAutoJoinAcceptsAnyoneWhenAllowlistIsEmpty covers the documented
 // "empty allow-list accepts from anyone" rule.
 func TestAutoJoinAcceptsAnyoneWhenAllowlistIsEmpty(t *testing.T) {
-	fake := &inviteServer{sender: "@mallory:test"}
+	fake := &inviteServer{sender: "@mallory:test", inviteOn: 1}
 	srv := fake.start(t)
 
 	cfg := testConfig(srv.URL)
@@ -1040,6 +1046,29 @@ func TestAutoJoinAcceptsAnyoneWhenAllowlistIsEmpty(t *testing.T) {
 	defer stop()
 
 	waitFor(t, "the join request", func() bool { return fake.joinCount.Load() > 0 })
+}
+
+// TestAutoJoinAcceptsInviteFromIncrementalSync is the everyday flow: the bot is
+// already running when the invitation arrives, so it shows up in an incremental
+// /sync response rather than the first one.
+func TestAutoJoinAcceptsInviteFromIncrementalSync(t *testing.T) {
+	fake := &inviteServer{sender: "@alice:test", inviteOn: 2}
+	srv := fake.start(t)
+
+	cfg := testConfig(srv.URL)
+	cfg.AutoJoinInvites = true
+	cfg.InviteAllowlist = []string{"@Alice:test"} // compared case-insensitively
+	c, err := New(cfg, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := runSync(t, c)
+	defer stop()
+
+	waitFor(t, "the join request after an incremental invite", func() bool { return fake.joinCount.Load() > 0 })
+	if n := fake.syncCount.Load(); n < 2 {
+		t.Fatalf("joined after %d sync responses, want the invitation from the second", n)
+	}
 }
 
 func TestSendTextAllowsRoomFromAllowlistFile(t *testing.T) {
