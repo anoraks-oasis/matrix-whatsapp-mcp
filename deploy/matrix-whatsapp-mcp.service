@@ -1,0 +1,38 @@
+[Unit]
+Description=matrix-whatsapp-mcp - MCP server for a mautrix/whatsapp bridge
+Documentation=https://github.com/ButterHost69/matrix-whatsapp-mcp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=matrix-mcp
+Group=matrix-mcp
+WorkingDirectory=/var/lib/matrix-whatsapp-mcp
+ExecStart=/usr/local/bin/matrix-whatsapp-mcp
+
+# The default is stdio, which needs a client on stdin; a service has none, so
+# serve Streamable HTTP instead. Both can be overridden in the env file below.
+Environment=MCP_TRANSPORT=http
+Environment=HTTP_ADDR=127.0.0.1:8080
+
+# Holds MATRIX_HOMESERVER, MATRIX_USER_ID, MATRIX_ACCESS_TOKEN and any optional
+# variables. Keep it root:matrix-mcp 0640 so `rooms allow` can be run as the
+# service user.
+EnvironmentFile=/etc/matrix-whatsapp-mcp/env
+
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=20s
+
+# Hardening. ProtectHome keeps HOME away from the service, so the allowlist file
+# must be set explicitly (MATRIX_ALLOWLIST_FILE=/var/lib/matrix-whatsapp-mcp/allow.txt).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/matrix-whatsapp-mcp
+
+[Install]
+WantedBy=multi-user.target
