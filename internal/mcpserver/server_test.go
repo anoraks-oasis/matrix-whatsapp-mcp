@@ -41,6 +41,11 @@ type fakeMatrix struct {
 	sentID     string
 	sentErr    error
 	sendDelay  time.Duration
+	// sendStarted receives one value when a send begins, and sendGate makes it
+	// wait there, so a test can hold a send in flight while it does something
+	// else (such as advancing the idempotency clock past its TTL).
+	sendStarted chan struct{}
+	sendGate    chan struct{}
 
 	searchReqs []matrix.SearchRequest
 	searchOut  matrix.SearchOutcome
@@ -88,7 +93,20 @@ func (f *fakeMatrix) Messages(_ context.Context, roomID string, limit int, befor
 	return page, err
 }
 
-func (f *fakeMatrix) SendText(_ context.Context, roomID, text, replyTo string) (string, error) {
+func (f *fakeMatrix) SendText(ctx context.Context, roomID, text, replyTo string) (string, error) {
+	if f.sendStarted != nil {
+		select {
+		case f.sendStarted <- struct{}{}:
+		default:
+		}
+	}
+	if f.sendGate != nil {
+		select {
+		case <-f.sendGate:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
 	if f.sendDelay > 0 {
 		time.Sleep(f.sendDelay)
 	}
@@ -1366,5 +1384,97 @@ func TestSendMessageIdempotencyConcurrent(t *testing.T) {
 	}
 	if _, texts, _ := svc.sends(); len(texts) != 1 {
 		t.Fatalf("matrix saw %d sends, want exactly 1 for 8 concurrent retries", len(texts))
+	}
+}
+
+// TestSendMessageIdempotencyInFlightPastTTL proves R1's invariant end to end: a
+// send that is still in flight when the idempotency TTL elapses keeps its key,
+// so the retry waits for it and replays its event instead of posting the same
+// message to the homeserver a second time.
+func TestSendMessageIdempotencyInFlightPastTTL(t *testing.T) {
+	cache, advance := testCache(idempotencyTTL, 8)
+	gate := make(chan struct{})
+	started := make(chan struct{}, 1)
+	svc := &fakeMatrix{sentID: "$once", sendStarted: started, sendGate: gate}
+	srv := newServer(svc, &fakeProber{}, &fakeRecent{}, allowlist.FromSlice([]string{"!ok:test"}), cache)
+	session, cleanup := connect(t, srv)
+	defer cleanup()
+
+	send := func() (sendMessageResult, error) {
+		res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+			Name:      "send_message",
+			Arguments: map[string]any{"room_id": "!ok:test", "text": "hello", "idempotency_key": "k"},
+		})
+		if err != nil {
+			return sendMessageResult{}, err
+		}
+		if res.IsError {
+			return sendMessageResult{}, errors.New(resultErrorText(t, res))
+		}
+		return decodeStructured[sendMessageResult](t, res), nil
+	}
+
+	type outcome struct {
+		result sendMessageResult
+		err    error
+	}
+	first := make(chan outcome, 1)
+	go func() {
+		result, err := send()
+		first <- outcome{result, err}
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		close(gate)
+		t.Fatal("the first send never reached the homeserver")
+	}
+
+	// The send is now in flight and its recorded entry is older than the TTL.
+	advance(idempotencyTTL + time.Second)
+
+	second := make(chan outcome, 1)
+	go func() {
+		result, err := send()
+		second <- outcome{result, err}
+	}()
+
+	select {
+	case got := <-second:
+		close(gate)
+		t.Fatalf("the retry returned %+v while the first send was still in flight, want it to wait", got.result)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(gate)
+
+	gotFirst := <-first
+	if gotFirst.err != nil {
+		t.Fatalf("first send: %v", gotFirst.err)
+	}
+	if gotFirst.result.EventID != "$once" || gotFirst.result.Deduplicated {
+		t.Fatalf("first send = %+v, want the new event $once with deduplicated false", gotFirst.result)
+	}
+
+	gotSecond := <-second
+	if gotSecond.err != nil {
+		t.Fatalf("retry: %v", gotSecond.err)
+	}
+	if gotSecond.result.EventID != "$once" || !gotSecond.result.Deduplicated {
+		t.Fatalf("retry = %+v, want $once replayed with deduplicated true", gotSecond.result)
+	}
+
+	// A later retry replays the same event too: one send, two identical replays.
+	third, err := send()
+	if err != nil {
+		t.Fatalf("third call: %v", err)
+	}
+	if third.EventID != "$once" || !third.Deduplicated {
+		t.Fatalf("third call = %+v, want $once replayed", third)
+	}
+
+	if _, texts, _ := svc.sends(); len(texts) != 1 {
+		t.Fatalf("matrix saw %d sends, want exactly 1 for one key across the ttl boundary", len(texts))
 	}
 }

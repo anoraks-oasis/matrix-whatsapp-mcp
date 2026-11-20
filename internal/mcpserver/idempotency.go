@@ -76,13 +76,19 @@ func newIdempotencyCache() *idempotencyCache {
 // claim reserves key for one send of roomID+text. An identical send recorded
 // within the TTL is returned as a replay; an identical send still in flight is
 // waited for (so two concurrent retries cannot both reach the homeserver) and
-// then replayed. A key already used for different content is
+// then replayed. Only a settled entry expires: an in-flight send stays
+// claimable for as long as it takes, so a hung connection cannot turn a retry
+// into a second message. A key already used for different content is
 // errIdempotencyConflict rather than a second send.
 func (c *idempotencyCache) claim(ctx context.Context, key, roomID, text string) (*sendClaim, error) {
 	for {
 		c.mu.Lock()
 		entry, ok := c.entries[key]
-		if ok && c.expired(entry) {
+		if ok && c.expired(entry) && entry.settled {
+			// Only a settled entry may expire. An entry whose send is still
+			// in flight is kept, because the caller waiting on it must replay
+			// that send's event: dropping it here would let a retry reserve
+			// the key a second time and post the message twice.
 			delete(c.entries, key)
 			ok = false
 		}

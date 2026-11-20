@@ -80,12 +80,18 @@ func New(svc matrix.MatrixService, prober RoomProber, recent TriggerReader, allo
 // NewWithAllowlist is New against a live allow-list source, so a room added by
 // `matrix-whatsapp-mcp rooms allow` becomes sendable without a restart.
 func NewWithAllowlist(svc matrix.MatrixService, prober RoomProber, recent TriggerReader, allow allowlist.List) *mcp.Server {
+	return newServer(svc, prober, recent, allow, newIdempotencyCache())
+}
+
+// newServer wires the server around an explicit send cache, so a test can drive
+// idempotency expiry with an injected clock instead of waiting ten minutes.
+func newServer(svc matrix.MatrixService, prober RoomProber, recent TriggerReader, allow allowlist.List, sends *idempotencyCache) *mcp.Server {
 	s := &Server{
 		matrix: svc,
 		prober: prober,
 		recent: recent,
 		gate:   newSendGateWith(allow, sendInterval),
-		sends:  newIdempotencyCache(),
+		sends:  sends,
 	}
 
 	mcpServer := mcp.NewServer(&mcp.Implementation{Name: Name, Version: Version}, &mcp.ServerOptions{

@@ -127,8 +127,58 @@ func TestIdempotencyCacheWaitsForInFlightSend(t *testing.T) {
 	}
 }
 
-// TestIdempotencyCacheBounds verifies the size cap evicts the oldest recorded
-// send instead of growing without limit, and that an evicted key sends again.
+// TestIdempotencyCacheInFlightEntrySurvivesTTL is the expiry twin of
+// TestIdempotencyCacheEvictionSkipsInFlightEntries: a send can sit in flight
+// past the ten-minute TTL on a hung connection, and the retry that arrives
+// during that window must wait for it and replay its event instead of claiming
+// the key and posting the message a second time.
+func TestIdempotencyCacheInFlightEntrySurvivesTTL(t *testing.T) {
+	cache, advance := testCache(10*time.Minute, 8)
+	inFlight := mustClaim(t, cache, "k", "!r:test", "hello")
+
+	// The send is still in flight when its entry would otherwise expire.
+	advance(10*time.Minute + time.Second)
+
+	type result struct {
+		claim *sendClaim
+		err   error
+	}
+	waited := make(chan result, 1)
+	go func() {
+		claim, err := cache.claim(context.Background(), "k", "!r:test", "hello")
+		waited <- result{claim, err}
+	}()
+
+	select {
+	case got := <-waited:
+		t.Fatalf("the second claim returned %+v while the first send was still in flight, want it to wait", got.claim)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	cache.settle(inFlight, "$e1")
+
+	select {
+	case got := <-waited:
+		if got.err != nil {
+			t.Fatalf("the waiting claim errored: %v", got.err)
+		}
+		if !got.claim.replayed || got.claim.eventID != "$e1" {
+			t.Fatalf("waiting claim = %+v, want a replay of $e1", got.claim)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the waiting claim never returned after the send settled")
+	}
+
+	// The retry that waited and the one after it both replay the single send.
+	replay, err := cache.claim(context.Background(), "k", "!r:test", "hello")
+	if err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if !replay.replayed || replay.eventID != "$e1" {
+		t.Fatalf("third claim = %+v, want a replay of $e1", replay)
+	}
+}
+
 func TestIdempotencyCacheBounds(t *testing.T) {
 	cache, advance := testCache(10*time.Minute, 2)
 
