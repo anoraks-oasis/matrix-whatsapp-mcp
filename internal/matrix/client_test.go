@@ -880,20 +880,31 @@ func TestRelatesToEventID(t *testing.T) {
 	}
 }
 
-// inviteSyncBody is the first /sync response for the auto-join tests: one
-// invitation from sender, carried by the invite state exactly as a real
-// homeserver sends it.
-func inviteSyncBody(sender string) string {
-	return `{"next_batch":"s1","rooms":{"invite":{"!invited:test":{"invite_state":{"events":[` +
+// inviteSyncBody is one /sync response for the auto-join tests: one invitation
+// from sender, carried by the invite state exactly as a real homeserver sends
+// it. batch is the response's next_batch, so consecutive responses differ the
+// way a real server's do.
+func inviteSyncBody(sender, batch string) string {
+	return `{"next_batch":"` + batch + `","rooms":{"invite":{"!invited:test":{"invite_state":{"events":[` +
 		`{"type":"m.room.member","state_key":"@bot:test","sender":"` + sender + `","content":{"membership":"invite"}},` +
 		`{"type":"m.room.name","state_key":"","sender":"` + sender + `","content":{"name":"Family"}}]}}}}}`
 }
 
-// inviteServer is a fake homeserver that sends one invitation in the /sync
-// response numbered inviteOn and records every join request.
+// inviteServer is a fake homeserver that sends the same invitation in two
+// consecutive /sync responses, the way a server repeats a pending invite while
+// the join is in flight, and records every join request.
+//
+// A join request blocks in the handler until joinGate is closed or the request
+// is cancelled. That is what makes the two auto-join properties testable: a
+// join still in flight when the next response repeats the invitation is the
+// only way to exercise the in-flight dedupe, and a join that blocks proves the
+// sync loop kept going without it.
 type inviteServer struct {
-	sender    string
-	inviteOn  int64
+	sender   string
+	inviteOn int64
+	// joinGate releases held joins and is opened by the test's cleanup.
+	joinGate chan struct{}
+
 	syncCount atomic.Int64
 	joinCount atomic.Int64
 	joinPath  atomic.Value
@@ -901,6 +912,16 @@ type inviteServer struct {
 
 func (s *inviteServer) start(t *testing.T) *httptest.Server {
 	t.Helper()
+	if s.joinGate == nil {
+		s.joinGate = make(chan struct{})
+	}
+	t.Cleanup(func() {
+		select {
+		case <-s.joinGate:
+		default:
+			close(s.joinGate)
+		}
+	})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.URL.Path == "/_matrix/client/v3/account/whoami":
@@ -912,13 +933,21 @@ func (s *inviteServer) start(t *testing.T) *httptest.Server {
 		case strings.HasPrefix(r.URL.Path, "/_matrix/client/v3/rooms/") && strings.HasSuffix(r.URL.Path, "/join"):
 			s.joinCount.Add(1)
 			s.joinPath.Store(r.URL.Path)
+			// Consume the body before blocking: until it is read, net/http will
+			// not start the background read that notices the client hanging up,
+			// so a cancelled join would leave this handler stuck.
+			_, _ = io.Copy(io.Discard, r.Body)
+			select {
+			case <-s.joinGate:
+			case <-r.Context().Done():
+			}
 			io.WriteString(w, `{"room_id":"!invited:test"}`)
 		case r.URL.Path == "/_matrix/client/v3/sync":
 			n := s.syncCount.Add(1)
-			switch n {
-			case s.inviteOn:
-				io.WriteString(w, inviteSyncBody(s.sender))
-			case s.inviteOn - 1:
+			switch {
+			case n == s.inviteOn || n == s.inviteOn+1:
+				io.WriteString(w, inviteSyncBody(s.sender, "s"+itoa(n)))
+			case n < s.inviteOn:
 				io.WriteString(w, `{"next_batch":"s0"}`)
 			default:
 				// Hold the long-poll open until the test cancels the run.
@@ -971,6 +1000,12 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 // the invitation arrives in the first sync response, which DontProcessOldEvents
 // drops for event handlers, so joining here means an invite that landed while
 // the bot was down is not lost.
+//
+// The fake repeats the invitation in the next response and holds the join open,
+// so the second invitation arrives while the first join is still in flight.
+// Both properties MATRIX_AUTO_JOIN_INVITES exists for are then observable: only
+// one join is issued for the repeated invitation, and the sync loop keeps
+// polling while the join is stalled.
 func TestAutoJoinAcceptsInviteFromAllowlistedInviter(t *testing.T) {
 	fake := &inviteServer{sender: "@alice:test", inviteOn: 1}
 	srv := fake.start(t)
@@ -989,9 +1024,20 @@ func TestAutoJoinAcceptsInviteFromAllowlistedInviter(t *testing.T) {
 	if !strings.Contains(fake.joinPath.Load().(string), "!invited:test") {
 		t.Fatalf("join path = %q, want it to target !invited:test", fake.joinPath.Load())
 	}
-	waitFor(t, "the first sync to be answered", func() bool { return fake.syncCount.Load() >= 2 })
+	// The join is held open in the fake. Reaching the third sync request means
+	// the loop processed the repeated invitation and polled again while that
+	// join was still blocked, which a join made on the sync goroutine could
+	// not do.
+	waitFor(t, "the sync loop to poll again while the join is held open", func() bool { return fake.syncCount.Load() >= 3 })
 	if n := fake.joinCount.Load(); n != 1 {
-		t.Fatalf("issued %d join requests, want exactly 1 (repeated invitations deduplicated)", n)
+		t.Fatalf("issued %d join requests for one repeated invitation, want exactly 1", n)
+	}
+
+	// Letting the join finish must not release a second one either.
+	close(fake.joinGate)
+	time.Sleep(100 * time.Millisecond)
+	if n := fake.joinCount.Load(); n != 1 {
+		t.Fatalf("issued %d join requests after the join completed, want exactly 1", n)
 	}
 }
 
@@ -1072,8 +1118,63 @@ func TestAutoJoinAcceptsInviteFromIncrementalSync(t *testing.T) {
 	defer stop()
 
 	waitFor(t, "the join request after an incremental invite", func() bool { return fake.joinCount.Load() > 0 })
-	if n := fake.syncCount.Load(); n < 2 {
-		t.Fatalf("joined after %d sync responses, want the invitation from the second", n)
+	// The invitation repeats in the response after the one that carried it and
+	// the join is held open, so a second join would show up here.
+	waitFor(t, "the repeated invitation to be processed", func() bool { return fake.syncCount.Load() >= 4 })
+	if n := fake.joinCount.Load(); n != 1 {
+		t.Fatalf("issued %d join requests for the incremental invitation, want exactly 1", n)
+	}
+}
+
+// TestAutoJoinHeldOpenJoinKeepsSyncingAndCloses is the non-blocking half of the
+// auto-join contract: a /join the homeserver never answers must not stall the
+// sync loop, and Close must still return while the join is in flight.
+func TestAutoJoinHeldOpenJoinKeepsSyncingAndCloses(t *testing.T) {
+	fake := &inviteServer{sender: "@alice:test", inviteOn: 1}
+	srv := fake.start(t)
+
+	cfg := testConfig(srv.URL)
+	cfg.AutoJoinInvites = true
+	c, err := New(cfg, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	syncDone := make(chan error, 1)
+	go func() { syncDone <- c.Sync(ctx) }()
+	defer cancel()
+
+	waitFor(t, "the join request", func() bool { return fake.joinCount.Load() > 0 })
+	// The join is blocked in the fake: a join made on the sync goroutine would
+	// stop here, so a second and third sync response can only happen when the
+	// join runs off it.
+	waitFor(t, "the sync loop to keep polling while the join is held open", func() bool { return fake.syncCount.Load() >= 3 })
+
+	closed := make(chan error, 1)
+	go func() { closed <- c.Close() }()
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return while a join request was in flight")
+	}
+
+	// Close cancels the join; the sync loop's own exit is the caller's context,
+	// exactly as in the shipped binary's shutdown order.
+	cancel()
+	select {
+	case err := <-syncDone:
+		if err != nil {
+			t.Fatalf("Sync returned %v, want nil after cancellation", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Sync did not return after its context was cancelled")
+	}
+	if n := fake.joinCount.Load(); n != 1 {
+		t.Fatalf("issued %d join requests, want exactly 1", n)
 	}
 }
 
