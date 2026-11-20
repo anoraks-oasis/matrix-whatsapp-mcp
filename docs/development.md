@@ -92,15 +92,19 @@ On a machine whose Go 1.26 toolchain was downloaded by `GOTOOLCHAIN`, this can e
 `1` with `go: no such tool "covdata"` for the packages that have **no test files**
 (`cmd/server`, `internal/logger`). The downloaded toolchain is missing
 `pkg/tool/<goos>_<goarch>/covdata`, so coverage merging for a package without tests
-fails. Running coverage over the packages that have tests works normally:
+fails.
+
+So `./internal/...` alone is not enough: it includes `internal/logger`. Ask for the
+packages that have tests directly:
 
 ```sh
-go test -tags goolm -cover ./internal/...
+go test -tags goolm -cover ./internal/{allowlist,cli,config,matrix,mcpserver,trigger}
 ```
 
-Nothing in this repository causes it and no repository change fixes it; a locally
-installed Go toolchain of the same version does not have the problem. Treat it as an
-environment quirk when you reproduce coverage numbers.
+That exits `0` and prints a number per package. Nothing in this repository causes the
+`covdata` failure and no repository change fixes it; a locally installed Go toolchain
+of the same version does not have the problem. Treat it as an environment quirk when
+you reproduce coverage numbers.
 
 ## Continuous integration
 
