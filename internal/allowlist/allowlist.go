@@ -94,8 +94,10 @@ func WithMinInterval(d time.Duration) Option {
 }
 
 // New builds a Store over the given baseline (ALLOWED_SEND_ROOMS) and file. An
-// empty path or a logger of nil disables the file, leaving the baseline alone.
-// The file is not read until the first query, so construction cannot fail.
+// empty path disables the file, leaving the baseline alone; a logger of nil
+// only silences the diagnostics, so a nil-logger Store still reads the file,
+// still warns nobody, and never panics on a malformed line. The file is not
+// read until the first query, so construction cannot fail.
 func New(baseline []string, path string, logger *log.Logger, opts ...Option) *Store {
 	s := &Store{
 		baseline:    append([]string(nil), baseline...),
@@ -191,8 +193,12 @@ func (s *Store) refresh(force bool) {
 		return
 	}
 	rooms, warnings := parse(data)
-	for _, warning := range warnings {
-		s.log.Printf("allowlist file %s: %s", s.path, warning)
+	if s.log != nil {
+		// A nil logger means no diagnostics at all, not a disabled file: the
+		// parse warnings are the only thing it silences.
+		for _, warning := range warnings {
+			s.log.Printf("allowlist file %s: %s", s.path, warning)
+		}
 	}
 	s.lastExists = true
 	s.lastContent = data

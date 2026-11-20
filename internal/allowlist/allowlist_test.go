@@ -414,3 +414,43 @@ func equalStrings(got, want []string) bool {
 	}
 	return true
 }
+
+// TestStoreNilLoggerStillReadsTheFile pins the constructor's contract: a nil
+// logger silences the diagnostics and disables nothing else. The file is still
+// read and unioned with the baseline.
+func TestStoreNilLoggerStillReadsTheFile(t *testing.T) {
+	dir := t.TempDir()
+	path := writeFile(t, dir, roomA+"\n")
+
+	store := New([]string{roomB}, path, nil, WithMinInterval(0))
+	if got := store.Rooms(); !equalStrings(got, []string{roomA, roomB}) {
+		t.Fatalf("Rooms() with a nil logger = %v, want the baseline and the file", got)
+	}
+	if !store.Allowed(roomA) || !store.Allowed(roomB) {
+		t.Fatal("a nil logger disabled the file")
+	}
+	if store.Path() != path {
+		t.Fatalf("Path() = %q, want %q", store.Path(), path)
+	}
+}
+
+// TestStoreNilLoggerDoesNotPanicOnMalformedLine is R3's regression: the parse
+// warning loop dereferenced a nil logger, so one hand-edited bad line in the
+// file crashed a nil-logger Store instead of being silently dropped.
+func TestStoreNilLoggerDoesNotPanicOnMalformedLine(t *testing.T) {
+	dir := t.TempDir()
+	path := writeFile(t, dir, "not-a-room\n"+roomA+"\n!\n")
+
+	store := New(nil, path, nil, WithMinInterval(0))
+	if got := store.Rooms(); !equalStrings(got, []string{roomA}) {
+		t.Fatalf("Rooms() = %v, want the one valid room with the malformed lines dropped", got)
+	}
+
+	// A rewritten file warns again, still without a logger.
+	if err := os.WriteFile(path, []byte(roomB+"\n"+"also-not-a-room\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !store.Allowed(roomB) {
+		t.Fatal("a nil-logger Store did not pick up a rewritten file")
+	}
+}
