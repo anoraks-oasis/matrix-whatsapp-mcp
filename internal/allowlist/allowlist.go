@@ -153,12 +153,10 @@ func (s *Store) Entries() []Entry {
 	return entries
 }
 
-// Refresh re-reads the file if it changed and at least minInterval has passed
-// since the last check. Queries call it for you; it is exported so a caller can
-// force a load after writing the file itself.
-func (s *Store) Refresh() { s.refresh(false) }
-
-// Reload re-reads the file unconditionally, ignoring the throttle.
+// Reload re-reads the file unconditionally, ignoring the throttle. Nothing in
+// cmd/ or on the server path calls it: every query refreshes itself, and the
+// running server sees a rewrite within the throttle anyway. It stays for tests
+// that have to force a re-read without moving the clock.
 func (s *Store) Reload() { s.refresh(true) }
 
 func (s *Store) refresh(force bool) {
