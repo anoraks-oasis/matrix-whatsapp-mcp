@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // Transport selects how the MCP server is exposed.
@@ -23,6 +24,9 @@ const (
 const (
 	defaultHTTPAddr     = ":8080"
 	defaultCryptoDBPath = "matrix-crypto.db"
+
+	// maxRoomIDLen is the Matrix spec's 255-byte cap on room IDs.
+	maxRoomIDLen = 255
 )
 
 var (
@@ -75,6 +79,26 @@ func (c *Config) SendAllowed(roomID string) bool {
 		}
 	}
 	return false
+}
+
+// ValidRoomID reports whether roomID is a well-formed Matrix room ID: a "!"
+// sigil, at most 255 bytes, and no whitespace, control characters, or "/",
+// "?", "#". A ":server" part is deliberately not required, because bridges
+// hand out room IDs without one.
+func ValidRoomID(roomID string) bool {
+	if len(roomID) < 2 || len(roomID) > maxRoomIDLen || roomID[0] != '!' {
+		return false
+	}
+	for _, r := range roomID {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return false
+		}
+		switch r {
+		case '/', '?', '#':
+			return false
+		}
+	}
+	return true
 }
 
 // String implements fmt.Stringer with secrets redacted.
@@ -167,8 +191,8 @@ func LoadFrom(getenv func(string) string) (*Config, error) {
 		if r == "" {
 			continue
 		}
-		if !strings.HasPrefix(r, "!") || !strings.Contains(r, ":") {
-			fail("ALLOWED_SEND_ROOMS", ErrInvalid, "entries must be room IDs like !abc:server")
+		if !ValidRoomID(r) {
+			fail("ALLOWED_SEND_ROOMS", ErrInvalid, "entries must be room IDs like !abcdef:example.com")
 			break
 		}
 		cfg.AllowedSendRooms = append(cfg.AllowedSendRooms, r)

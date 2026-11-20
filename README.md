@@ -34,7 +34,7 @@ per variable, with an example value:
 | `MATRIX_CRYPTO_DB_PATH` | no | `matrix-crypto.db` | `matrix-crypto.db` | SQLite crypto store path, used only when E2EE is on. |
 | `MATRIX_PICKLE_KEY` | no | — | `change-me-32-byte-random-string` | Crypto pickle key; required when E2EE is on. Secret. |
 | `TRIGGER_WEBHOOK_URL` | no | — | `https://example.com/hooks/wa` | Optional URL to POST incoming-message triggers (JSON, 5s timeout, 1 retry). |
-| `ALLOWED_SEND_ROOMS` | no | — (empty) | `!room1:example.com,!room2:example.com` | Comma-separated room IDs allowed to receive outbound messages. Empty = read-only (sending fails closed). |
+| `ALLOWED_SEND_ROOMS` | no | — (empty) | `!room1:example.com,!UBRW6WycBKpUJu3m4HP0RCMsGnUp_EwSZa2RLXHe34Y` | Comma-separated room IDs allowed to receive outbound messages; a `:server` suffix is optional. Empty = read-only (sending fails closed). |
 | `MCP_TRANSPORT` | no | `stdio` | `stdio` or `http` | How the MCP server is exposed. |
 | `HTTP_ADDR` | no | `:8080` | `127.0.0.1:8080` | Listen address when `MCP_TRANSPORT=http`. |
 
@@ -155,7 +155,9 @@ It never prints the access token.
   Verify the account is a member of the bridged rooms and that `MATRIX_USER_ID`
   matches the token's user.
 - **Sending is rejected** — sending fails closed. Add the room ID to
-  `ALLOWED_SEND_ROOMS`; an empty value means read-only mode.
+  `ALLOWED_SEND_ROOMS`; an empty value means read-only mode. Room IDs the
+  bridge lists without a `:server` suffix are valid and can be allow-listed
+  as-is.
 
 ## Architecture
 
@@ -191,11 +193,21 @@ type Config struct {
 
 func Load() (*Config, error)
 
+// ValidRoomID is the single source of truth for room ID shape: a leading "!",
+// at most 255 bytes, and no whitespace, control characters, "/", "?", or "#".
+// A ":server" part is *not* required — the WhatsApp bridge hands out room IDs
+// without one.
+func ValidRoomID(roomID string) bool
+
 func (c *Config) ReadOnly() bool
 func (c *Config) SendAllowed(roomID string) bool
 func (c *Config) String() string // redacts secrets
 func (c *Config) GoString() string
 ```
+
+`ValidRoomID` is what both `Load()` (for `ALLOWED_SEND_ROOMS`) and
+`matrix.Client` (for `Messages` and `SendText`) use, so the allow-list and the
+client can never disagree about which room IDs are acceptable.
 
 `Load()` validates every variable and returns a joined error of
 `*config.VarError` values. Error messages name the offending variable and

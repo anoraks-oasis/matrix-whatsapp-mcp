@@ -349,3 +349,74 @@ func TestCloseJoinsBackgroundWork(t *testing.T) {
 		t.Fatal("Close blocked while the background goroutine was mid-request; goroutine leaked")
 	}
 }
+
+// domainlessRoomID has the shape the live WhatsApp bridge actually hands out:
+// no ":server" part. Requiring one rejected every real room.
+const domainlessRoomID = "!UBRW6WycBKpUJu3m4HP0RCMsGnUp_EwSZa2RLXHe34Y"
+
+func TestRoomIDValidation(t *testing.T) {
+	var mu sync.Mutex
+	var sentPaths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.Contains(r.URL.Path, "/state/m.room.encryption"):
+			w.WriteHeader(http.StatusNotFound)
+			io.WriteString(w, `{"errcode":"M_NOT_FOUND","error":"Not found"}`)
+		case strings.Contains(r.URL.Path, "/messages"):
+			io.WriteString(w, `{"chunk":[]}`)
+		case strings.Contains(r.URL.Path, "/send/m.room.message/"):
+			mu.Lock()
+			sentPaths = append(sentPaths, r.URL.Path)
+			mu.Unlock()
+			io.WriteString(w, `{"event_id":"$send1"}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c, err := New(testConfig(srv.URL, domainlessRoomID), testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := c.Messages(context.Background(), domainlessRoomID, 10); err != nil {
+		t.Fatalf("Messages(%q) = %v, want success", domainlessRoomID, err)
+	}
+	if _, err := c.SendText(context.Background(), domainlessRoomID, "hi"); err != nil {
+		t.Fatalf("SendText(%q) = %v, want success", domainlessRoomID, err)
+	}
+
+	// The 255-byte cap is inclusive.
+	boundary := "!" + strings.Repeat("x", 254)
+	if _, err := c.Messages(context.Background(), boundary, 10); err != nil {
+		t.Fatalf("Messages(%d-byte room ID) = %v, want success", len(boundary), err)
+	}
+
+	rejected := []string{
+		"",
+		"not-a-room",
+		"!a/b",
+		"!a b",
+		"!a\tb",
+		"!a?b",
+		"!a#b",
+		"!" + strings.Repeat("x", 255),
+	}
+	for _, roomID := range rejected {
+		if _, err := c.Messages(context.Background(), roomID, 10); !errors.Is(err, ErrInvalidRoomID) {
+			t.Errorf("Messages(%q) = %v, want ErrInvalidRoomID", roomID, err)
+		}
+		if _, err := c.SendText(context.Background(), roomID, "hi"); !errors.Is(err, ErrInvalidRoomID) {
+			t.Errorf("SendText(%q) = %v, want ErrInvalidRoomID", roomID, err)
+		}
+	}
+
+	mu.Lock()
+	paths := append([]string(nil), sentPaths...)
+	mu.Unlock()
+	want := "/rooms/" + domainlessRoomID + "/send/m.room.message/"
+	if len(paths) != 1 || !strings.Contains(paths[0], want) {
+		t.Fatalf("send paths = %v, want exactly one send to %s", paths, want)
+	}
+}

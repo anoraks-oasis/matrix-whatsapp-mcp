@@ -66,7 +66,7 @@ var (
 	ErrSendNotAllowed = errors.New("matrix: sending to this room is not allowed")
 	// ErrRoomEncrypted is returned when a room is encrypted but E2EE is disabled.
 	ErrRoomEncrypted = errors.New("matrix: room is encrypted and MATRIX_E2EE_ENABLED is false")
-	// ErrInvalidRoomID is returned for room IDs that do not look like !id:server.
+	// ErrInvalidRoomID is returned for room IDs rejected by config.ValidRoomID.
 	ErrInvalidRoomID = errors.New("matrix: invalid room ID")
 	// ErrEmptyMessage is returned when the text to send is empty.
 	ErrEmptyMessage = errors.New("matrix: message text is empty")
@@ -301,7 +301,7 @@ func (c *Client) JoinedRooms(ctx context.Context) ([]Room, error) {
 
 // Messages implements MatrixService. A limit outside 1..100 is clamped.
 func (c *Client) Messages(ctx context.Context, roomID string, limit int) ([]Message, error) {
-	if !validRoomID(roomID) {
+	if !config.ValidRoomID(roomID) {
 		return nil, ErrInvalidRoomID
 	}
 	switch {
@@ -385,7 +385,7 @@ func (c *Client) decrypt(ctx context.Context, evt *event.Event) *event.Event {
 
 // SendText implements MatrixService.
 func (c *Client) SendText(ctx context.Context, roomID, text string) (string, error) {
-	if !validRoomID(roomID) {
+	if !config.ValidRoomID(roomID) {
 		return "", ErrInvalidRoomID
 	}
 	if !c.cfg.SendAllowed(roomID) {
@@ -570,8 +570,4 @@ func (c *Client) Close() error {
 		}
 	})
 	return c.closeErr
-}
-
-func validRoomID(roomID string) bool {
-	return strings.HasPrefix(roomID, "!") && strings.Contains(roomID, ":")
 }
