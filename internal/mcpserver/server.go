@@ -73,9 +73,13 @@ type Server struct {
 	recent TriggerReader
 	gate   *sendGate
 	sends  *idempotencyCache
+	// inlineBudget is the largest base64 payload get_media puts in a content
+	// block. It is a field so a test can shrink it instead of building a
+	// megabyte image.
+	inlineBudget int
 }
 
-// New builds the MCP server with its seven tools wired to the given Matrix
+// New builds the MCP server with its nine tools wired to the given Matrix
 // service, room prober and trigger reader. allowed is a fixed send allow-list;
 // an empty list keeps the server read-only (every send is rejected). Use
 // NewWithAllowlist for the live allow-list the running server reads.
@@ -92,12 +96,20 @@ func NewWithAllowlist(svc matrix.MatrixService, prober RoomProber, recent Trigge
 // newServer wires the server around an explicit send cache, so a test can drive
 // idempotency expiry with an injected clock instead of waiting ten minutes.
 func newServer(svc matrix.MatrixService, prober RoomProber, recent TriggerReader, allow allowlist.List, sends *idempotencyCache) *mcp.Server {
+	return newServerWithBudget(svc, prober, recent, allow, sends, defaultInlineMediaBudget)
+}
+
+// newServerWithBudget is newServer with get_media's inline budget overridden, so
+// a test can exercise the over-budget path without generating a megabyte
+// fixture. It is a test seam, like newServer's explicit cache.
+func newServerWithBudget(svc matrix.MatrixService, prober RoomProber, recent TriggerReader, allow allowlist.List, sends *idempotencyCache, inlineBudget int) *mcp.Server {
 	s := &Server{
-		matrix: svc,
-		prober: prober,
-		recent: recent,
-		gate:   newSendGateWith(allow, sendInterval),
-		sends:  sends,
+		matrix:       svc,
+		prober:       prober,
+		recent:       recent,
+		gate:         newSendGateWith(allow, sendInterval),
+		sends:        sends,
+		inlineBudget: inlineBudget,
 	}
 
 	mcpServer := mcp.NewServer(&mcp.Implementation{Name: Name, Version: Version}, &mcp.ServerOptions{
@@ -154,6 +166,18 @@ func newServer(svc matrix.MatrixService, prober RoomProber, recent TriggerReader
 	}, s.handleListParticipants)
 
 	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name: "get_media",
+		Description: fmt.Sprintf("Fetch one message's attachment and return it inline. The result is a text block with the attachment's metadata as JSON "+
+			"(mimetype, filename, size, actual dimensions, whether it was downscaled, and the mxc URI) plus, when the payload qualifies, a second content block holding it: "+
+			"an image block for an image, an audio block for audio. An image is downscaled so its long edge is at most max_dimension (default %d, clamped to %d..%d) and "+
+			"re-encoded until the base64 payload fits about %.1f MiB; audio over that budget, and every other type such as video or a document, returns metadata and text only "+
+			"with reason saying why. Nothing is cached and nothing is written to disk, and a download larger than %d MiB is refused rather than truncated. "+
+			"Encrypted media is decrypted when MATRIX_E2EE_ENABLED is on and refused with a clear error when it is off.",
+			defaultMediaDimension, minMediaDimension, maxMediaDimension, float64(defaultInlineMediaBudget)/(1<<20), matrix.MaxMediaDownloadBytes>>20),
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+	}, s.handleGetMedia)
+
+	mcp.AddTool(mcpServer, &mcp.Tool{
 		Name: "get_recent_triggers",
 		Description: fmt.Sprintf("Read the incoming-message triggers this server has seen, newest first. It is an in-memory, process-local ring buffer: "+
 			"it holds the newest %d triggers and is empty again after a restart, so it is a recent-activity view and not a transcript. "+
@@ -176,6 +200,21 @@ func newServer(svc matrix.MatrixService, prober RoomProber, recent TriggerReader
 		},
 	}, s.handleSendMessage)
 
+	mcp.AddTool(mcpServer, &mcp.Tool{
+		Name: "send_media",
+		Description: fmt.Sprintf("Upload one attachment and send it as a single media message. Pass exactly one of path (an absolute local file) or data_base64 (with mimetype); "+
+			"the message type follows the mimetype: image/* becomes m.image, video/* m.video, audio/* m.audio, anything else m.file. caption is sent as the message body, "+
+			"which WhatsApp shows under the media, and reply_to makes the message a quote. It goes through the same gate as send_message: the room must be allow-listed, "+
+			"at most one message is accepted every %s, a bridge rejection notice fails the call instead of reporting success, and idempotency_key makes a retry safe "+
+			"without uploading or sending twice. The payload is capped at %d MiB, and the bytes are held in memory only.",
+			sendInterval, maxMediaUploadBytes>>20),
+		Annotations: &mcp.ToolAnnotations{
+			DestructiveHint: boolPtr(true),
+			IdempotentHint:  false,
+			ReadOnlyHint:    false,
+		},
+	}, s.handleSendMedia)
+
 	return mcpServer
 }
 
@@ -194,17 +233,24 @@ type readMessagesInput struct {
 }
 
 type messageResult struct {
-	EventID   string   `json:"event_id" jsonschema:"the Matrix event ID"`
-	RoomID    string   `json:"room_id" jsonschema:"the Matrix room ID"`
-	Sender    string   `json:"sender" jsonschema:"the sender Matrix user ID"`
-	Body      string   `json:"body" jsonschema:"the message body; media events with no text body carry a bracketed type marker such as [image] or [file]; a redacted message has an empty body"`
-	MsgType   string   `json:"msgtype" jsonschema:"the message type, for example m.text, m.notice or m.image"`
-	Timestamp int64    `json:"timestamp" jsonschema:"unix milliseconds when the message was sent"`
-	Encrypted bool     `json:"encrypted" jsonschema:"whether the event was encrypted; an undecryptable body is a fixed placeholder"`
-	ReplyTo   string   `json:"reply_to,omitempty" jsonschema:"the event ID this message replies to, present even when that message is outside this page. Carried from both the m.relates_to.m.in_reply_to and the flat m.relates_to.event_id shape"`
-	EditOf    string   `json:"edit_of,omitempty" jsonschema:"the event ID this message replaces (rel_type m.replace). An edit stays in the stream with this field set, so a client can apply it to the original instead of showing a duplicate"`
-	Mentions  []string `json:"mentions,omitempty" jsonschema:"user IDs the message mentions (m.mentions.user_ids); absent when it mentions nobody"`
-	Redacted  bool     `json:"redacted" jsonschema:"true when the room has redacted (deleted) this message; its body is empty and the deleted text is never returned"`
+	EventID    string   `json:"event_id" jsonschema:"the Matrix event ID"`
+	RoomID     string   `json:"room_id" jsonschema:"the Matrix room ID"`
+	Sender     string   `json:"sender" jsonschema:"the sender Matrix user ID"`
+	Body       string   `json:"body" jsonschema:"the message body; media events with no text body carry a bracketed type marker such as [image] or [file]; a redacted message has an empty body"`
+	MsgType    string   `json:"msgtype" jsonschema:"the message type, for example m.text, m.notice or m.image"`
+	Timestamp  int64    `json:"timestamp" jsonschema:"unix milliseconds when the message was sent"`
+	Encrypted  bool     `json:"encrypted" jsonschema:"whether the event was encrypted; an undecryptable body is a fixed placeholder"`
+	ReplyTo    string   `json:"reply_to,omitempty" jsonschema:"the event ID this message replies to, present even when that message is outside this page. Carried from both the m.relates_to.m.in_reply_to and the flat m.relates_to.event_id shape"`
+	EditOf     string   `json:"edit_of,omitempty" jsonschema:"the event ID this message replaces (rel_type m.replace). An edit stays in the stream with this field set, so a client can apply it to the original instead of showing a duplicate"`
+	Mentions   []string `json:"mentions,omitempty" jsonschema:"user IDs the message mentions (m.mentions.user_ids); absent when it mentions nobody"`
+	Redacted   bool     `json:"redacted" jsonschema:"true when the room has redacted (deleted) this message; its body is empty and the deleted text is never returned"`
+	Mimetype   string   `json:"mimetype,omitempty" jsonschema:"the MIME type of the message's attachment, from content.info.mimetype; absent when the message carries no attachment"`
+	Filename   string   `json:"filename,omitempty" jsonschema:"the filename the sender set on the attachment (content.filename); absent when the sender set none. Many clients put the filename in body instead"`
+	SizeBytes  int64    `json:"size_bytes,omitempty" jsonschema:"the attachment's size in bytes as the sender declared it (content.info.size); absent when the message carries no attachment or declares no size"`
+	Width      int      `json:"width,omitempty" jsonschema:"the attachment's width in pixels when the sender reported one, as an image or video; absent otherwise"`
+	Height     int      `json:"height,omitempty" jsonschema:"the attachment's height in pixels when the sender reported one, as an image or video; absent otherwise"`
+	DurationMS int64    `json:"duration_ms,omitempty" jsonschema:"the attachment's duration in milliseconds when the sender reported one, as audio or video; absent otherwise"`
+	MXCURI     string   `json:"mxc_uri,omitempty" jsonschema:"the Matrix content URI of the attachment, mxc://server/media-id, from content.url for plaintext media or content.file.url for encrypted media; absent when the message carries no attachment"`
 }
 
 type readMessagesResult struct {
@@ -530,17 +576,24 @@ func contextLimit(v *int) int {
 // every tool that returns a message returns exactly the same one.
 func toMessageResult(m matrix.Message) messageResult {
 	return messageResult{
-		EventID:   m.EventID,
-		RoomID:    m.RoomID,
-		Sender:    m.Sender,
-		Body:      m.Body,
-		MsgType:   m.MsgType,
-		Timestamp: m.Timestamp,
-		Encrypted: m.Encrypted,
-		ReplyTo:   m.ReplyTo,
-		EditOf:    m.EditOf,
-		Mentions:  m.Mentions,
-		Redacted:  m.Redacted,
+		EventID:    m.EventID,
+		RoomID:     m.RoomID,
+		Sender:     m.Sender,
+		Body:       m.Body,
+		MsgType:    m.MsgType,
+		Timestamp:  m.Timestamp,
+		Encrypted:  m.Encrypted,
+		ReplyTo:    m.ReplyTo,
+		EditOf:     m.EditOf,
+		Mentions:   m.Mentions,
+		Redacted:   m.Redacted,
+		Mimetype:   m.MimeType,
+		Filename:   m.Filename,
+		SizeBytes:  m.SizeBytes,
+		Width:      m.Width,
+		Height:     m.Height,
+		DurationMS: m.DurationMS,
+		MXCURI:     m.MXCURI,
 	}
 }
 
