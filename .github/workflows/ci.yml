@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  # mautrix compiles its C libolm backend unless the pure-Go backend is selected.
+  # Set at the job level so no step can silently miss the tag.
+  GOFLAGS: -tags=goolm
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Confirm gcc (cgo SQLite store)
+        run: gcc --version
+
+      - name: Build
+        run: go build -tags goolm ./...
+
+      - name: Vet
+        run: go vet -tags goolm ./...
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l . | tee /dev/stderr | wc -l)"
+          test "$unformatted" -eq 0
+
+      - name: Test
+        run: go test -race -count=1 -tags goolm ./...
