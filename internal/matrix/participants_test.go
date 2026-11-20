@@ -218,12 +218,17 @@ func TestParticipantsHonoursCancellation(t *testing.T) {
 // had: any localpart containing whatsapp counts, because bridges rename ghosts.
 func TestClassifyBridgeUser(t *testing.T) {
 	cases := map[string]string{
-		"@whatsapp_15551234567:example.com":   BridgeKindContact,
+		"@whatsapp_15551234567:example.com": BridgeKindContact,
+		// Both LID shapes, and the case-insensitivity of the whole rule.
 		"@whatsapp_lid-987654321:example.com": BridgeKindContact,
+		"@whatsapp-lid-987654321:example.com": BridgeKindContact,
+		"@WhatsApp_LID-987654321:example.com": BridgeKindContact,
+		"@whatsapp_lid_987654321:example.com": BridgeKindContact,
 		"@whatsapp_1203630:example.com":       BridgeKindContact,
 		"@whatsappbot:example.com":            BridgeKindBot,
 		"@whatsapp_bot:example.com":           BridgeKindBot,
 		"@whatsappbridgebot:example.com":      BridgeKindBot,
+		"@WhatsAppBot:example.com":            BridgeKindBot,
 		"@somewhatsappname:example.com":       BridgeKindContact,
 		"@alice:example.com":                  "",
 		"@signal_15551234567:example.com":     "",

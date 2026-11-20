@@ -153,11 +153,14 @@ func (c *Client) fillDisplayNames(ctx context.Context, parts []Participant) {
 // classifyBridgeUser is the single bridge-naming heuristic in this package: it
 // is what both IsBridged (through the room's members) and list_participants use,
 // so a room and its members can never disagree about what a WhatsApp ghost is.
-// A localpart starting with whatsapp_ (a phone-number ghost) or whatsapp_lid-
-// (a LID ghost) is a contact ghost, a localpart that starts with whatsapp and
-// ends with bot is the bridge bot, and any other localpart containing whatsapp
-// stays a contact ghost — the looser rule IsBridged has always used, because
-// bridges rename ghosts and the phone number is not always the first segment.
+// A localpart starting with whatsapp_ (a phone-number ghost) or with
+// whatsapp_lid-/whatsapp-lid- (a LID ghost, whichever separator the bridge
+// chose) is a contact ghost, a localpart that starts with whatsapp and ends
+// with bot is the bridge bot, and any other localpart containing whatsapp stays
+// a contact ghost — the looser rule IsBridged has always used, because bridges
+// rename ghosts and the phone number is not always the first segment. The
+// localpart is lowercased first, so every prefix here is matched
+// case-insensitively.
 func classifyBridgeUser(userID string) string {
 	localpart, _, err := id.UserID(userID).Parse()
 	if err != nil {
@@ -168,7 +171,8 @@ func classifyBridgeUser(userID string) string {
 	case strings.HasPrefix(localpart, "whatsapp") && strings.HasSuffix(localpart, "bot"):
 		return BridgeKindBot
 	case strings.HasPrefix(localpart, "whatsapp_"),
-		strings.HasPrefix(localpart, "whatsapp-lid"),
+		strings.HasPrefix(localpart, "whatsapp_lid-"),
+		strings.HasPrefix(localpart, "whatsapp-lid-"),
 		strings.Contains(localpart, "whatsapp"):
 		return BridgeKindContact
 	}

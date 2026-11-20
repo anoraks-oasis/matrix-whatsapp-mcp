@@ -97,7 +97,8 @@ type MatrixService interface {
 }
 
 var (
-	// ErrSendNotAllowed is returned when the room is not in ALLOWED_SEND_ROOMS.
+	// ErrSendNotAllowed is returned when the room is in neither
+	// ALLOWED_SEND_ROOMS nor the allowlist file.
 	ErrSendNotAllowed = errors.New("matrix: sending to this room is not allowed")
 	// ErrRoomEncrypted is returned when a room is encrypted but E2EE is disabled.
 	ErrRoomEncrypted = errors.New("matrix: room is encrypted and MATRIX_E2EE_ENABLED is false")

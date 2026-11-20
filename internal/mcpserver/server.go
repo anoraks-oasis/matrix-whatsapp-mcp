@@ -69,7 +69,7 @@ type Server struct {
 	sends  *idempotencyCache
 }
 
-// New builds the MCP server with its four tools wired to the given Matrix
+// New builds the MCP server with its seven tools wired to the given Matrix
 // service, room prober and trigger reader. allowed is a fixed send allow-list;
 // an empty list keeps the server read-only (every send is rejected). Use
 // NewWithAllowlist for the live allow-list the running server reads.
@@ -96,8 +96,9 @@ func newServer(svc matrix.MatrixService, prober RoomProber, recent TriggerReader
 
 	mcpServer := mcp.NewServer(&mcp.Implementation{Name: Name, Version: Version}, &mcp.ServerOptions{
 		Instructions: "Tools for a Matrix homeserver running a mautrix/whatsapp bridge. " +
-			"Sending is fail-closed: only rooms listed in ALLOWED_SEND_ROOMS may receive messages, " +
-			"at most one message every 3 seconds.",
+			"Sending is fail-closed: a room may receive messages only when it is in ALLOWED_SEND_ROOMS or in the allowlist file " +
+			"(the two are unioned, so `matrix-whatsapp-mcp rooms allow` makes a room sendable without a restart). " +
+			"At most one message is accepted every 3 seconds, across all rooms.",
 	})
 
 	mcp.AddTool(mcpServer, &mcp.Tool{
@@ -138,14 +139,18 @@ func newServer(svc matrix.MatrixService, prober RoomProber, recent TriggerReader
 		Name: "list_participants",
 		Description: "List every joined member of a room with the display name the room reports, whether the member belongs to the WhatsApp bridge, and which kind of bridge user it is: " +
 			"whatsapp_contact for a WhatsApp ghost, whatsapp_bot for the bridge bot, and empty for a plain Matrix user. " +
-			"bridged uses the same heuristic as list_rooms: a user ID whose localpart starts with a mautrix bridge prefix such as whatsapp_ or whatsapp_lid-, any other localpart containing whatsapp, " +
+			"bridged uses the same heuristic as list_rooms: a user ID whose localpart starts with a mautrix bridge prefix such as whatsapp_ or whatsapp_lid-/whatsapp-lid-, any other localpart containing whatsapp, " +
 			"or a bridge marker in the member event. The call is bounded by a timeout, and a member whose profile cannot be read is still listed.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, s.handleListParticipants)
 
 	mcp.AddTool(mcpServer, &mcp.Tool{
-		Name:        "get_recent_triggers",
-		Description: "Read recent incoming-message triggers from the dispatcher ring buffer, newest first.",
+		Name: "get_recent_triggers",
+		Description: fmt.Sprintf("Read the incoming-message triggers this server has seen, newest first. It is an in-memory, process-local ring buffer: "+
+			"it holds the newest %d triggers and is empty again after a restart, so it is a recent-activity view and not a transcript. "+
+			"since_timestamp keeps only triggers received strictly after that unix-millisecond time, and limit caps the answer at 1..100 (20 by default); "+
+			"both apply to what the buffer still holds. Each trigger carries its event ID, room and room name, sender, body (media with no text body "+
+			"carries a bracketed marker such as [image]), msgtype and receipt time.", trigger.BufferSize),
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, s.handleRecentTriggers)
 

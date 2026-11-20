@@ -3,12 +3,14 @@ package mcpserver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/matrix"
+	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/trigger"
 )
 
 func TestSearchMessagesTool(t *testing.T) {
@@ -385,4 +387,48 @@ func TestListParticipantsToolErrorAndCancellation(t *testing.T) {
 			t.Fatalf("handler error = %v, want context.Canceled", err)
 		}
 	})
+}
+
+// TestInitializeInstructionsNameBothAllowlistSources is R4's regression: the
+// instructions are the first thing an MCP client reads, and a client told that
+// only ALLOWED_SEND_ROOMS permits sending concludes that a room enrolled with
+// `rooms allow` is unsendable — the workflow this release added.
+func TestInitializeInstructionsNameBothAllowlistSources(t *testing.T) {
+	srv := New(&fakeMatrix{}, &fakeProber{}, &fakeRecent{}, nil)
+	session, cleanup := connect(t, srv)
+	defer cleanup()
+
+	init := session.InitializeResult()
+	if init == nil || init.Instructions == "" {
+		t.Fatal("initialize returned no instructions")
+	}
+	for _, want := range []string{"ALLOWED_SEND_ROOMS", "allowlist file", "3 seconds"} {
+		if !strings.Contains(init.Instructions, want) {
+			t.Fatalf("instructions = %q, want them to mention %q", init.Instructions, want)
+		}
+	}
+	if strings.Contains(init.Instructions, "only rooms listed in ALLOWED_SEND_ROOMS") {
+		t.Fatalf("instructions still say only ALLOWED_SEND_ROOMS permits sending: %q", init.Instructions)
+	}
+}
+
+// TestTriggerDescriptionStatesTheBuffer pins get_recent_triggers' description to
+// the ring buffer it describes: the capacity comes from trigger.BufferSize, and
+// the in-memory, restart-clearing nature of the buffer is what a caller needs
+// to know before treating the list as history.
+func TestTriggerDescriptionStatesTheBuffer(t *testing.T) {
+	srv := New(&fakeMatrix{}, &fakeProber{}, &fakeRecent{}, nil)
+	session, cleanup := connect(t, srv)
+	defer cleanup()
+
+	res, err := session.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("tools/list: %v", err)
+	}
+	desc := toolByName(t, res.Tools, "get_recent_triggers").Description
+	for _, want := range []string{fmt.Sprint(trigger.BufferSize), "in-memory", "restart", "since_timestamp"} {
+		if !strings.Contains(desc, want) {
+			t.Fatalf("get_recent_triggers description = %q, want it to state %q", desc, want)
+		}
+	}
 }
