@@ -62,7 +62,7 @@ type pageSigner struct {
 func newPageSigner() (*pageSigner, error) {
 	key := make([]byte, pageTokenKeyLen)
 	if _, err := rand.Read(key); err != nil {
-		return nil, fmt.Errorf("matrix: generate page token key: %w", err)
+		return nil, fmt.Errorf("could not generate a page token key: %w", err)
 	}
 	return &pageSigner{key: key}, nil
 }
@@ -75,7 +75,7 @@ func (s *pageSigner) sign(roomID, cursor string) (string, error) {
 	}
 	body, err := json.Marshal(pageTokenPayload{Version: pageTokenVersion, RoomID: roomID, Cursor: cursor})
 	if err != nil {
-		return "", fmt.Errorf("matrix: encode page token: %w", err)
+		return "", fmt.Errorf("could not encode the page token: %w", err)
 	}
 	return base64.RawURLEncoding.EncodeToString(body) + "." +
 		base64.RawURLEncoding.EncodeToString(s.mac(body)), nil
@@ -107,7 +107,7 @@ func (s *pageSigner) verify(roomID, token string) (string, error) {
 		return "", invalidPageToken("the token has an unsupported version")
 	}
 	if payload.RoomID != roomID {
-		return "", invalidPageToken("the token was issued for a different room")
+		return "", invalidPageToken("the token was issued for a different chat")
 	}
 	if payload.Cursor == "" {
 		return "", invalidPageToken("the token carries no position")

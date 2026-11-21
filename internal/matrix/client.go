@@ -119,39 +119,45 @@ type MatrixService interface {
 var (
 	// ErrSendNotAllowed is returned when the room is in neither
 	// ALLOWED_SEND_ROOMS nor the allowlist file.
-	ErrSendNotAllowed = errors.New("matrix: sending to this room is not allowed")
+	ErrSendNotAllowed = errors.New("sending to this chat is not allowed")
 	// ErrRoomEncrypted is returned when a room is encrypted but E2EE is disabled.
-	ErrRoomEncrypted = errors.New("matrix: room is encrypted and MATRIX_E2EE_ENABLED is false")
+	ErrRoomEncrypted = errors.New("this chat is encrypted and end-to-end encryption is switched off on the server; set MATRIX_E2EE_ENABLED=true")
 	// ErrInvalidRoomID is returned for room IDs rejected by config.ValidRoomID.
-	ErrInvalidRoomID = errors.New("matrix: invalid room ID")
+	ErrInvalidRoomID = errors.New("invalid chat ID: expected a chat reference such as !abc:server")
 	// ErrInvalidEventID is returned for reply targets that are not well-formed
 	// Matrix event IDs.
-	ErrInvalidEventID = errors.New("matrix: invalid event ID")
+	ErrInvalidEventID = errors.New("invalid message ID: expected a message reference such as $abc123")
 	// ErrEmptyMessage is returned when the text to send is empty.
-	ErrEmptyMessage = errors.New("matrix: message text is empty")
+	ErrEmptyMessage = errors.New("the message text is empty")
 	// ErrAlreadySyncing is returned when Sync is called twice concurrently.
-	ErrAlreadySyncing = errors.New("matrix: sync already running")
+	ErrAlreadySyncing = errors.New("a sync is already running")
 	// ErrUserMismatch is returned when the access token belongs to a different user.
-	ErrUserMismatch = errors.New("matrix: access token does not belong to MATRIX_USER_ID")
+	ErrUserMismatch = errors.New("the access token does not belong to MATRIX_USER_ID")
 	// ErrClosed is returned by operations on a closed client.
-	ErrClosed = errors.New("matrix: client closed")
+	ErrClosed = errors.New("the server connection is closed")
 	// ErrNotBridged is returned when the bridge reported that the message was
 	// not forwarded, even though Matrix accepted the event.
-	ErrNotBridged = errors.New("matrix: bridge did not bridge the message")
+	ErrNotBridged = errors.New("WhatsApp did not deliver the message")
 	// ErrInvalidPageToken is returned when a before token is malformed, was
 	// modified, belongs to another room, or was issued by a previous process.
-	ErrInvalidPageToken = errors.New("matrix: invalid page token")
+	ErrInvalidPageToken = errors.New("invalid page token: it is not one this server issued, or it was edited")
 	// ErrStalePageToken is returned when the homeserver rejects a token this
 	// process issued, for example because the timeline moved past it.
-	ErrStalePageToken = errors.New("matrix: page token is no longer valid")
+	ErrStalePageToken = errors.New("page token is no longer valid: the server rejected it, so call again without before")
 	// ErrEmptyQuery is returned when a search has no search term.
-	ErrEmptyQuery = errors.New("matrix: search query is empty")
+	ErrEmptyQuery = errors.New("search query is empty")
 	// ErrEventNotFound is returned when a well-formed event ID is not in the
 	// room, including when the room itself is unknown.
-	ErrEventNotFound = errors.New("matrix: event not found in room")
+	ErrEventNotFound = errors.New("message not found in this chat")
 	// ErrNotAMessage is returned when an event exists but carries no message to
 	// read the context of, such as a membership or state event.
-	ErrNotAMessage = errors.New("matrix: event is not a message")
+	ErrNotAMessage = errors.New("this message is not a text message")
+	// ErrRoomNotFound is returned when a chat the caller named is not one the
+	// account has joined, or no longer exists.
+	ErrRoomNotFound = errors.New("chat not found")
+	// ErrSearchUnavailable is returned when the server's search index cannot
+	// answer the query.
+	ErrSearchUnavailable = errors.New("search is unavailable on this server")
 )
 
 // BridgeNoticeError reports a message that Matrix accepted but the bridge
@@ -163,7 +169,7 @@ type BridgeNoticeError struct {
 }
 
 func (e *BridgeNoticeError) Error() string {
-	return fmt.Sprintf("%v: event %s: %s", ErrNotBridged, e.EventID, e.Notice)
+	return fmt.Sprintf("%v: %s", ErrNotBridged, e.Notice)
 }
 
 func (e *BridgeNoticeError) Unwrap() error { return ErrNotBridged }
@@ -245,14 +251,14 @@ var _ MatrixService = (*Client)(nil)
 // setup and the sync loop all start in Sync.
 func New(cfg *config.Config, logger *log.Logger) (*Client, error) {
 	if cfg == nil {
-		return nil, errors.New("matrix: nil config")
+		return nil, errors.New("missing configuration")
 	}
 	if logger == nil {
-		return nil, errors.New("matrix: nil logger")
+		return nil, errors.New("missing logger")
 	}
 	cli, err := mautrix.NewClient(cfg.Homeserver, id.UserID(cfg.UserID), cfg.AccessToken)
 	if err != nil {
-		return nil, fmt.Errorf("matrix: create client: %w", err)
+		return nil, fmt.Errorf("could not start the server client: %w", err)
 	}
 	cli.Log = zerolog.New(os.Stderr).Level(zerolog.WarnLevel).With().Timestamp().Logger()
 
@@ -322,7 +328,7 @@ func (c *Client) Allowlist() *allowlist.Store { return c.allow }
 func (c *Client) WhoAmI(ctx context.Context) (userID, deviceID string, err error) {
 	who, err := c.cli.Whoami(ctx)
 	if err != nil {
-		return "", "", fmt.Errorf("matrix: whoami: %w", err)
+		return "", "", c.failedText("could not verify the signed-in account", err)
 	}
 	return who.UserID.String(), who.DeviceID.String(), nil
 }
@@ -441,7 +447,7 @@ func (c *Client) JoinedRooms(ctx context.Context) ([]Room, error) {
 func (c *Client) joinedRoomIDs(ctx context.Context) ([]id.RoomID, error) {
 	resp, err := c.cli.JoinedRooms(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("matrix: list joined rooms: %w", err)
+		return nil, c.failedText("could not list chats", err)
 	}
 	return resp.JoinedRooms, nil
 }
@@ -527,9 +533,12 @@ func (c *Client) Messages(ctx context.Context, roomID string, limit int, before 
 		resp, err := c.cli.Messages(ctx, id.RoomID(roomID), from, "", mautrix.DirectionBackward, nil, want)
 		if err != nil {
 			if from != "" && isStalePageError(err) {
-				return MessagePage{}, fmt.Errorf("%w: the homeserver rejected it; call again without before", ErrStalePageToken)
+				return MessagePage{}, c.failedAs(ErrStalePageToken, err)
 			}
-			return MessagePage{}, fmt.Errorf("matrix: fetch messages: %w", err)
+			if errors.Is(err, mautrix.MNotFound) {
+				return MessagePage{}, c.failedAs(ErrRoomNotFound, err)
+			}
+			return MessagePage{}, c.failedText("could not read chat history", err)
 		}
 		rawBudget -= len(resp.Chunk)
 		for _, evt := range resp.Chunk {
@@ -726,7 +735,10 @@ func (c *Client) SendText(ctx context.Context, roomID, text, replyTo string) (st
 	}
 	resp, err := c.cli.SendMessageEvent(ctx, id.RoomID(roomID), event.EventMessage, content)
 	if err != nil {
-		return "", fmt.Errorf("matrix: send message: %w", err)
+		if errors.Is(err, mautrix.MNotFound) {
+			return "", c.failedAs(ErrRoomNotFound, err)
+		}
+		return "", c.failedText("could not send the message", err)
 	}
 	eventID := resp.EventID.String()
 	// Matrix accepting the event does not mean the bridge forwarded it: a
@@ -858,21 +870,21 @@ func (c *Client) prepareEncryption(ctx context.Context, roomID id.RoomID) (bool,
 		return false, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("matrix: check room encryption: %w", err)
+		return false, c.failedText("could not check whether this chat is encrypted", err)
 	}
 	if c.crypto.Load() == nil || c.cli.StateStore == nil {
 		return false, ErrRoomEncrypted
 	}
 	if err := c.cli.StateStore.SetEncryptionEvent(ctx, roomID, &content); err != nil {
-		return false, fmt.Errorf("matrix: record room encryption: %w", err)
+		return false, c.failedText("could not prepare this chat for an encrypted message", err)
 	}
 	fetched, err := c.cli.StateStore.HasFetchedMembers(ctx, roomID)
 	if err != nil {
-		return false, fmt.Errorf("matrix: check member cache: %w", err)
+		return false, c.failedText("could not read this chat's contacts", err)
 	}
 	if !fetched {
 		if _, err := c.cli.Members(ctx, roomID); err != nil {
-			return false, fmt.Errorf("matrix: fetch room members: %w", err)
+			return false, c.failedText("could not read this chat's contacts", err)
 		}
 	}
 	return true, nil
@@ -1020,7 +1032,7 @@ func (c *Client) init(ctx context.Context) error {
 	if !c.whoamiOK {
 		who, err := c.cli.Whoami(ctx)
 		if err != nil {
-			return fmt.Errorf("matrix: whoami: %w", err)
+			return c.failedText("could not verify the signed-in account", err)
 		}
 		if who.UserID != c.cli.UserID {
 			return ErrUserMismatch
@@ -1032,11 +1044,11 @@ func (c *Client) init(ctx context.Context) error {
 	if c.cfg.E2EEEnabled && !c.cryptoOK {
 		helper, err := cryptohelper.NewCryptoHelper(c.cli, []byte(c.cfg.PickleKey), c.cfg.CryptoDBPath)
 		if err != nil {
-			return fmt.Errorf("matrix: create crypto helper: %w", err)
+			return fmt.Errorf("could not set up end-to-end encryption: %w", err)
 		}
 		if err := helper.Init(ctx); err != nil {
 			_ = helper.Close()
-			return fmt.Errorf("matrix: init crypto helper: %w", err)
+			return fmt.Errorf("could not start end-to-end encryption: %w", err)
 		}
 		c.cli.Crypto = helper
 		c.crypto.Store(helper)

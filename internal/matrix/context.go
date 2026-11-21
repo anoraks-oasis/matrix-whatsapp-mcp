@@ -3,7 +3,6 @@ package matrix
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sort"
 
 	"maunium.net/go/mautrix"
@@ -98,16 +97,16 @@ func (c *Client) endpointContext(ctx context.Context, roomID, eventID string, be
 	resp, err := c.cli.Context(ctx, id.RoomID(roomID), id.EventID(eventID), nil, limit)
 	if err != nil {
 		if errors.Is(err, mautrix.MNotFound) {
-			return ContextOutcome{}, fmt.Errorf("%w: %s is not in room %s", ErrEventNotFound, eventID, roomID)
+			return ContextOutcome{}, c.failedAs(ErrEventNotFound, err)
 		}
-		return ContextOutcome{}, fmt.Errorf("matrix: fetch message context: %w", err)
+		return ContextOutcome{}, c.failedText("could not read the message context", err)
 	}
 	if resp == nil || resp.Event == nil {
-		return ContextOutcome{}, fmt.Errorf("%w: %s is not in room %s", ErrEventNotFound, eventID, roomID)
+		return ContextOutcome{}, ErrEventNotFound
 	}
 	target, ok := c.contextMessage(ctx, roomID, resp.Event)
 	if !ok {
-		return ContextOutcome{}, fmt.Errorf("%w: event %s", ErrNotAMessage, eventID)
+		return ContextOutcome{}, ErrNotAMessage
 	}
 
 	out := ContextOutcome{
@@ -136,13 +135,13 @@ func (c *Client) scanContext(ctx context.Context, roomID, eventID string, before
 	evt, err := c.cli.GetEvent(ctx, id.RoomID(roomID), id.EventID(eventID))
 	if err != nil {
 		if errors.Is(err, mautrix.MNotFound) {
-			return ContextOutcome{}, fmt.Errorf("%w: %s is not in room %s", ErrEventNotFound, eventID, roomID)
+			return ContextOutcome{}, c.failedAs(ErrEventNotFound, err)
 		}
-		return ContextOutcome{}, fmt.Errorf("matrix: fetch event: %w", err)
+		return ContextOutcome{}, c.failedText("could not read the message", err)
 	}
 	target, ok := c.contextMessage(ctx, roomID, evt)
 	if !ok {
-		return ContextOutcome{}, fmt.Errorf("%w: event %s", ErrNotAMessage, eventID)
+		return ContextOutcome{}, ErrNotAMessage
 	}
 
 	window, err := c.scanAround(ctx, roomID, target, before, after)
@@ -194,7 +193,7 @@ func (c *Client) scanAround(ctx context.Context, roomID string, target Message, 
 		want := min(ContextScanPageLimit, budget-raw)
 		resp, err := c.cli.Messages(ctx, id.RoomID(roomID), from, "", mautrix.DirectionBackward, nil, want)
 		if err != nil {
-			return scanWindow{}, fmt.Errorf("matrix: scan room history: %w", err)
+			return scanWindow{}, c.failedText("could not read chat history", err)
 		}
 		raw += len(resp.Chunk)
 		for _, evt := range resp.Chunk {

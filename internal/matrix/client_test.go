@@ -728,8 +728,10 @@ func TestSendTextBridgeNoticeFailsClosed(t *testing.T) {
 	if strings.ContainsAny(noticeErr.Notice, "\n\r\t") || strings.ContainsFunc(noticeErr.Notice, unicode.IsControl) {
 		t.Fatalf("BridgeNoticeError.Notice = %q, want a single line with no control characters", noticeErr.Notice)
 	}
-	if msg := err.Error(); !strings.Contains(msg, "$send1") || !strings.Contains(msg, "not bridged") {
-		t.Fatalf("send error text = %q, want it to name the event and the notice", msg)
+	if msg := err.Error(); !strings.Contains(msg, "WhatsApp did not deliver the message") || !strings.Contains(msg, "not bridged") {
+		t.Fatalf("send error text = %q, want the WhatsApp wording and the notice", msg)
+	} else if strings.Contains(msg, "$send1") {
+		t.Fatalf("send error text = %q, want no message ID in the tool-facing text", msg)
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("SendText took %v, want it to return as soon as the notice appears", elapsed)

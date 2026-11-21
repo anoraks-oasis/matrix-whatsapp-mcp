@@ -176,8 +176,8 @@ func TestMediaUnknownEventIsTyped(t *testing.T) {
 	if !errors.Is(err, ErrEventNotFound) {
 		t.Fatalf("Media(unknown event) = %v, want ErrEventNotFound", err)
 	}
-	if !strings.Contains(err.Error(), "$missing") {
-		t.Fatalf("error = %q, want it to name the event", err)
+	if msg := err.Error(); strings.Contains(msg, "$missing") || !strings.Contains(msg, "message not found in this chat") {
+		t.Fatalf("error = %q, want the friendly text with no message ID", msg)
 	}
 }
 

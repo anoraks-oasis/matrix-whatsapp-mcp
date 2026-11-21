@@ -47,7 +47,7 @@ const (
 
 // ErrInvalidRoomID is returned when a caller asks to write a string that is not
 // a well-formed Matrix room ID.
-var ErrInvalidRoomID = errors.New("allowlist: invalid room ID")
+var ErrInvalidRoomID = errors.New("invalid chat ID: expected a chat reference such as !abc:server")
 
 // List is the read-only view of the effective allowlist. Both the Matrix client
 // and the MCP send gate hold one, so they can never disagree about which rooms

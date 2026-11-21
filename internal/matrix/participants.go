@@ -2,7 +2,7 @@ package matrix
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"sort"
 	"strings"
 	"sync"
@@ -70,7 +70,10 @@ func (c *Client) Participants(ctx context.Context, roomID string) ([]Participant
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("matrix: list room members: %w", err)
+		if errors.Is(err, mautrix.MNotFound) {
+			return nil, c.failedAs(ErrRoomNotFound, err)
+		}
+		return nil, c.failedText("could not list the chat's contacts", err)
 	}
 
 	parts := make([]Participant, 0, len(resp.Chunk))

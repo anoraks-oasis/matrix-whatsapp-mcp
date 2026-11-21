@@ -32,25 +32,25 @@ var (
 	// such as a text message or a state event. It is deliberately distinct from
 	// ErrNotAMessage: a membership event is not a message at all, while a text
 	// message is a message that simply has no media.
-	ErrNotMedia = errors.New("matrix: event carries no media attachment")
+	ErrNotMedia = errors.New("this message has no attachment")
 	// ErrMediaTooLarge is returned when the homeserver reports or serves more
 	// than MaxMediaDownloadBytes.
-	ErrMediaTooLarge = errors.New("matrix: media is larger than the download limit")
+	ErrMediaTooLarge = errors.New("attachment is too large to download")
 	// ErrMediaDownload is returned when the homeserver refuses or fails the
 	// media download, or serves an attachment that cannot be interpreted.
-	ErrMediaDownload = errors.New("matrix: media download failed")
+	ErrMediaDownload = errors.New("could not download the attachment")
 	// ErrEncryptedMediaNoE2EE is returned for encrypted media when E2EE is off:
 	// the bytes would be ciphertext, and returning them would be garbage.
-	ErrEncryptedMediaNoE2EE = errors.New("matrix: media is encrypted and MATRIX_E2EE_ENABLED is false")
+	ErrEncryptedMediaNoE2EE = errors.New("this message is encrypted and end-to-end encryption is switched off on the server; set MATRIX_E2EE_ENABLED=true")
 	// ErrMediaUndecryptable is returned when E2EE is on but the attachment's key
 	// material is missing or does not decrypt its own payload.
-	ErrMediaUndecryptable = errors.New("matrix: encrypted media could not be decrypted")
+	ErrMediaUndecryptable = errors.New("this attachment could not be decrypted")
 	// ErrUnsupportedCodec is returned for an attachment this server cannot
 	// interpret: an encryption algorithm it does not implement, or an image
 	// format the Go standard library cannot decode.
-	ErrUnsupportedCodec = errors.New("matrix: unsupported media codec")
+	ErrUnsupportedCodec = errors.New("unsupported attachment format")
 	// ErrEmptyMedia is returned when a send_media payload has no bytes.
-	ErrEmptyMedia = errors.New("matrix: media payload is empty")
+	ErrEmptyMedia = errors.New("the attachment is empty")
 )
 
 // MediaAttachment is one downloaded attachment: what the message says about it
@@ -138,9 +138,9 @@ func (c *Client) Media(ctx context.Context, roomID, eventID string) (MediaAttach
 	evt, err := c.cli.GetEvent(ctx, id.RoomID(roomID), id.EventID(eventID))
 	if err != nil {
 		if errors.Is(err, mautrix.MNotFound) {
-			return MediaAttachment{}, fmt.Errorf("%w: %s is not in room %s", ErrEventNotFound, eventID, roomID)
+			return MediaAttachment{}, c.failedAs(ErrEventNotFound, err)
 		}
-		return MediaAttachment{}, fmt.Errorf("matrix: fetch event: %w", err)
+		return MediaAttachment{}, c.failedText("could not read the message", err)
 	}
 	if evt.Type == event.EventEncrypted {
 		if !c.cfg.E2EEEnabled || c.crypto.Load() == nil {
@@ -153,17 +153,17 @@ func (c *Client) Media(ctx context.Context, roomID, eventID string) (MediaAttach
 		evt = decrypted
 	}
 	if evt.Type != event.EventMessage {
-		return MediaAttachment{}, fmt.Errorf("%w: %s is a %s event", ErrNotMedia, eventID, evt.Type.Type)
+		return MediaAttachment{}, ErrNotMedia
 	}
 	if evt.Content.Parsed == nil {
 		if err := evt.Content.ParseRaw(evt.Type); err != nil {
-			return MediaAttachment{}, fmt.Errorf("%w: %s could not be parsed", ErrNotMedia, eventID)
+			return MediaAttachment{}, ErrNotMedia
 		}
 	}
 	msg := evt.Content.AsMessage()
 	att, ok := contentAttachment(msg)
 	if !ok {
-		return MediaAttachment{}, fmt.Errorf("%w: %s", ErrNotMedia, eventID)
+		return MediaAttachment{}, ErrNotMedia
 	}
 	if att.Encrypted && (!c.cfg.E2EEEnabled || c.crypto.Load() == nil) {
 		return MediaAttachment{}, ErrEncryptedMediaNoE2EE
@@ -171,7 +171,7 @@ func (c *Client) Media(ctx context.Context, roomID, eventID string) (MediaAttach
 
 	uri, err := id.ParseContentURI(att.MXCURI)
 	if err != nil {
-		return MediaAttachment{}, fmt.Errorf("%w: %s is not a valid mxc URI", ErrMediaDownload, att.MXCURI)
+		return MediaAttachment{}, c.failedAs(ErrMediaDownload, err)
 	}
 	data, contentType, err := c.downloadMedia(ctx, uri)
 	if err != nil {
@@ -181,7 +181,7 @@ func (c *Client) Media(ctx context.Context, roomID, eventID string) (MediaAttach
 		if att.File == nil {
 			return MediaAttachment{}, ErrMediaUndecryptable
 		}
-		data, err = decryptMedia(att.File, data)
+		data, err = c.decryptMedia(att.File, data)
 		if err != nil {
 			return MediaAttachment{}, err
 		}
@@ -207,18 +207,18 @@ func (c *Client) Media(ctx context.Context, roomID, eventID string) (MediaAttach
 func (c *Client) downloadMedia(ctx context.Context, uri id.ContentURI) ([]byte, string, error) {
 	resp, err := c.cli.Download(ctx, uri)
 	if err != nil {
-		return nil, "", fmt.Errorf("%w: %w", ErrMediaDownload, err)
+		return nil, "", c.failedAs(ErrMediaDownload, err)
 	}
 	defer resp.Body.Close()
 	if resp.ContentLength > MaxMediaDownloadBytes {
-		return nil, "", fmt.Errorf("%w: the server reports %d bytes, over the %d-byte limit", ErrMediaTooLarge, resp.ContentLength, MaxMediaDownloadBytes)
+		return nil, "", c.failedAs(ErrMediaTooLarge, fmt.Errorf("server reports %d bytes, over the %d-byte limit", resp.ContentLength, MaxMediaDownloadBytes))
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, MaxMediaDownloadBytes+1))
 	if err != nil {
-		return nil, "", fmt.Errorf("%w: %w", ErrMediaDownload, err)
+		return nil, "", c.failedAs(ErrMediaDownload, err)
 	}
 	if len(data) > MaxMediaDownloadBytes {
-		return nil, "", fmt.Errorf("%w: over the %d-byte limit", ErrMediaTooLarge, MaxMediaDownloadBytes)
+		return nil, "", c.failedAs(ErrMediaTooLarge, fmt.Errorf("payload over the %d-byte limit", MaxMediaDownloadBytes))
 	}
 	contentType := resp.Header.Get("Content-Type")
 	if parsed, _, err := mime.ParseMediaType(contentType); err == nil {
@@ -230,15 +230,15 @@ func (c *Client) downloadMedia(ctx context.Context, uri id.ContentURI) ([]byte, 
 // decryptMedia decrypts an attachment with the key material its own content
 // carries. The hash check is part of the decryption: a payload that does not
 // match the declared SHA-256 is treated as corrupt rather than returned.
-func decryptMedia(file *event.EncryptedFileInfo, data []byte) ([]byte, error) {
+func (c *Client) decryptMedia(file *event.EncryptedFileInfo, data []byte) ([]byte, error) {
 	encrypted := file.EncryptedFile
 	plaintext, err := encrypted.Decrypt(data)
 	if err != nil {
 		switch {
 		case errors.Is(err, attachment.ErrUnsupportedVersion), errors.Is(err, attachment.ErrUnsupportedAlgorithm):
-			return nil, fmt.Errorf("%w: %v", ErrUnsupportedCodec, err)
+			return nil, c.failedAs(ErrUnsupportedCodec, err)
 		default:
-			return nil, fmt.Errorf("%w: %v", ErrMediaUndecryptable, err)
+			return nil, c.failedAs(ErrMediaUndecryptable, err)
 		}
 	}
 	return plaintext, nil
@@ -318,7 +318,7 @@ func (c *Client) SendMedia(ctx context.Context, roomID string, media MediaUpload
 		upload.ContentType = "application/octet-stream"
 		uploaded, err := c.cli.UploadMedia(ctx, upload)
 		if err != nil {
-			return MediaSendResult{}, fmt.Errorf("matrix: upload media: %w", err)
+			return MediaSendResult{}, c.failedText("could not upload the attachment", err)
 		}
 		content.File = &event.EncryptedFileInfo{EncryptedFile: *file, URL: id.ContentURIString(uploaded.ContentURI.String())}
 		content.URL = ""
@@ -326,7 +326,7 @@ func (c *Client) SendMedia(ctx context.Context, roomID string, media MediaUpload
 		upload.ContentBytes = media.Data
 		uploaded, err := c.cli.UploadMedia(ctx, upload)
 		if err != nil {
-			return MediaSendResult{}, fmt.Errorf("matrix: upload media: %w", err)
+			return MediaSendResult{}, c.failedText("could not upload the attachment", err)
 		}
 		content.URL = id.ContentURIString(uploaded.ContentURI.String())
 	}
@@ -336,7 +336,7 @@ func (c *Client) SendMedia(ctx context.Context, roomID string, media MediaUpload
 	}
 	resp, err := c.cli.SendMessageEvent(ctx, id.RoomID(roomID), event.EventMessage, content)
 	if err != nil {
-		return MediaSendResult{}, fmt.Errorf("matrix: send media message: %w", err)
+		return MediaSendResult{}, c.failedText("could not send the attachment", err)
 	}
 	eventID := resp.EventID.String()
 	if c.cfg.BridgeAckTimeout > 0 {

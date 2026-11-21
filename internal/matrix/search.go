@@ -3,7 +3,6 @@ package matrix
 import (
 	"context"
 	"errors"
-	"fmt"
 	"sort"
 	"strings"
 
@@ -103,7 +102,7 @@ func (c *Client) SearchMessages(ctx context.Context, req SearchRequest) (SearchO
 			return SearchOutcome{}, ctx.Err()
 		}
 		if !isSearchUnsupported(err) {
-			return SearchOutcome{}, fmt.Errorf("matrix: search: %w", err)
+			return SearchOutcome{}, c.failedAs(ErrSearchUnavailable, err)
 		}
 		c.searchUnavailable.Store(true)
 		c.log.Printf("homeserver does not implement /search; falling back to a bounded room scan")
