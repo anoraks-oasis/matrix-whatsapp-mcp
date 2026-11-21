@@ -336,6 +336,9 @@ func (c *Client) SendMedia(ctx context.Context, roomID string, media MediaUpload
 	}
 	resp, err := c.cli.SendMessageEvent(ctx, id.RoomID(roomID), event.EventMessage, content)
 	if err != nil {
+		if errors.Is(err, mautrix.MNotFound) {
+			return MediaSendResult{}, c.failedAs(ErrRoomNotFound, err)
+		}
 		return MediaSendResult{}, c.failedText("could not send the attachment", err)
 	}
 	eventID := resp.EventID.String()
