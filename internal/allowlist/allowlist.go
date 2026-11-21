@@ -1,7 +1,7 @@
 // Package allowlist owns the send allowlist: the ALLOWED_SEND_ROOMS baseline
-// from the environment, unioned with the room IDs in a plain-text file that the
+// from the environment, unioned with the chat IDs in a plain-text file that the
 // running server re-reads when the file changes. That file is what
-// `matrix-whatsapp-mcp rooms allow` writes, so enrolling a room needs no
+// `matrix-whatsapp-mcp chats allow` writes, so enrolling a chat needs no
 // restart and no .env edit.
 //
 // The file is read at most once per second, and only when it is consulted, so
@@ -32,7 +32,7 @@ const EnvSource = "ALLOWED_SEND_ROOMS"
 
 const (
 	// defaultMinInterval bounds how often the file on disk is stat'ed. A
-	// second is fast enough that a `rooms allow` takes effect before the
+	// second is fast enough that a `chats allow` takes effect before the
 	// person can send anything, and slow enough that a busy send loop never
 	// turns into a stat storm.
 	defaultMinInterval = time.Second
@@ -40,9 +40,9 @@ const (
 	fileMode = 0o600
 	dirMode  = 0o700
 
-	fileHeader = "# matrix-whatsapp-mcp send allowlist: one room ID per line.\n" +
+	fileHeader = "# matrix-whatsapp-mcp send allowlist: one chat ID per line.\n" +
 		"# Lines starting with '#' are comments.\n" +
-		"# Managed by `matrix-whatsapp-mcp rooms allow` and `rooms deny`.\n"
+		"# Managed by `matrix-whatsapp-mcp chats allow` and `chats deny`.\n"
 )
 
 // ErrInvalidRoomID is returned when a caller asks to write a string that is not

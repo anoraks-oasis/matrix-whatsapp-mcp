@@ -105,20 +105,20 @@ func runDoctor(ctx context.Context, args []string, deps Deps) int {
 		rep.check(statusOK, "whoami", fmt.Sprintf("%s (device %s)", userID, deviceID))
 	}
 
-	rooms, roomsErr := svc.JoinedRooms(ctx)
-	var bridged []bool
-	if roomsErr != nil {
-		rep.check(statusFail, "joined rooms", roomsErr.Error())
+	chats, chatsErr := svc.JoinedRooms(ctx)
+	var whatsapp []bool
+	if chatsErr != nil {
+		rep.check(statusFail, "joined chats", chatsErr.Error())
 	} else {
 		probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 		var cut bool
-		bridged, cut = probeBridged(probeCtx, svc, rooms)
+		whatsapp, cut = probeBridged(probeCtx, svc, chats)
 		cancel()
-		detail := fmt.Sprintf("%d joined, %d bridged from WhatsApp", len(rooms), countTrue(bridged))
+		detail := fmt.Sprintf("%d joined, %d on WhatsApp", len(chats), countTrue(whatsapp))
 		if cut {
-			detail += fmt.Sprintf("\nthe bridged check was cut off after %s, so some rooms were not probed", probeTimeout)
+			detail += fmt.Sprintf("\nthe WhatsApp check was cut off after %s, so some chats were not probed", probeTimeout)
 		}
-		rep.check(statusOK, "joined rooms", detail)
+		rep.check(statusOK, "joined chats", detail)
 	}
 
 	store := newStore(cfg, logger)
@@ -140,9 +140,9 @@ func runDoctor(ctx context.Context, args []string, deps Deps) int {
 		}
 	}
 
-	if roomsErr == nil {
-		fmt.Fprint(out, "\njoined rooms\n")
-		printRooms(out, rooms, bridged, store)
+	if chatsErr == nil {
+		fmt.Fprint(out, "\njoined chats\n")
+		printChats(out, chats, whatsapp, store)
 	}
 	if len(entries) > 0 {
 		fmt.Fprint(out, "\nsend allowlist\n")

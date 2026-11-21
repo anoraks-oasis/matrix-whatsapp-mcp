@@ -1,6 +1,8 @@
-// Package cli implements the binary's subcommands: `rooms`, `rooms allow|deny`
-// and `doctor`. They exist so enrolling a room is one command instead of an
-// Element lookup, an .env edit and a restart.
+// Package cli implements the binary's subcommands: `chats`, `chats allow|deny`
+// and `doctor`. They exist so enrolling a chat is one command instead of an
+// Element lookup, an .env edit and a restart. `rooms` and `rooms allow|deny`
+// stay as hidden aliases of the same commands, so existing scripts keep
+// working.
 //
 // Nothing here runs on the server path. With no arguments the binary still
 // serves MCP, and that path never writes to stdout.
@@ -34,39 +36,39 @@ const (
 	// reachabilityTimeout bounds the /versions probe doctor makes.
 	reachabilityTimeout = 5 * time.Second
 
-	// probeParallel bounds concurrent room probes for the bridged check.
+	// probeParallel bounds concurrent chat probes for the WhatsApp check.
 	probeParallel = 8
-	// probeTimeout bounds the bridged-probe phase of `rooms` and `doctor` as a
-	// whole. Each room costs up to two probes with a 10s network timeout each,
+	// probeTimeout bounds the WhatsApp-probe phase of `chats` and `doctor` as a
+	// whole. Each chat costs up to two probes with a 10s network timeout each,
 	// so an unbounded phase would spend the 30s command budget on a large
 	// account and end in a context error with no table at all; cut off, the
-	// table still prints and the bridged column says it is partial.
+	// table still prints and the WhatsApp column says it is partial.
 	probeTimeout = 20 * time.Second
 
 	nameWidth = 48
 	idWidth   = 80
 )
 
-const usage = `matrix-whatsapp-mcp - Matrix /sync listener and MCP server for a mautrix/whatsapp bridge
+const usage = `matrix-whatsapp-mcp - WhatsApp tooling for a mautrix/whatsapp bridge over Matrix
 
 Usage:
   matrix-whatsapp-mcp                     serve MCP (stdio or HTTP per MCP_TRANSPORT)
-  matrix-whatsapp-mcp rooms               list joined rooms, bridged and send-allowed
-  matrix-whatsapp-mcp rooms allow <room>  add a room to the send allowlist
-  matrix-whatsapp-mcp rooms deny <room>   remove a room from the send allowlist
+  matrix-whatsapp-mcp chats               list joined chats, WhatsApp and send-allowed
+  matrix-whatsapp-mcp chats allow <chat>  add a chat to the send allowlist
+  matrix-whatsapp-mcp chats deny <chat>   remove a chat from the send allowlist
   matrix-whatsapp-mcp doctor              check the configuration against the homeserver
 
-<room> is a room ID, a room name, or a case-insensitive part of either.
-Pass --index N to use the number printed by "rooms" instead.
+<chat> is a chat ID, a chat name, or a case-insensitive part of either.
+Pass --index N to use the number printed by "chats" instead.
 
-Enrolling a room:
-  1. Invite the bot to the room from Element.
-  2. matrix-whatsapp-mcp rooms            # find it in the table
-  3. matrix-whatsapp-mcp rooms allow 2    # or: rooms allow "Family WhatsApp"
+Enrolling a chat:
+  1. Invite the bot to the chat from Element.
+  2. matrix-whatsapp-mcp chats            # find it in the table
+  3. matrix-whatsapp-mcp chats allow 2    # or: chats allow "Family WhatsApp"
 `
 
-const roomsUsage = `usage: matrix-whatsapp-mcp rooms allow <name-or-room-id> [--index N]
-       matrix-whatsapp-mcp rooms deny  <name-or-room-id> [--index N]`
+const chatsUsage = `usage: matrix-whatsapp-mcp chats allow <name-or-chat-id> [--index N]
+       matrix-whatsapp-mcp chats deny  <name-or-chat-id> [--index N]`
 
 // RoomService is the part of the Matrix client the subcommands use.
 type RoomService interface {
@@ -132,8 +134,10 @@ func Run(ctx context.Context, args []string, deps Deps) int {
 		return exitUsage
 	}
 	switch args[0] {
-	case "rooms":
-		return runRooms(ctx, args[1:], deps)
+	case "chats", "rooms":
+		// rooms is the Matrix-era name for chats and stays a hidden alias so a
+		// script written against the old surface keeps working.
+		return runChats(ctx, args[1:], deps)
 	case "doctor":
 		return runDoctor(ctx, args[1:], deps)
 	case "help", "-h", "--help":
@@ -195,10 +199,10 @@ func fail(deps Deps, err error) int {
 	return exitFail
 }
 
-// probeBridged resolves the bridged flag for every room, bounded to
+// probeBridged resolves the WhatsApp flag for every chat, bounded to
 // probeParallel concurrent probes and to ctx. It reports whether ctx ended
 // before the probes could finish, so the caller can say the column is partial
-// instead of presenting an unprobed room as a confident "not bridged".
+// instead of presenting an unprobed chat as a confident "not on WhatsApp".
 func probeBridged(ctx context.Context, svc RoomService, rooms []matrix.Room) ([]bool, bool) {
 	bridged := make([]bool, len(rooms))
 	var wg sync.WaitGroup

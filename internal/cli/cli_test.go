@@ -136,7 +136,7 @@ func TestRunHelp(t *testing.T) {
 	if code := b.run(t, "help"); code != exitOK {
 		t.Fatalf("exit code = %d, want %d", code, exitOK)
 	}
-	for _, want := range []string{"rooms allow", "doctor", "Enrolling a room"} {
+	for _, want := range []string{"chats allow", "doctor", "Enrolling a chat"} {
 		if !strings.Contains(b.out.String(), want) {
 			t.Fatalf("help output is missing %q:\n%s", want, b.out.String())
 		}
@@ -245,17 +245,83 @@ func TestResolveAmbiguityListsCandidates(t *testing.T) {
 	}
 }
 
-func TestRoomsTable(t *testing.T) {
+// TestRoomsAliasStillWorks keeps the Matrix-era subcommand working: a script
+// written before the rename must not break, even though help no longer
+// advertises it.
+func TestRoomsAliasStillWorks(t *testing.T) {
+	chats := newBus(t)
+	chats.svc.rooms = twoRooms()
+	if code := chats.run(t, "chats"); code != exitOK {
+		t.Fatalf("chats exit code = %d, want 0 (stderr: %s)", code, chats.errOut.String())
+	}
+
+	rooms := newBus(t)
+	rooms.svc.rooms = twoRooms()
+	if code := rooms.run(t, "rooms"); code != exitOK {
+		t.Fatalf("rooms exit code = %d, want 0 (stderr: %s)", code, rooms.errOut.String())
+	}
+	if stripPaths(rooms.out.String(), rooms.dir) != stripPaths(chats.out.String(), chats.dir) {
+		t.Fatalf("rooms output differs from chats:\nrooms:\n%s\nchats:\n%s", rooms.out.String(), chats.out.String())
+	}
+	if !strings.Contains(rooms.out.String(), "CHAT ID") {
+		t.Fatalf("rooms output = %q, want the chat table", rooms.out.String())
+	}
+
+	if code := rooms.run(t, "rooms", "allow", "--index", "1"); code != exitOK {
+		t.Fatalf("rooms allow exit code = %d, want 0 (stderr: %s)", code, rooms.errOut.String())
+	}
+	data, err := os.ReadFile(rooms.allowlistPath())
+	if err != nil {
+		t.Fatalf("read allowlist: %v", err)
+	}
+	if !strings.Contains(string(data), "!family:example.com") {
+		t.Fatalf("allowlist file = %q, want the chat rooms allow selected", data)
+	}
+	if code := rooms.run(t, "rooms", "deny", "family"); code != exitOK {
+		t.Fatalf("rooms deny exit code = %d, want 0 (stderr: %s)", code, rooms.errOut.String())
+	}
+	if data, err := os.ReadFile(rooms.allowlistPath()); err == nil && strings.Contains(string(data), "!family:example.com") {
+		t.Fatalf("allowlist file = %q, want the chat removed", data)
+	}
+}
+
+// TestHelpAdvertisesChatsOnly proves the alias is hidden: the canonical command
+// is what help teaches, and nothing points a new user at `rooms`.
+func TestHelpAdvertisesChatsOnly(t *testing.T) {
+	b := newBus(t)
+	if code := b.run(t, "help"); code != exitOK {
+		t.Fatalf("exit code = %d, want %d", code, exitOK)
+	}
+	out := b.out.String()
+	for _, want := range []string{"chats allow", "chats deny", "doctor"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("help output is missing %q:\n%s", want, out)
+		}
+	}
+	for _, old := range []string{"rooms allow", "rooms deny", "matrix-whatsapp-mcp rooms"} {
+		if strings.Contains(out, old) {
+			t.Fatalf("help output still advertises %q:\n%s", old, out)
+		}
+	}
+}
+
+// stripPaths removes the two buses' distinct temp directories so their output
+// can be compared byte for byte.
+func stripPaths(out, dir string) string {
+	return strings.ReplaceAll(out, dir, "<dir>")
+}
+
+func TestChatsTable(t *testing.T) {
 	b := newBus(t)
 	b.svc.rooms = twoRooms()
 	b.svc.bridged["!family:example.com"] = true
 	b.env["ALLOWED_SEND_ROOMS"] = "!cafe:example.com"
 
-	if code := b.run(t, "rooms"); code != exitOK {
+	if code := b.run(t, "chats"); code != exitOK {
 		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, b.errOut.String())
 	}
 	out := b.out.String()
-	for _, want := range []string{"#", "NAME", "ROOM ID", "BRIDGED", "SEND", "Family WhatsApp", "!family:example.com"} {
+	for _, want := range []string{"#", "NAME", "CHAT ID", "WHATSAPP", "SEND", "Family WhatsApp", "!family:example.com"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("table is missing %q:\n%s", want, out)
 		}
@@ -275,7 +341,7 @@ func TestRoomsTable(t *testing.T) {
 	if !strings.HasSuffix(strings.TrimRight(cafeLine, " "), "yes") {
 		t.Fatalf("cafe row = %q, want send yes (ALLOWED_SEND_ROOMS)", cafeLine)
 	}
-	if !strings.Contains(out, "2 room(s), 1 send-allowed") {
+	if !strings.Contains(out, "2 chat(s), 1 send-allowed") {
 		t.Fatalf("footer is missing the counts:\n%s", out)
 	}
 	if !strings.Contains(out, "1 from ALLOWED_SEND_ROOMS, 0 from "+b.allowlistPath()) {
@@ -286,21 +352,21 @@ func TestRoomsTable(t *testing.T) {
 	}
 }
 
-func TestRoomsEmpty(t *testing.T) {
+func TestChatsEmpty(t *testing.T) {
 	b := newBus(t)
-	if code := b.run(t, "rooms"); code != exitOK {
+	if code := b.run(t, "chats"); code != exitOK {
 		t.Fatalf("exit code = %d, want 0", code)
 	}
-	if !strings.Contains(b.out.String(), "no joined rooms") {
+	if !strings.Contains(b.out.String(), "no joined chats") {
 		t.Fatalf("output = %q, want the empty-state message", b.out.String())
 	}
 }
 
-func TestRoomsAllowByNameWritesFile(t *testing.T) {
+func TestChatsAllowByNameWritesFile(t *testing.T) {
 	b := newBus(t)
 	b.svc.rooms = twoRooms()
 
-	if code := b.run(t, "rooms", "allow", "cafe"); code != exitOK {
+	if code := b.run(t, "chats", "allow", "cafe"); code != exitOK {
 		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, b.errOut.String())
 	}
 	data, err := os.ReadFile(b.allowlistPath())
@@ -315,11 +381,11 @@ func TestRoomsAllowByNameWritesFile(t *testing.T) {
 	}
 }
 
-func TestRoomsAllowByIndex(t *testing.T) {
+func TestChatsAllowByIndex(t *testing.T) {
 	b := newBus(t)
 	b.svc.rooms = twoRooms()
 
-	if code := b.run(t, "rooms", "allow", "--index", "1"); code != exitOK {
+	if code := b.run(t, "chats", "allow", "--index", "1"); code != exitOK {
 		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, b.errOut.String())
 	}
 	data, err := os.ReadFile(b.allowlistPath())
@@ -331,12 +397,12 @@ func TestRoomsAllowByIndex(t *testing.T) {
 	}
 }
 
-func TestRoomsAllowTwiceIsIdempotent(t *testing.T) {
+func TestChatsAllowTwiceIsIdempotent(t *testing.T) {
 	b := newBus(t)
 	b.svc.rooms = twoRooms()
 
 	for range 2 {
-		if code := b.run(t, "rooms", "allow", "Cafe"); code != exitOK {
+		if code := b.run(t, "chats", "allow", "Cafe"); code != exitOK {
 			t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, b.errOut.String())
 		}
 	}
@@ -348,14 +414,14 @@ func TestRoomsAllowTwiceIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestRoomsAllowAmbiguousRefusesAndWritesNothing(t *testing.T) {
+func TestChatsAllowAmbiguousRefusesAndWritesNothing(t *testing.T) {
 	b := newBus(t)
 	b.svc.rooms = []matrix.Room{
 		{ID: "!a:example.com", Name: "Family WhatsApp"},
 		{ID: "!b:example.com", Name: "Family Photos"},
 	}
 
-	if code := b.run(t, "rooms", "allow", "family"); code != exitFail {
+	if code := b.run(t, "chats", "allow", "family"); code != exitFail {
 		t.Fatalf("exit code = %d, want %d", code, exitFail)
 	}
 	for _, want := range []string{"!a:example.com", "!b:example.com"} {
@@ -368,14 +434,14 @@ func TestRoomsAllowAmbiguousRefusesAndWritesNothing(t *testing.T) {
 	}
 }
 
-func TestRoomsDenyRemovesFromFile(t *testing.T) {
+func TestChatsDenyRemovesFromFile(t *testing.T) {
 	b := newBus(t)
 	b.svc.rooms = twoRooms()
-	if code := b.run(t, "rooms", "allow", "!cafe:example.com"); code != exitOK {
+	if code := b.run(t, "chats", "allow", "!cafe:example.com"); code != exitOK {
 		t.Fatalf("setup allow failed with %d", code)
 	}
 
-	if code := b.run(t, "rooms", "deny", "cafe"); code != exitOK {
+	if code := b.run(t, "chats", "deny", "cafe"); code != exitOK {
 		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, b.errOut.String())
 	}
 	if data := readFile(t, b.allowlistPath()); strings.Contains(data, "!cafe:example.com") {
@@ -386,12 +452,12 @@ func TestRoomsDenyRemovesFromFile(t *testing.T) {
 	}
 }
 
-func TestRoomsDenyEnvOnlyRoomFails(t *testing.T) {
+func TestChatsDenyEnvOnlyChatFails(t *testing.T) {
 	b := newBus(t)
 	b.svc.rooms = twoRooms()
 	b.env["ALLOWED_SEND_ROOMS"] = "!cafe:example.com"
 
-	if code := b.run(t, "rooms", "deny", "cafe"); code != exitFail {
+	if code := b.run(t, "chats", "deny", "cafe"); code != exitFail {
 		t.Fatalf("exit code = %d, want %d", code, exitFail)
 	}
 	if !strings.Contains(b.errOut.String(), "ALLOWED_SEND_ROOMS") {
@@ -399,11 +465,11 @@ func TestRoomsDenyEnvOnlyRoomFails(t *testing.T) {
 	}
 }
 
-func TestRoomsDenyUnlistedRoomIsNoOp(t *testing.T) {
+func TestChatsDenyUnlistedChatIsNoOp(t *testing.T) {
 	b := newBus(t)
 	b.svc.rooms = twoRooms()
 
-	if code := b.run(t, "rooms", "deny", "cafe"); code != exitOK {
+	if code := b.run(t, "chats", "deny", "cafe"); code != exitOK {
 		t.Fatalf("exit code = %d, want 0", code)
 	}
 	if !strings.Contains(b.out.String(), "nothing to deny") {
@@ -411,12 +477,12 @@ func TestRoomsDenyUnlistedRoomIsNoOp(t *testing.T) {
 	}
 }
 
-func TestRoomsAllowRoomAlreadyInEnv(t *testing.T) {
+func TestChatsAllowChatAlreadyInEnv(t *testing.T) {
 	b := newBus(t)
 	b.svc.rooms = twoRooms()
 	b.env["ALLOWED_SEND_ROOMS"] = "!cafe:example.com"
 
-	if code := b.run(t, "rooms", "allow", "cafe"); code != exitOK {
+	if code := b.run(t, "chats", "allow", "cafe"); code != exitOK {
 		t.Fatalf("exit code = %d, want 0", code)
 	}
 	if !strings.Contains(b.out.String(), "already sendable through ALLOWED_SEND_ROOMS") {
@@ -424,19 +490,19 @@ func TestRoomsAllowRoomAlreadyInEnv(t *testing.T) {
 	}
 }
 
-func TestRoomsSelectorAndIndexTogetherIsUsageError(t *testing.T) {
+func TestChatsSelectorAndIndexTogetherIsUsageError(t *testing.T) {
 	b := newBus(t)
 	b.svc.rooms = twoRooms()
-	if code := b.run(t, "rooms", "allow", "cafe", "--index", "1"); code != exitUsage {
+	if code := b.run(t, "chats", "allow", "cafe", "--index", "1"); code != exitUsage {
 		t.Fatalf("exit code = %d, want %d", code, exitUsage)
 	}
 }
 
-func TestRoomsSurfacesClientError(t *testing.T) {
+func TestChatsSurfacesClientError(t *testing.T) {
 	b := newBus(t)
 	b.svc.roomsErr = io.ErrUnexpectedEOF
 
-	if code := b.run(t, "rooms"); code != exitFail {
+	if code := b.run(t, "chats"); code != exitFail {
 		t.Fatalf("exit code = %d, want %d", code, exitFail)
 	}
 	if !strings.Contains(b.errOut.String(), "error:") {
@@ -480,9 +546,9 @@ func TestDoctorHealthy(t *testing.T) {
 	out := b.out.String()
 	for _, want := range []string{
 		"config", "homeserver", srv.URL, "@bot:example.com", "stdio",
-		"[ok  ]", "versions", "whoami", "joined rooms", "2 joined, 1 bridged",
-		"send allowlist", "2 room(s)", "crypto db",
-		"joined rooms", b.allowlistPath(),
+		"[ok  ]", "versions", "whoami", "joined chats", "2 joined, 1 on WhatsApp",
+		"send allowlist", "2 chat(s)", "crypto db",
+		"joined chats", b.allowlistPath(),
 		"all 5 checks passed",
 	} {
 		if !strings.Contains(out, want) {
@@ -593,18 +659,18 @@ func readFile(t *testing.T, path string) string {
 	return string(data)
 }
 
-// TestRoomsProbePhaseIsBounded is R8's CLI half: the bridged probes run under
+// TestChatsProbePhaseIsBounded is R8's CLI half: the bridged probes run under
 // one overall deadline, so a large account with a slow homeserver cannot spend
 // the whole 30s command budget probing and end with no table at all. Reaching
 // IsBridged without a deadline would mean the phase is unbounded again.
-func TestRoomsProbePhaseIsBounded(t *testing.T) {
+func TestChatsProbePhaseIsBounded(t *testing.T) {
 	if probeTimeout <= 0 || probeTimeout >= commandTimeout {
 		t.Fatalf("probeTimeout = %s, want it inside the %s command budget", probeTimeout, commandTimeout)
 	}
 
 	b := newBus(t)
 	b.svc.rooms = twoRooms()
-	if code := b.run(t, "rooms"); code != exitOK {
+	if code := b.run(t, "chats"); code != exitOK {
 		t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, b.errOut.String())
 	}
 

@@ -2,7 +2,7 @@
 // loads the configuration, brings up the Matrix sync loop and trigger
 // dispatcher, and serves the MCP server over stdio or Streamable HTTP until
 // interrupted. The first argument selects one of the helper subcommands
-// `rooms`, `rooms allow|deny` or `doctor`, which run against the homeserver and
+// `chats`, `chats allow|deny` or `doctor`, which run against the homeserver and
 // exit instead of serving.
 package main
 

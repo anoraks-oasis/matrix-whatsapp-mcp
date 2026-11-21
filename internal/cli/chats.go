@@ -13,9 +13,9 @@ import (
 	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/matrix"
 )
 
-func runRooms(ctx context.Context, args []string, deps Deps) int {
+func runChats(ctx context.Context, args []string, deps Deps) int {
 	if len(args) == 0 {
-		return listRooms(ctx, deps)
+		return listChats(ctx, deps)
 	}
 	switch args[0] {
 	case "allow":
@@ -23,12 +23,12 @@ func runRooms(ctx context.Context, args []string, deps Deps) int {
 	case "deny":
 		return enrol(ctx, args[1:], deps, false)
 	default:
-		fmt.Fprintf(deps.Stderr, "unknown rooms command %q\n\n%s\n", args[0], roomsUsage)
+		fmt.Fprintf(deps.Stderr, "unknown chats command %q\n\n%s\n", args[0], chatsUsage)
 		return exitUsage
 	}
 }
 
-func listRooms(ctx context.Context, deps Deps) int {
+func listChats(ctx context.Context, deps Deps) int {
 	env, err := open(deps)
 	if err != nil {
 		return fail(deps, err)
@@ -37,48 +37,48 @@ func listRooms(ctx context.Context, deps Deps) int {
 
 	rooms, err := env.rooms.JoinedRooms(ctx)
 	if err != nil {
-		return fail(deps, fmt.Errorf("listing joined rooms: %w", err))
+		return fail(deps, fmt.Errorf("listing joined chats: %w", err))
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	bridged, cut := probeBridged(probeCtx, env.rooms, rooms)
 	cancel()
-	printRooms(deps.Stdout, rooms, bridged, env.allow)
+	printChats(deps.Stdout, rooms, bridged, env.allow)
 	if cut {
-		fmt.Fprintf(deps.Stderr, "note: the bridged check was cut off after %s; rooms it did not reach are listed as not bridged\n", probeTimeout)
+		fmt.Fprintf(deps.Stderr, "note: the WhatsApp check was cut off after %s; chats it did not reach are listed as not on WhatsApp\n", probeTimeout)
 	}
 	return exitOK
 }
 
-// printRooms renders the table `rooms allow --index N` indexes into. The order
+// printChats renders the table `chats allow --index N` indexes into. The order
 // is exactly what JoinedRooms returns (sorted by name), so row numbers stay
 // stable between the listing and a later allow/deny.
-func printRooms(w io.Writer, rooms []matrix.Room, bridged []bool, allow *allowlist.Store) {
+func printChats(w io.Writer, rooms []matrix.Room, bridged []bool, allow *allowlist.Store) {
 	if len(rooms) == 0 {
-		fmt.Fprintln(w, "no joined rooms")
-		fmt.Fprintln(w, "\nInvite the bot to a room from Element, then run this again.")
+		fmt.Fprintln(w, "no joined chats")
+		fmt.Fprintln(w, "\nInvite the bot to a chat from Element, then run this again.")
 		return
 	}
 
 	names := make([]string, len(rooms))
-	nameW, idW := len("NAME"), len("ROOM ID")
+	nameW, idW := len("NAME"), len("CHAT ID")
 	for i, r := range rooms {
 		names[i] = clamp(displayName(r), nameWidth)
 		nameW = max(nameW, len([]rune(names[i])))
 		idW = max(idW, len([]rune(clamp(r.ID, idWidth))))
 	}
 
-	fmt.Fprintf(w, "%3s  %s  %s  %-7s  %s\n", "#", pad("NAME", nameW), pad("ROOM ID", idW), "BRIDGED", "SEND")
+	fmt.Fprintf(w, "%3s  %s  %s  %-8s  %s\n", "#", pad("NAME", nameW), pad("CHAT ID", idW), "WHATSAPP", "SEND")
 	allowed := 0
 	for i, r := range rooms {
 		send := allow.Allowed(r.ID)
 		if send {
 			allowed++
 		}
-		fmt.Fprintf(w, "%3d  %s  %s  %-7s  %s\n",
+		fmt.Fprintf(w, "%3d  %s  %s  %-8s  %s\n",
 			i+1, pad(names[i], nameW), pad(clamp(r.ID, idW), idW), yesNo(bridged[i]), yesNo(send))
 	}
 
-	fmt.Fprintf(w, "\n%d room(s), %d send-allowed\n", len(rooms), allowed)
+	fmt.Fprintf(w, "\n%d chat(s), %d send-allowed\n", len(rooms), allowed)
 	fmt.Fprintf(w, "allowlist: %s\n", allowlistSources(allow))
 }
 
@@ -114,15 +114,15 @@ func displayName(r matrix.Room) string {
 	return r.Name
 }
 
-func describeRoom(r matrix.Room) string {
+func describeChat(r matrix.Room) string {
 	if r.Name == "" || r.Name == r.ID {
 		return r.ID
 	}
 	return fmt.Sprintf("%q (%s)", r.Name, r.ID)
 }
 
-// selector is one of the two ways to name a room: a query string, or the row
-// number printed by `rooms`.
+// selector is one of the two ways to name a chat: a query string, or the row
+// number printed by `chats`.
 type selector struct {
 	query    string
 	index    int
@@ -154,11 +154,11 @@ func parseSelector(args []string) (selector, error) {
 	}
 	switch {
 	case sel.hasIndex && len(words) > 0:
-		return sel, errors.New("give either a room name or --index, not both")
+		return sel, errors.New("give either a chat name or --index, not both")
 	case sel.hasIndex:
 		return sel, nil
 	case len(words) == 0:
-		return sel, errors.New("give a room name, a room ID, or --index N")
+		return sel, errors.New("give a chat name, a chat ID, or --index N")
 	}
 	sel.query = strings.Join(words, " ")
 	return sel, nil
@@ -174,15 +174,15 @@ func (s *selector) setIndex(raw string) error {
 	return nil
 }
 
-// resolve picks the room a selector names. An exact room ID wins outright, then
+// resolve picks the chat a selector names. An exact chat ID wins outright, then
 // an exact case-insensitive name; failing those the query is matched as a
-// case-insensitive substring of the name or the room ID. Anything but a single
+// case-insensitive substring of the name or the chat ID. Anything but a single
 // match is an error, and an ambiguous query lists every candidate instead of
 // picking one.
 func resolve(rooms []matrix.Room, sel selector) (matrix.Room, error) {
 	if sel.hasIndex {
 		if sel.index < 1 || sel.index > len(rooms) {
-			return matrix.Room{}, fmt.Errorf("--index %d is out of range: %d joined room(s)", sel.index, len(rooms))
+			return matrix.Room{}, fmt.Errorf("--index %d is out of range: %d joined chat(s)", sel.index, len(rooms))
 		}
 		return rooms[sel.index-1], nil
 	}
@@ -214,24 +214,24 @@ func resolve(rooms []matrix.Room, sel selector) (matrix.Room, error) {
 	case len(partial) > 1:
 		return matrix.Room{}, ambiguous(query, partial)
 	default:
-		return matrix.Room{}, fmt.Errorf("no joined room matches %q; run `matrix-whatsapp-mcp rooms` to list them", query)
+		return matrix.Room{}, fmt.Errorf("no joined chat matches %q; run `matrix-whatsapp-mcp chats` to list them", query)
 	}
 }
 
 func ambiguous(query string, candidates []matrix.Room) error {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%q matches %d rooms, refusing to guess:", query, len(candidates))
+	fmt.Fprintf(&b, "%q matches %d chats, refusing to guess:", query, len(candidates))
 	for _, r := range candidates {
-		fmt.Fprintf(&b, "\n  %s", describeRoom(r))
+		fmt.Fprintf(&b, "\n  %s", describeChat(r))
 	}
-	b.WriteString("\nname one of them exactly, pass the room ID, or use --index N")
+	b.WriteString("\nname one of them exactly, pass the chat ID, or use --index N")
 	return errors.New(b.String())
 }
 
 func enrol(ctx context.Context, args []string, deps Deps, allow bool) int {
 	sel, err := parseSelector(args)
 	if err != nil {
-		fmt.Fprintf(deps.Stderr, "%v\n\n%s\n", err, roomsUsage)
+		fmt.Fprintf(deps.Stderr, "%v\n\n%s\n", err, chatsUsage)
 		return exitUsage
 	}
 	env, err := open(deps)
@@ -242,19 +242,19 @@ func enrol(ctx context.Context, args []string, deps Deps, allow bool) int {
 
 	rooms, err := env.rooms.JoinedRooms(ctx)
 	if err != nil {
-		return fail(deps, fmt.Errorf("listing joined rooms: %w", err))
+		return fail(deps, fmt.Errorf("listing joined chats: %w", err))
 	}
 	target, err := resolve(rooms, sel)
 	if err != nil {
 		return fail(deps, err)
 	}
 	if allow {
-		return allowRoom(deps, env, target)
+		return allowChat(deps, env, target)
 	}
-	return denyRoom(deps, env, target)
+	return denyChat(deps, env, target)
 }
 
-func allowRoom(deps Deps, env *cmdEnv, room matrix.Room) int {
+func allowChat(deps Deps, env *cmdEnv, room matrix.Room) int {
 	path := env.cfg.AllowlistFile
 	if path == "" {
 		return fail(deps, errNoAllowlistFile)
@@ -264,7 +264,7 @@ func allowRoom(deps Deps, env *cmdEnv, room matrix.Room) int {
 		return fail(deps, fmt.Errorf("writing %s: %w", path, err))
 	}
 
-	name := describeRoom(room)
+	name := describeChat(room)
 	viaEnv := env.cfg.SendAllowed(room.ID)
 	switch {
 	case !changed && viaEnv:
@@ -279,8 +279,8 @@ func allowRoom(deps Deps, env *cmdEnv, room matrix.Room) int {
 	return exitOK
 }
 
-func denyRoom(deps Deps, env *cmdEnv, room matrix.Room) int {
-	name := describeRoom(room)
+func denyChat(deps Deps, env *cmdEnv, room matrix.Room) int {
+	name := describeChat(room)
 	viaEnv := env.cfg.SendAllowed(room.ID)
 
 	removed := false
