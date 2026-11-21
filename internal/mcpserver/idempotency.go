@@ -95,7 +95,7 @@ func (c *idempotencyCache) claim(ctx context.Context, key, roomID, text string) 
 		if ok {
 			if entry.roomID != roomID || entry.text != text {
 				c.mu.Unlock()
-				return nil, fmt.Errorf("%w: pass the original room and text to get its event ID back, or use a new key", errIdempotencyConflict)
+				return nil, fmt.Errorf("%w: pass the original chat and text to get its message ID back, or use a new key", errIdempotencyConflict)
 			}
 			if entry.settled {
 				claim := &sendClaim{replayed: true, eventID: entry.eventID}

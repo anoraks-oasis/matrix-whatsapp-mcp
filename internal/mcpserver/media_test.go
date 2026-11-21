@@ -99,7 +99,7 @@ func TestGetMediaReturnsImageBlock(t *testing.T) {
 
 	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 		Name:      "get_media",
-		Arguments: map[string]any{"room_id": "!r:test", "event_id": "$img"},
+		Arguments: map[string]any{"chat_id": "!r:test", "message_id": "$img"},
 	})
 	if err != nil {
 		t.Fatalf("get_media: %v", err)
@@ -114,8 +114,8 @@ func TestGetMediaReturnsImageBlock(t *testing.T) {
 	if !meta.Included || meta.Reason != "" {
 		t.Fatalf("metadata = %+v, want included true and no reason", meta)
 	}
-	if meta.Mimetype != "image/png" || meta.Filename != "pic.png" || meta.MXCURI != "mxc://test/pic" {
-		t.Fatalf("metadata = %+v, want the attachment's type, name and mxc URI", meta)
+	if meta.Mimetype != "image/png" || meta.Filename != "pic.png" || meta.MediaURI != "mxc://test/pic" {
+		t.Fatalf("metadata = %+v, want the attachment's type, name and media URI", meta)
 	}
 	if meta.SizeBytes != int64(len(payload)) {
 		t.Fatalf("metadata size_bytes = %d, want %d", meta.SizeBytes, len(payload))
@@ -158,7 +158,7 @@ func TestGetMediaDownscalesToMaxDimension(t *testing.T) {
 
 	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 		Name:      "get_media",
-		Arguments: map[string]any{"room_id": "!r:test", "event_id": "$img", "max_dimension": 512},
+		Arguments: map[string]any{"chat_id": "!r:test", "message_id": "$img", "max_dimension": 512},
 	})
 	if err != nil {
 		t.Fatalf("get_media: %v", err)
@@ -205,7 +205,7 @@ func TestGetMediaOverBudgetReturnsMetadataOnly(t *testing.T) {
 
 	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 		Name:      "get_media",
-		Arguments: map[string]any{"room_id": "!r:test", "event_id": "$img"},
+		Arguments: map[string]any{"chat_id": "!r:test", "message_id": "$img"},
 	})
 	if err != nil {
 		t.Fatalf("get_media: %v", err)
@@ -223,7 +223,7 @@ func TestGetMediaOverBudgetReturnsMetadataOnly(t *testing.T) {
 	if !strings.Contains(meta.Reason, "budget") {
 		t.Fatalf("reason = %q, want it to explain the inline budget", meta.Reason)
 	}
-	if meta.Mimetype != "image/png" || meta.MXCURI != "mxc://test/pic" || meta.SizeBytes != int64(len(payload)) {
+	if meta.Mimetype != "image/png" || meta.MediaURI != "mxc://test/pic" || meta.SizeBytes != int64(len(payload)) {
 		t.Fatalf("metadata = %+v, want the attachment's metadata even when the payload is dropped", meta)
 	}
 	if meta.Width != 40 || meta.Height != 30 || meta.Downscaled {
@@ -245,7 +245,7 @@ func TestGetMediaAudioBecomesAudioBlock(t *testing.T) {
 
 	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 		Name:      "get_media",
-		Arguments: map[string]any{"room_id": "!r:test", "event_id": "$audio"},
+		Arguments: map[string]any{"chat_id": "!r:test", "message_id": "$audio"},
 	})
 	if err != nil {
 		t.Fatalf("get_media: %v", err)
@@ -282,7 +282,7 @@ func TestGetMediaNonImageReturnsMetadataOnly(t *testing.T) {
 
 	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 		Name:      "get_media",
-		Arguments: map[string]any{"room_id": "!r:test", "event_id": "$doc"},
+		Arguments: map[string]any{"chat_id": "!r:test", "message_id": "$doc"},
 	})
 	if err != nil {
 		t.Fatalf("get_media: %v", err)
@@ -349,7 +349,7 @@ func TestGetMediaTypedErrors(t *testing.T) {
 
 			res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 				Name:      "get_media",
-				Arguments: map[string]any{"room_id": "!r:test", "event_id": "$img"},
+				Arguments: map[string]any{"chat_id": "!r:test", "message_id": "$img"},
 			})
 			if err != nil {
 				t.Fatalf("get_media: %v", err)
@@ -370,7 +370,7 @@ func TestGetMediaRejectsMalformedEventIDBeforeFetching(t *testing.T) {
 
 	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 		Name:      "get_media",
-		Arguments: map[string]any{"room_id": "!r:test", "event_id": "not-an-event"},
+		Arguments: map[string]any{"chat_id": "!r:test", "message_id": "not-an-event"},
 	})
 	if err != nil {
 		t.Fatalf("get_media: %v", err)
@@ -395,7 +395,7 @@ func TestGetMediaClampsMaxDimension(t *testing.T) {
 
 	call := func(maxDimension any) getMediaResult {
 		t.Helper()
-		args := map[string]any{"room_id": "!r:test", "event_id": "$img"}
+		args := map[string]any{"chat_id": "!r:test", "message_id": "$img"}
 		if maxDimension != nil {
 			args["max_dimension"] = maxDimension
 		}
@@ -442,7 +442,7 @@ func TestSendMediaFromPath(t *testing.T) {
 	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 		Name: "send_media",
 		Arguments: map[string]any{
-			"room_id":  "!ok:test",
+			"chat_id":  "!ok:test",
 			"path":     path,
 			"caption":  "look",
 			"reply_to": "$parent",
@@ -455,8 +455,8 @@ func TestSendMediaFromPath(t *testing.T) {
 		t.Fatalf("send_media returned error: %s", resultErrorText(t, res))
 	}
 	got := decodeStructured[sendMediaResult](t, res)
-	if got.EventID != "$mediaSent" || got.Deduplicated || got.MsgType != "m.image" || got.MXCURI != "mxc://test/uploaded" {
-		t.Fatalf("send_media result = %+v, want $mediaSent as m.image at the uploaded mxc URI", got)
+	if got.MessageID != "$mediaSent" || got.Deduplicated || got.Type != "image" || got.MediaURI != "mxc://test/uploaded" {
+		t.Fatalf("send_media result = %+v, want $mediaSent as image at the uploaded media URI", got)
 	}
 
 	sends := svc.mediaSent()
@@ -488,7 +488,7 @@ func TestSendMediaFromBase64(t *testing.T) {
 	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 		Name: "send_media",
 		Arguments: map[string]any{
-			"room_id":     "!ok:test",
+			"chat_id":     "!ok:test",
 			"data_base64": base64.StdEncoding.EncodeToString(payload),
 			"mimetype":    "audio/wav",
 			"filename":    "note.wav",
@@ -501,8 +501,8 @@ func TestSendMediaFromBase64(t *testing.T) {
 		t.Fatalf("send_media returned error: %s", resultErrorText(t, res))
 	}
 	got := decodeStructured[sendMediaResult](t, res)
-	if got.MsgType != "m.audio" {
-		t.Fatalf("msgtype = %q, want m.audio", got.MsgType)
+	if got.Type != "audio" {
+		t.Fatalf("type = %q, want audio", got.Type)
 	}
 	sends := svc.mediaSent()
 	if len(sends) != 1 || !bytes.Equal(sends[0].media.Data, payload) {
@@ -527,42 +527,42 @@ func TestSendMediaRejectsBadPayloadSources(t *testing.T) {
 	}{
 		{
 			name:    "neither source",
-			args:    map[string]any{"room_id": "!ok:test"},
+			args:    map[string]any{"chat_id": "!ok:test"},
 			wantMsg: "pass one of path or data_base64",
 		},
 		{
 			name:    "both sources",
-			args:    map[string]any{"room_id": "!ok:test", "path": "/tmp/x", "data_base64": "aGk=", "mimetype": "image/png"},
+			args:    map[string]any{"chat_id": "!ok:test", "path": "/tmp/x", "data_base64": "aGk=", "mimetype": "image/png"},
 			wantMsg: "exactly one of path and data_base64",
 		},
 		{
 			name:    "relative path",
-			args:    map[string]any{"room_id": "!ok:test", "path": "photo.png"},
+			args:    map[string]any{"chat_id": "!ok:test", "path": "photo.png"},
 			wantMsg: "path must be absolute",
 		},
 		{
 			name:    "missing file",
-			args:    map[string]any{"room_id": "!ok:test", "path": filepath.Join(dir, "nope.png")},
+			args:    map[string]any{"chat_id": "!ok:test", "path": filepath.Join(dir, "nope.png")},
 			wantMsg: "path is not readable",
 		},
 		{
 			name:    "directory",
-			args:    map[string]any{"room_id": "!ok:test", "path": dir},
+			args:    map[string]any{"chat_id": "!ok:test", "path": dir},
 			wantMsg: "is a directory",
 		},
 		{
 			name:    "base64 without mimetype",
-			args:    map[string]any{"room_id": "!ok:test", "data_base64": "aGk="},
+			args:    map[string]any{"chat_id": "!ok:test", "data_base64": "aGk="},
 			wantMsg: "mimetype is required",
 		},
 		{
 			name:    "invalid base64",
-			args:    map[string]any{"room_id": "!ok:test", "data_base64": "not base64!", "mimetype": "image/png"},
+			args:    map[string]any{"chat_id": "!ok:test", "data_base64": "not base64!", "mimetype": "image/png"},
 			wantMsg: "not valid standard base64",
 		},
 		{
 			name:    "malformed reply",
-			args:    map[string]any{"room_id": "!ok:test", "data_base64": "aGk=", "mimetype": "image/png", "reply_to": "nope"},
+			args:    map[string]any{"chat_id": "!ok:test", "data_base64": "aGk=", "mimetype": "image/png", "reply_to": "nope"},
 			wantMsg: "invalid event ID",
 		},
 	}
@@ -604,7 +604,7 @@ func TestSendMediaRefusesOversizedFile(t *testing.T) {
 
 	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 		Name:      "send_media",
-		Arguments: map[string]any{"room_id": "!ok:test", "path": path},
+		Arguments: map[string]any{"chat_id": "!ok:test", "path": path},
 	})
 	if err != nil {
 		t.Fatalf("send_media: %v", err)
@@ -627,7 +627,7 @@ func TestSendMediaAllowlistRejectsWithZeroUploads(t *testing.T) {
 
 			res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 				Name:      "send_media",
-				Arguments: map[string]any{"room_id": "!ok:test", "data_base64": "aGk=", "mimetype": "image/png"},
+				Arguments: map[string]any{"chat_id": "!ok:test", "data_base64": "aGk=", "mimetype": "image/png"},
 			})
 			if err != nil {
 				t.Fatalf("send_media: %v", err)
@@ -653,7 +653,7 @@ func TestSendMediaRateLimited(t *testing.T) {
 	session, cleanup := connect(t, srv)
 	defer cleanup()
 
-	args := map[string]any{"room_id": "!ok:test", "data_base64": "aGk=", "mimetype": "image/png"}
+	args := map[string]any{"chat_id": "!ok:test", "data_base64": "aGk=", "mimetype": "image/png"}
 	first, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "send_media", Arguments: args})
 	if err != nil {
 		t.Fatalf("first send_media: %v", err)
@@ -680,7 +680,7 @@ func TestSendMediaIdempotentReplaySkipsUpload(t *testing.T) {
 	defer cleanup()
 
 	args := map[string]any{
-		"room_id":         "!ok:test",
+		"chat_id":         "!ok:test",
 		"data_base64":     "aGVsbG8=",
 		"mimetype":        "text/plain",
 		"caption":         "hi",
@@ -701,7 +701,7 @@ func TestSendMediaIdempotentReplaySkipsUpload(t *testing.T) {
 		t.Fatalf("replay rejected: %s", resultErrorText(t, second))
 	}
 	replay := decodeStructured[sendMediaResult](t, second)
-	if replay.EventID != "$once" || !replay.Deduplicated {
+	if replay.MessageID != "$once" || !replay.Deduplicated {
 		t.Fatalf("replay = %+v, want $once with deduplicated true", replay)
 	}
 	if sends := svc.mediaSent(); len(sends) != 1 {
@@ -710,7 +710,7 @@ func TestSendMediaIdempotentReplaySkipsUpload(t *testing.T) {
 
 	// The same key with different bytes is a conflict, not a second send.
 	changed := map[string]any{
-		"room_id":         "!ok:test",
+		"chat_id":         "!ok:test",
 		"data_base64":     "ZGlmZmVyZW50",
 		"mimetype":        "text/plain",
 		"caption":         "hi",
@@ -736,7 +736,7 @@ func TestSendMediaSurfacesUpstreamError(t *testing.T) {
 
 	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 		Name:      "send_media",
-		Arguments: map[string]any{"room_id": "!ok:test", "data_base64": "aGk=", "mimetype": "image/png"},
+		Arguments: map[string]any{"chat_id": "!ok:test", "data_base64": "aGk=", "mimetype": "image/png"},
 	})
 	if err != nil {
 		t.Fatalf("send_media: %v", err)

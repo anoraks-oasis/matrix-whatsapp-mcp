@@ -25,6 +25,7 @@ import (
 	"golang.org/x/image/draw"
 
 	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/matrix"
+	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/whatsapp"
 )
 
 const (
@@ -56,9 +57,9 @@ var jpegQualities = []int{85, 75, 65, 55, 45, 35}
 var errMediaUploadTooLarge = errors.New("media is larger than the 50 MiB upload limit")
 
 type getMediaInput struct {
-	RoomID       string `json:"room_id" jsonschema:"the Matrix room ID the event belongs to"`
-	EventID      string `json:"event_id" jsonschema:"the event ID of the message whose attachment to fetch, for example $abc123. It must be a Matrix event ID ($ followed by the ID) or the call is rejected before anything is requested"`
-	MaxDimension int    `json:"max_dimension,omitempty" jsonschema:"the longest edge in pixels an image may have in the returned image block; default 1568, clamped to 256..4096. A larger image is downscaled and the metadata reports downscaled true"`
+	chatRef
+	messageRef
+	MaxDimension int `json:"max_dimension,omitempty" jsonschema:"the longest edge in pixels an image may have in the returned image block; default 1568, clamped to 256..4096. A larger image is downscaled and the metadata reports downscaled true"`
 }
 
 type getMediaResult struct {
@@ -68,7 +69,7 @@ type getMediaResult struct {
 	Width      int    `json:"width,omitempty" jsonschema:"the width in pixels of the image this result describes: the returned image block after downscaling, or the source image when its payload did not fit; absent when the payload is not an image"`
 	Height     int    `json:"height,omitempty" jsonschema:"the height in pixels of the image this result describes: the returned image block after downscaling, or the source image when its payload did not fit; absent when the payload is not an image"`
 	DurationMS int64  `json:"duration_ms,omitempty" jsonschema:"the duration the sender declared for the media, in milliseconds; absent when the sender declared none"`
-	MXCURI     string `json:"mxc_uri" jsonschema:"the Matrix content URI of the attachment, mxc://server/media-id"`
+	MediaURI   string `json:"media_uri" jsonschema:"an opaque reference to the attachment's stored bytes; pass it back to the homeserver's media API when you need the payload outside this tool"`
 	Encrypted  bool   `json:"encrypted" jsonschema:"true when the attachment was end-to-end encrypted and was decrypted before being returned"`
 	Downscaled bool   `json:"downscaled" jsonschema:"true when the returned image was resized or re-encoded smaller to respect max_dimension or the inline budget"`
 	Included   bool   `json:"included" jsonschema:"whether the result also carries the payload as an image or audio content block. False means the text block is the whole answer and reason says why"`
@@ -76,21 +77,21 @@ type getMediaResult struct {
 }
 
 type sendMediaInput struct {
-	RoomID         string `json:"room_id" jsonschema:"the Matrix room ID to send the media to; it must be on the send allowlist"`
+	chatRef
 	Path           string `json:"path,omitempty" jsonschema:"absolute path of a local file to upload. Pass exactly one of path and data_base64. The file must exist, be readable, be a regular file and be at most 50 MiB; its bytes are read into memory and never modified"`
 	DataBase64     string `json:"data_base64,omitempty" jsonschema:"the payload itself as standard base64. Pass exactly one of path and data_base64, and mimetype alongside it. The decoded payload must be at most 50 MiB"`
-	Mimetype       string `json:"mimetype,omitempty" jsonschema:"the payload's MIME type, for example image/jpeg. Required with data_base64; with path it overrides the type detected from the file. It decides the Matrix message type: image/* becomes m.image, video/* m.video, audio/* m.audio, anything else m.file"`
-	Caption        string `json:"caption,omitempty" jsonschema:"text to send as the message body, which WhatsApp shows under the media. When empty the filename is used as the body"`
+	Mimetype       string `json:"mimetype,omitempty" jsonschema:"the payload's MIME type, for example image/jpeg. Required with data_base64; with path it overrides the type detected from the file. It decides the reported type: image/* becomes image, video/* video, audio/* audio, anything else document"`
+	Caption        string `json:"caption,omitempty" jsonschema:"text to send as the message text, which WhatsApp shows under the media. When empty the filename is used as the text"`
 	Filename       string `json:"filename,omitempty" jsonschema:"the filename to record on the message and the upload; default the base name of path, or upload for data_base64"`
-	ReplyTo        string `json:"reply_to,omitempty" jsonschema:"optional event ID of the message this one answers, for example $abc123. It must be a Matrix event ID ($ followed by the ID) or the call is rejected before anything is uploaded. The replied-to message can be in any room; only the target room must be allow-listed"`
-	IdempotencyKey string `json:"idempotency_key,omitempty" jsonschema:"optional key of at most 128 characters that makes a retry safe. A second call with the same key, room and payload within 10 minutes returns the first event ID with deduplicated true and uploads nothing; the same key with a different payload is an error. Keys are held in memory only, so a restart forgets them"`
+	ReplyTo        string `json:"reply_to,omitempty" jsonschema:"optional message ID this one answers, for example $abc123. It must be a Matrix event ID ($ followed by the ID) or the call is rejected before anything is uploaded. The replied-to message can be in any chat; only the target chat must be allow-listed"`
+	IdempotencyKey string `json:"idempotency_key,omitempty" jsonschema:"optional key of at most 128 characters that makes a retry safe. A second call with the same key, chat and payload within 10 minutes returns the first message ID with deduplicated true and uploads nothing; the same key with a different payload is an error. Keys are held in memory only, so a restart forgets them"`
 }
 
 type sendMediaResult struct {
-	EventID      string `json:"event_id" jsonschema:"the Matrix event ID of the sent media message, or of the original send when the call was deduplicated"`
+	MessageID    string `json:"message_id" jsonschema:"the message ID of the sent media message, or of the original send when the call was deduplicated"`
 	Deduplicated bool   `json:"deduplicated" jsonschema:"true when an earlier send with the same idempotency_key was returned instead of uploading and sending again"`
-	MsgType      string `json:"msgtype" jsonschema:"the Matrix message type the media was sent as: m.image, m.video, m.audio or m.file"`
-	MXCURI       string `json:"mxc_uri,omitempty" jsonschema:"the content URI the payload was uploaded to; absent on a deduplicated replay, which uploads nothing"`
+	Type         string `json:"type" jsonschema:"the WhatsApp message type the media was sent as: image, video, audio or document"`
+	MediaURI     string `json:"media_uri,omitempty" jsonschema:"the opaque reference the payload was uploaded to; absent on a deduplicated replay, which uploads nothing"`
 }
 
 // handleGetMedia answers one attachment as metadata plus, when it qualifies, an
@@ -98,10 +99,10 @@ type sendMediaResult struct {
 // a caller that cannot use a payload still learns what the attachment is and
 // why the payload is missing.
 func (s *Server) handleGetMedia(ctx context.Context, _ *mcp.CallToolRequest, in getMediaInput) (*mcp.CallToolResult, getMediaResult, error) {
-	if !matrix.ValidEventID(in.EventID) {
-		return nil, getMediaResult{}, fmt.Errorf("%w: event_id must be a Matrix event ID, a $ sigil followed by the ID", matrix.ErrInvalidEventID)
+	if !matrix.ValidEventID(in.messageID()) {
+		return nil, getMediaResult{}, fmt.Errorf("%w: message_id must be a Matrix event ID, a $ sigil followed by the ID", matrix.ErrInvalidEventID)
 	}
-	att, err := s.matrix.Media(ctx, in.RoomID, in.EventID)
+	att, err := s.matrix.Media(ctx, in.chatRef.chatID(), in.messageID())
 	if err != nil {
 		return nil, getMediaResult{}, err
 	}
@@ -114,7 +115,7 @@ func (s *Server) handleGetMedia(ctx context.Context, _ *mcp.CallToolRequest, in 
 		Filename:   att.Filename,
 		SizeBytes:  int64(len(att.Data)),
 		DurationMS: att.DurationMS,
-		MXCURI:     att.MXCURI,
+		MediaURI:   att.MXCURI,
 		Encrypted:  att.Encrypted,
 	}
 	block, width, height, downscaled, reason, err := s.inlineMedia(att.Data, mimeType, clampMediaDimension(in.MaxDimension))
@@ -329,6 +330,7 @@ type outgoingMedia struct {
 // source, a path that is not an absolute readable file — happens before the
 // idempotency key is claimed and before the rate-limit token is spent.
 func (s *Server) handleSendMedia(ctx context.Context, _ *mcp.CallToolRequest, in sendMediaInput) (*mcp.CallToolResult, sendMediaResult, error) {
+	chatID := in.chatID()
 	if in.ReplyTo != "" && !matrix.ValidEventID(in.ReplyTo) {
 		return nil, sendMediaResult{}, fmt.Errorf("%w: reply_to must be a Matrix event ID, a $ sigil followed by the ID", matrix.ErrInvalidEventID)
 	}
@@ -346,25 +348,25 @@ func (s *Server) handleSendMedia(ctx context.Context, _ *mcp.CallToolRequest, in
 	// same key with different bytes is a conflict rather than a replay.
 	var claim *sendClaim
 	if in.IdempotencyKey != "" {
-		c, err := s.sends.claim(ctx, in.IdempotencyKey, in.RoomID, mediaFingerprint(media, in))
+		c, err := s.sends.claim(ctx, in.IdempotencyKey, chatID, mediaFingerprint(media, in))
 		if err != nil {
 			return nil, sendMediaResult{}, err
 		}
 		if c.replayed {
 			return nil, sendMediaResult{
-				EventID:      c.eventID,
+				MessageID:    c.eventID,
 				Deduplicated: true,
-				MsgType:      string(matrix.MediaMessageType(media.mimeType)),
+				Type:         whatsapp.Type(string(matrix.MediaMessageType(media.mimeType))),
 			}, nil
 		}
 		claim = c
 		defer s.sends.release(claim)
 	}
 
-	if err := s.gate.check(in.RoomID); err != nil {
+	if err := s.gate.check(chatID); err != nil {
 		return nil, sendMediaResult{}, err
 	}
-	sent, err := s.matrix.SendMedia(ctx, in.RoomID, matrix.MediaUpload{
+	sent, err := s.matrix.SendMedia(ctx, chatID, matrix.MediaUpload{
 		Data:     media.data,
 		MimeType: media.mimeType,
 		Filename: media.filename,
@@ -375,7 +377,7 @@ func (s *Server) handleSendMedia(ctx context.Context, _ *mcp.CallToolRequest, in
 	if claim != nil {
 		s.sends.settle(claim, sent.EventID)
 	}
-	return nil, sendMediaResult{EventID: sent.EventID, MsgType: sent.MsgType, MXCURI: sent.MXCURI}, nil
+	return nil, sendMediaResult{MessageID: sent.EventID, Type: whatsapp.Type(sent.MsgType), MediaURI: sent.MXCURI}, nil
 }
 
 // loadOutgoingMedia validates the payload source and reads it into memory. It

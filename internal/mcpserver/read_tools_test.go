@@ -30,7 +30,7 @@ func TestSearchMessagesTool(t *testing.T) {
 
 	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 		Name:      "search_messages",
-		Arguments: map[string]any{"query": "  dinner  ", "room_id": "!r:test", "limit": 5, "since_timestamp": 50},
+		Arguments: map[string]any{"query": "  dinner  ", "chat_id": "!r:test", "limit": 5, "since": 50},
 	})
 	if err != nil {
 		t.Fatalf("search_messages: %v", err)
@@ -42,16 +42,16 @@ func TestSearchMessagesTool(t *testing.T) {
 	if len(got.Results) != 2 {
 		t.Fatalf("results = %d, want 2", len(got.Results))
 	}
-	if got.Results[0].EventID != "$b" || got.Results[1].EventID != "$a" {
+	if got.Results[0].MessageID != "$b" || got.Results[1].MessageID != "$a" {
 		t.Fatalf("results = %+v, want newest first as the Matrix layer returned them", got.Results)
 	}
-	if got.Results[0].RoomName != "Family" || got.Results[0].Body != "dinner tomorrow" || got.Results[0].MsgType != "m.text" {
-		t.Fatalf("hit = %+v, want the message shape plus room_name", got.Results[0])
+	if got.Results[0].ChatName != "Family" || got.Results[0].Text != "dinner tomorrow" || got.Results[0].Type != "text" {
+		t.Fatalf("hit = %+v, want the message shape plus chat_name", got.Results[0])
 	}
 	if got.Results[1].ReplyTo != "$parent" {
 		t.Fatalf("hit reply_to = %q, want $parent carried through", got.Results[1].ReplyTo)
 	}
-	if !got.Truncated || got.ScannedRooms != 3 || got.ScannedEvents != 42 {
+	if !got.Truncated || got.ScannedChats != 3 || got.ScannedMessages != 42 {
 		t.Fatalf("envelope = %+v, want truncated and the scan counts passed through", got)
 	}
 	if got.Source != matrix.SearchSourceScan {
@@ -189,7 +189,7 @@ func TestGetMessageContextTool(t *testing.T) {
 
 	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 		Name:      "get_message_context",
-		Arguments: map[string]any{"room_id": "!r:test", "event_id": "$t"},
+		Arguments: map[string]any{"chat_id": "!r:test", "message_id": "$t"},
 	})
 	if err != nil {
 		t.Fatalf("get_message_context: %v", err)
@@ -198,19 +198,19 @@ func TestGetMessageContextTool(t *testing.T) {
 		t.Fatalf("get_message_context returned error: %s", resultErrorText(t, res))
 	}
 	got := decodeStructured[getMessageContextResult](t, res)
-	if got.Event.EventID != "$t" || got.Event.Body != "the target" {
+	if got.Event.MessageID != "$t" || got.Event.Text != "the target" {
 		t.Fatalf("event = %+v, want the target in the message shape", got.Event)
 	}
-	if len(got.EventsBefore) != 1 || got.EventsBefore[0].EventID != "$b1" {
+	if len(got.EventsBefore) != 1 || got.EventsBefore[0].MessageID != "$b1" {
 		t.Fatalf("events_before = %+v, want [$b1]", got.EventsBefore)
 	}
-	if len(got.EventsAfter) != 1 || got.EventsAfter[0].EventID != "$a1" {
+	if len(got.EventsAfter) != 1 || got.EventsAfter[0].MessageID != "$a1" {
 		t.Fatalf("events_after = %+v, want [$a1]", got.EventsAfter)
 	}
-	if got.ReplyTo == nil || got.ReplyTo.EventID != "$parent" || got.ReplyTo.Body != "the parent" {
+	if got.ReplyTo == nil || got.ReplyTo.MessageID != "$parent" || got.ReplyTo.Text != "the parent" {
 		t.Fatalf("reply_to = %+v, want the parent resolved to a full message", got.ReplyTo)
 	}
-	if got.EditOf == nil || got.EditOf.EventID != "$orig" {
+	if got.EditOf == nil || got.EditOf.MessageID != "$orig" {
 		t.Fatalf("edit_of = %+v, want the edited message resolved", got.EditOf)
 	}
 	if got.Source != matrix.ContextSourceEndpoint || got.Truncated {
@@ -243,7 +243,7 @@ func TestGetMessageContextToolLimits(t *testing.T) {
 			session, cleanup := connect(t, srv)
 			defer cleanup()
 
-			args := map[string]any{"room_id": "!r:test", "event_id": "$t"}
+			args := map[string]any{"chat_id": "!r:test", "message_id": "$t"}
 			if tc.before != nil {
 				args["limit_before"] = tc.before
 			}
@@ -274,7 +274,7 @@ func TestGetMessageContextToolRejectsMalformedEvent(t *testing.T) {
 	for _, bad := range []string{"", "abc", "$", "$a b"} {
 		res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 			Name:      "get_message_context",
-			Arguments: map[string]any{"room_id": "!r:test", "event_id": bad},
+			Arguments: map[string]any{"chat_id": "!r:test", "message_id": bad},
 		})
 		if err != nil {
 			t.Fatalf("get_message_context(event_id=%q): %v", bad, err)
@@ -297,7 +297,7 @@ func TestGetMessageContextToolErrorAndCancellation(t *testing.T) {
 
 		res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 			Name:      "get_message_context",
-			Arguments: map[string]any{"room_id": "!r:test", "event_id": "$missing"},
+			Arguments: map[string]any{"chat_id": "!r:test", "message_id": "$missing"},
 		})
 		if err != nil {
 			t.Fatalf("get_message_context: %v", err)
@@ -312,13 +312,13 @@ func TestGetMessageContextToolErrorAndCancellation(t *testing.T) {
 		s := &Server{matrix: svc}
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		if _, _, err := s.handleMessageContext(ctx, nil, getMessageContextInput{RoomID: "!r:test", EventID: "$t"}); !errors.Is(err, context.Canceled) {
+		if _, _, err := s.handleMessageContext(ctx, nil, getMessageContextInput{chatRef: chatRef{ChatID: "!r:test"}, messageRef: messageRef{MessageID: "$t"}}); !errors.Is(err, context.Canceled) {
 			t.Fatalf("handler error = %v, want context.Canceled", err)
 		}
 	})
 }
 
-func TestListParticipantsTool(t *testing.T) {
+func TestListChatContactsTool(t *testing.T) {
 	svc := &fakeMatrix{parts: []matrix.Participant{
 		{UserID: "@alice:test", DisplayName: "Alice", Membership: "join"},
 		{UserID: "@whatsapp_15551234567:test", DisplayName: "Bob (WA)", Membership: "join", Bridged: true, BridgeKind: matrix.BridgeKindContact},
@@ -329,37 +329,37 @@ func TestListParticipantsTool(t *testing.T) {
 	defer cleanup()
 
 	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
-		Name:      "list_participants",
-		Arguments: map[string]any{"room_id": "!r:test"},
+		Name:      "list_chat_contacts",
+		Arguments: map[string]any{"chat_id": "!r:test"},
 	})
 	if err != nil {
-		t.Fatalf("list_participants: %v", err)
+		t.Fatalf("list_chat_contacts: %v", err)
 	}
 	if res.IsError {
-		t.Fatalf("list_participants returned error: %s", resultErrorText(t, res))
+		t.Fatalf("list_chat_contacts returned error: %s", resultErrorText(t, res))
 	}
-	got := decodeStructured[listParticipantsResult](t, res)
-	if len(got.Participants) != 3 {
-		t.Fatalf("participants = %d, want 3", len(got.Participants))
+	got := decodeStructured[listChatContactsResult](t, res)
+	if len(got.Contacts) != 3 {
+		t.Fatalf("contacts = %d, want 3", len(got.Contacts))
 	}
-	if got.Participants[0].UserID != "@alice:test" || got.Participants[0].Bridged || got.Participants[0].BridgeKind != "" {
-		t.Fatalf("plain member = %+v, want no bridge kind", got.Participants[0])
+	if got.Contacts[0].UserID != "@alice:test" || got.Contacts[0].WhatsApp || got.Contacts[0].ContactType != "matrix_user" {
+		t.Fatalf("plain member = %+v, want matrix_user", got.Contacts[0])
 	}
-	if got.Participants[1].BridgeKind != matrix.BridgeKindContact || !got.Participants[1].Bridged {
-		t.Fatalf("ghost = %+v, want a bridged whatsapp_contact", got.Participants[1])
+	if got.Contacts[1].ContactType != matrix.BridgeKindContact || !got.Contacts[1].WhatsApp {
+		t.Fatalf("contact = %+v, want a whatsapp_contact", got.Contacts[1])
 	}
-	if got.Participants[2].BridgeKind != matrix.BridgeKindBot {
-		t.Fatalf("bot = %+v, want whatsapp_bot", got.Participants[2])
+	if got.Contacts[2].ContactType != matrix.BridgeKindBot {
+		t.Fatalf("bridge bot = %+v, want bridge_bot", got.Contacts[2])
 	}
-	if got.Participants[0].Membership != "join" || got.Participants[0].DisplayName != "Alice" {
-		t.Fatalf("plain member = %+v, want membership and display name carried", got.Participants[0])
+	if got.Contacts[0].Membership != "join" || got.Contacts[0].DisplayName != "Alice" {
+		t.Fatalf("plain member = %+v, want membership and display name carried", got.Contacts[0])
 	}
 	if len(svc.partsRoom) != 1 || svc.partsRoom[0] != "!r:test" {
-		t.Fatalf("matrix saw rooms %v, want [!r:test]", svc.partsRoom)
+		t.Fatalf("matrix saw chats %v, want [!r:test]", svc.partsRoom)
 	}
 }
 
-func TestListParticipantsToolErrorAndCancellation(t *testing.T) {
+func TestListChatContactsToolErrorAndCancellation(t *testing.T) {
 	t.Run("matrix error surfaces", func(t *testing.T) {
 		svc := &fakeMatrix{partsErr: matrix.ErrInvalidRoomID}
 		srv := New(svc, &fakeProber{}, &fakeRecent{}, nil)
@@ -367,11 +367,11 @@ func TestListParticipantsToolErrorAndCancellation(t *testing.T) {
 		defer cleanup()
 
 		res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
-			Name:      "list_participants",
-			Arguments: map[string]any{"room_id": "not-a-room"},
+			Name:      "list_chat_contacts",
+			Arguments: map[string]any{"chat_id": "not-a-room"},
 		})
 		if err != nil {
-			t.Fatalf("list_participants: %v", err)
+			t.Fatalf("list_chat_contacts: %v", err)
 		}
 		if text := resultErrorText(t, res); !strings.Contains(text, "invalid room ID") {
 			t.Fatalf("error = %q, want the invalid-room error", text)
@@ -383,7 +383,7 @@ func TestListParticipantsToolErrorAndCancellation(t *testing.T) {
 		s := &Server{matrix: svc}
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		if _, _, err := s.handleListParticipants(ctx, nil, listParticipantsInput{RoomID: "!r:test"}); !errors.Is(err, context.Canceled) {
+		if _, _, err := s.handleListChatContacts(ctx, nil, listChatContactsInput{chatRef: chatRef{ChatID: "!r:test"}}); !errors.Is(err, context.Canceled) {
 			t.Fatalf("handler error = %v, want context.Canceled", err)
 		}
 	})
@@ -392,7 +392,7 @@ func TestListParticipantsToolErrorAndCancellation(t *testing.T) {
 // TestInitializeInstructionsNameBothAllowlistSources is R4's regression: the
 // instructions are the first thing an MCP client reads, and a client told that
 // only ALLOWED_SEND_ROOMS permits sending concludes that a room enrolled with
-// `rooms allow` is unsendable — the workflow this release added.
+// `chats allow` is unsendable — the workflow this release added.
 func TestInitializeInstructionsNameBothAllowlistSources(t *testing.T) {
 	srv := New(&fakeMatrix{}, &fakeProber{}, &fakeRecent{}, nil)
 	session, cleanup := connect(t, srv)
@@ -412,7 +412,7 @@ func TestInitializeInstructionsNameBothAllowlistSources(t *testing.T) {
 	}
 }
 
-// TestTriggerDescriptionStatesTheBuffer pins get_recent_triggers' description to
+// TestTriggerDescriptionStatesTheBuffer pins get_new_messages' description to
 // the ring buffer it describes: the capacity comes from trigger.BufferSize, and
 // the in-memory, restart-clearing nature of the buffer is what a caller needs
 // to know before treating the list as history.
@@ -425,10 +425,10 @@ func TestTriggerDescriptionStatesTheBuffer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tools/list: %v", err)
 	}
-	desc := toolByName(t, res.Tools, "get_recent_triggers").Description
+	desc := toolByName(t, res.Tools, "get_new_messages").Description
 	for _, want := range []string{fmt.Sprint(trigger.BufferSize), "in-memory", "restart", "since_timestamp"} {
 		if !strings.Contains(desc, want) {
-			t.Fatalf("get_recent_triggers description = %q, want it to state %q", desc, want)
+			t.Fatalf("get_new_messages description = %q, want it to state %q", desc, want)
 		}
 	}
 }

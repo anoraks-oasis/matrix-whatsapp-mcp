@@ -534,7 +534,7 @@ func TestMessagesPagesPastNonMessageEvents(t *testing.T) {
 }
 
 // TestMessagesPaginationIsBounded proves the two hard bounds: page count and
-// raw events scanned, so a room that converts nothing cannot make read_messages
+// raw entries scanned, so a chat that converts nothing cannot make get_messages
 // walk forever.
 func TestMessagesPaginationIsBounded(t *testing.T) {
 	t.Run("page cap", func(t *testing.T) {
@@ -611,7 +611,7 @@ func TestMessagesMediaPlaceholder(t *testing.T) {
 		"$img":  "[image]",
 		"$txt":  "hello there",
 		"$cap":  "a caption",
-		"$file": "[file]",
+		"$file": "[document]",
 		"$note": "",
 	}
 	wantTypes := map[string]string{

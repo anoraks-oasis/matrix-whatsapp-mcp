@@ -288,7 +288,7 @@ func TestHandleMediaPlaceholderAndMsgType(t *testing.T) {
 		{"image with empty body", event.MsgImage, "", "[image]", "m.image"},
 		{"video with empty body", event.MsgVideo, "", "[video]", "m.video"},
 		{"audio with empty body", event.MsgAudio, "", "[audio]", "m.audio"},
-		{"file with empty body", event.MsgFile, "", "[file]", "m.file"},
+		{"file with empty body", event.MsgFile, "", "[document]", "m.file"},
 		{"image with caption", event.MsgImage, "a caption", "a caption", "m.image"},
 		{"text keeps its body", event.MsgText, "hello there", "hello there", "m.text"},
 	}

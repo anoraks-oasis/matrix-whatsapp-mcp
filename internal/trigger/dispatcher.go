@@ -14,12 +14,13 @@ import (
 	"net/http"
 	"net/url"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
+
+	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/whatsapp"
 )
 
 const (
@@ -132,17 +133,11 @@ func (d *Dispatcher) Handle(_ context.Context, evt *event.Event) {
 
 // bodyOrPlaceholder substitutes a short bracketed marker for a media event
 // with no text body, derived from the msgtype alone. Text-like bodies are
-// returned verbatim. It mirrors the rule in internal/matrix so a trigger and
-// the corresponding read_messages entry describe the same event identically.
+// returned verbatim. It is internal/whatsapp's rule, the same one
+// internal/matrix applies, so a trigger and the corresponding get_messages
+// entry describe the same message identically.
 func bodyOrPlaceholder(msgtype event.MessageType, body string) string {
-	if body != "" {
-		return body
-	}
-	switch msgtype {
-	case event.MsgText, event.MsgNotice, event.MsgEmote, "":
-		return body
-	}
-	return "[" + strings.TrimPrefix(string(msgtype), "m.") + "]"
+	return whatsapp.Body(string(msgtype), body)
 }
 
 func (d *Dispatcher) record(t Trigger) bool {

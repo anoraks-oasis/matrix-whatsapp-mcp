@@ -22,11 +22,11 @@ const (
 	// rendered into Matrix by the bridge.
 	BridgeKindContact = "whatsapp_contact"
 	// BridgeKindBot is the bridge's own bot account.
-	BridgeKindBot = "whatsapp_bot"
+	BridgeKindBot = "bridge_bot"
 )
 
 const (
-	// participantTimeout bounds one list_participants call, including the
+	// participantTimeout bounds one list_chat_contacts call, including the
 	// best-effort profile lookups it makes for members without a display name.
 	participantTimeout = 10 * time.Second
 	// profileTimeout and profileParallel bound those lookups individually and
@@ -41,8 +41,8 @@ const (
 // not follow the bridge's naming convention.
 var bridgeMarkerKeys = []string{"uk.half-shot.bridge", "m.bridge", "fi.mau.bridge"}
 
-// Participant is one joined member of a room. Bridged and BridgeKind come from
-// the same heuristic that list_rooms uses for rooms (see classifyBridgeUser);
+// Participant is one joined member of a chat. Bridged and BridgeKind come from
+// the same heuristic that list_chats uses for chats (see classifyBridgeUser);
 // Membership is the membership the room reports, which is "join" for every
 // member of this list.
 type Participant struct {
@@ -151,8 +151,8 @@ func (c *Client) fillDisplayNames(ctx context.Context, parts []Participant) {
 }
 
 // classifyBridgeUser is the single bridge-naming heuristic in this package: it
-// is what both IsBridged (through the room's members) and list_participants use,
-// so a room and its members can never disagree about what a WhatsApp ghost is.
+// is what both IsBridged (through the chat's members) and list_chat_contacts use,
+// so a chat and its contacts can never disagree about what a WhatsApp ghost is.
 // A localpart starting with whatsapp_ (a phone-number ghost) or with
 // whatsapp_lid-/whatsapp-lid- (a LID ghost, whichever separator the bridge
 // chose) is a contact ghost, a localpart that starts with whatsapp and ends

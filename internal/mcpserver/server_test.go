@@ -403,71 +403,90 @@ func TestToolsListHasNineToolsWithSchemas(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListTools: %v", err)
 	}
-	if len(res.Tools) != 9 {
-		t.Fatalf("ListTools returned %d tools, want 9", len(res.Tools))
+	want := []string{
+		"list_chats", "get_messages", "search_messages", "get_message_context",
+		"list_chat_contacts", "get_media", "get_new_messages", "send_message", "send_media",
+	}
+	if len(res.Tools) != len(want) {
+		t.Fatalf("ListTools returned %d tools, want %d", len(res.Tools), len(want))
 	}
 	names := make(map[string]bool, len(res.Tools))
 	for _, tool := range res.Tools {
 		names[tool.Name] = true
 	}
-	for _, want := range []string{
-		"list_rooms", "read_messages", "search_messages", "get_message_context",
-		"list_participants", "get_media", "get_recent_triggers", "send_message", "send_media",
-	} {
-		if !names[want] {
-			t.Fatalf("ListTools missing %q (got %v)", want, names)
+	for _, name := range want {
+		if !names[name] {
+			t.Fatalf("ListTools missing %q (got %v)", name, names)
+		}
+	}
+	for _, old := range []string{"list_rooms", "read_messages", "list_participants", "get_recent_triggers"} {
+		if names[old] {
+			t.Fatalf("ListTools still exposes the Matrix-era tool name %q", old)
 		}
 	}
 
-	listRooms := schemaMap(t, toolByName(t, res.Tools, "list_rooms"))
-	if len(requiredFields(t, listRooms)) != 0 {
-		t.Fatalf("list_rooms required = %v, want none", requiredFields(t, listRooms))
+	listChats := schemaMap(t, toolByName(t, res.Tools, "list_chats"))
+	if len(requiredFields(t, listChats)) != 0 {
+		t.Fatalf("list_chats required = %v, want none", requiredFields(t, listChats))
 	}
 
-	readTool := toolByName(t, res.Tools, "read_messages")
+	// get_messages: a chat to read (with its deprecated alias), an optional
+	// page size and cursor, and a message shape that names every field a
+	// reader needs.
+	readTool := toolByName(t, res.Tools, "get_messages")
 	read := schemaMap(t, readTool)
-	hasField(t, read, "room_id")
-	// read_messages must describe the type of every message it returns, so a
-	// media event is never a blank body with no hint about what it was, and
-	// every relation that makes a reply, an edit or a deletion readable.
-	for _, field := range []string{
-		"msgtype", "encrypted", "body", "reply_to", "edit_of", "mentions", "redacted",
-		"mimetype", "filename", "size_bytes", "width", "height", "duration_ms", "mxc_uri",
-	} {
-		if _, ok := messageProperties(t, readTool)[field]; !ok {
-			t.Fatalf("read_messages message schema has no %q property", field)
+	readProps := schemaProperties(t, read)
+	for _, field := range []string{"chat_id", "room_id", "limit", "before"} {
+		if _, ok := readProps[field]; !ok {
+			t.Fatalf("get_messages schema has no %q property", field)
 		}
+	}
+	if desc, _ := readProps["room_id"].(map[string]any)["description"].(string); !strings.Contains(desc, "deprecated alias") {
+		t.Fatalf("get_messages room_id description = %q, want it documented as a deprecated alias of chat_id", desc)
+	}
+	messageFields := []string{
+		"chat_id", "message_id", "from", "text", "type", "timestamp", "encrypted",
+		"reply_to", "edit_of", "mentions", "deleted",
+		"mimetype", "filename", "size_bytes", "width", "height", "duration_ms", "media_uri",
+	}
+	msgProps := messageProperties(t, readTool)
+	for _, field := range messageFields {
+		if _, ok := msgProps[field]; !ok {
+			t.Fatalf("get_messages message schema has no %q property", field)
+		}
+	}
+	if desc, _ := msgProps["type"].(map[string]any)["description"].(string); !strings.Contains(desc, "text, image, video, audio, document, sticker, location, or other") {
+		t.Fatalf("message type description = %q, want the WhatsApp type list", desc)
 	}
 	// Pagination lives in the output envelope, next to the messages it pages.
 	for _, field := range []string{"messages", "next_token", "has_more"} {
 		if _, ok := envelopeProperties(t, readTool)[field]; !ok {
-			t.Fatalf("read_messages output schema has no %q property", field)
+			t.Fatalf("get_messages output schema has no %q property", field)
 		}
 	}
-	readProps := read["properties"].(map[string]any)
 	limit := readProps["limit"].(map[string]any)
 	if limit["type"] != "integer" {
-		t.Fatalf("read_messages limit type = %v, want integer", limit["type"])
+		t.Fatalf("get_messages limit type = %v, want integer", limit["type"])
 	}
 	if desc, _ := limit["description"].(string); !strings.Contains(desc, "default 20") || !strings.Contains(desc, "100") {
-		t.Fatalf("read_messages limit description = %q, want it to document default 20 and max 100", desc)
+		t.Fatalf("get_messages limit description = %q, want it to document default 20 and max 100", desc)
 	}
 	before := readProps["before"].(map[string]any)
 	if before["type"] != "string" {
-		t.Fatalf("read_messages before type = %v, want string", before["type"])
+		t.Fatalf("get_messages before type = %v, want string", before["type"])
 	}
 	if desc, _ := before["description"].(string); !strings.Contains(desc, "next_token") {
-		t.Fatalf("read_messages before description = %q, want it to name next_token", desc)
+		t.Fatalf("get_messages before description = %q, want it to name next_token", desc)
 	}
 
-	// search_messages: one required query, an optional room scope, limit and
+	// search_messages: one required query, an optional chat scope, limit and
 	// date bound, and a result envelope that says how partial the answer is.
 	searchTool := toolByName(t, res.Tools, "search_messages")
 	search := schemaMap(t, searchTool)
 	if req := requiredFields(t, search); len(req) != 1 || req[0] != "query" {
 		t.Fatalf("search_messages required = %v, want [query]", req)
 	}
-	searchProps := search["properties"].(map[string]any)
+	searchProps := schemaProperties(t, search)
 	query, ok := searchProps["query"].(map[string]any)
 	if !ok || query["type"] != "string" {
 		t.Fatalf("search_messages query = %v, want a string", searchProps["query"])
@@ -475,13 +494,18 @@ func TestToolsListHasNineToolsWithSchemas(t *testing.T) {
 	if desc, _ := query["description"].(string); !strings.Contains(desc, "512") {
 		t.Fatalf("search_messages query description = %q, want the 512-character cap", desc)
 	}
-	for _, field := range []string{"room_id", "limit", "since_timestamp"} {
+	for _, field := range []string{"chat_id", "room_id", "limit", "since", "since_timestamp"} {
 		prop, ok := searchProps[field].(map[string]any)
 		if !ok {
 			t.Fatalf("search_messages schema has no %q property", field)
 		}
 		if desc, _ := prop["description"].(string); desc == "" {
 			t.Fatalf("search_messages %s has no description", field)
+		}
+	}
+	for _, alias := range []string{"room_id", "since_timestamp"} {
+		if desc, _ := searchProps[alias].(map[string]any)["description"].(string); !strings.Contains(desc, "deprecated alias") {
+			t.Fatalf("search_messages %s description = %q, want it documented as a deprecated alias", alias, desc)
 		}
 	}
 	searchLimit := searchProps["limit"].(map[string]any)
@@ -491,8 +515,8 @@ func TestToolsListHasNineToolsWithSchemas(t *testing.T) {
 	if desc, _ := searchLimit["description"].(string); !strings.Contains(desc, "default 20") || !strings.Contains(desc, "100") {
 		t.Fatalf("search_messages limit description = %q, want default 20 and max 100", desc)
 	}
-	if since := searchProps["since_timestamp"].(map[string]any); since["type"] != "integer" {
-		t.Fatalf("search_messages since_timestamp type = %v, want integer", since["type"])
+	if since := searchProps["since"].(map[string]any); since["type"] != "integer" {
+		t.Fatalf("search_messages since type = %v, want integer", since["type"])
 	}
 	// The budget in the description must be the budget the code enforces: both
 	// numbers come from the same constants.
@@ -502,13 +526,15 @@ func TestToolsListHasNineToolsWithSchemas(t *testing.T) {
 		fmt.Sprint(matrix.SearchMaxRooms),
 		fmt.Sprint(matrix.SearchMaxRooms * matrix.SearchEventsPerRoom),
 		"truncated",
+		"scanned_chats",
+		"scanned_messages",
 	} {
 		if !strings.Contains(searchDesc, want) {
 			t.Fatalf("search_messages description = %q, want it to state %q", searchDesc, want)
 		}
 	}
 	searchOut := envelopeProperties(t, searchTool)
-	for _, field := range []string{"results", "truncated", "scanned_rooms", "scanned_events", "source"} {
+	for _, field := range []string{"results", "truncated", "scanned_chats", "scanned_messages", "source"} {
 		if _, ok := searchOut[field]; !ok {
 			t.Fatalf("search_messages output schema has no %q property", field)
 		}
@@ -518,25 +544,30 @@ func TestToolsListHasNineToolsWithSchemas(t *testing.T) {
 		t.Fatalf("search_messages results schema has no items object")
 	}
 	hitProps := hitItems["properties"].(map[string]any)
-	for _, field := range []string{
-		"event_id", "room_id", "sender", "body", "msgtype", "timestamp", "encrypted",
-		"reply_to", "edit_of", "mentions", "redacted", "room_name",
-		"mimetype", "filename", "size_bytes", "width", "height", "duration_ms", "mxc_uri",
-	} {
+	for _, field := range append(append([]string{}, messageFields...), "chat_name") {
 		if _, ok := hitProps[field]; !ok {
-			t.Fatalf("search_messages result has no %q property (a match carries the whole message plus its room)", field)
+			t.Fatalf("search_messages result has no %q property (a match carries the whole message plus its chat)", field)
 		}
 	}
 
-	// get_message_context: room and event required, both limits optional so an
-	// explicit 0 can mean "none".
+	// get_message_context: a chat and a message, both with aliases, and both
+	// limits optional so an explicit 0 can mean "none".
 	contextTool := toolByName(t, res.Tools, "get_message_context")
 	contextSchema := schemaMap(t, contextTool)
-	contextReq := requiredFields(t, contextSchema)
-	if len(contextReq) != 2 || contextReq[0] != "room_id" || contextReq[1] != "event_id" {
-		t.Fatalf("get_message_context required = %v, want [room_id event_id]", contextReq)
+	if req := requiredFields(t, contextSchema); len(req) != 0 {
+		t.Fatalf("get_message_context required = %v, want none (chat and message accept aliases)", req)
 	}
-	contextProps := contextSchema["properties"].(map[string]any)
+	contextProps := schemaProperties(t, contextSchema)
+	for _, field := range []string{"chat_id", "room_id", "message_id", "event_id"} {
+		if _, ok := contextProps[field]; !ok {
+			t.Fatalf("get_message_context schema has no %q property", field)
+		}
+	}
+	for _, alias := range []string{"room_id", "event_id"} {
+		if desc, _ := contextProps[alias].(map[string]any)["description"].(string); !strings.Contains(desc, "deprecated alias") {
+			t.Fatalf("get_message_context %s description = %q, want it documented as a deprecated alias", alias, desc)
+		}
+	}
 	for _, field := range []string{"limit_before", "limit_after"} {
 		prop, ok := contextProps[field].(map[string]any)
 		if !ok {
@@ -559,42 +590,53 @@ func TestToolsListHasNineToolsWithSchemas(t *testing.T) {
 	if !ok {
 		t.Fatalf("get_message_context event schema is %T, want an object", contextOut["event"])
 	}
-	if _, ok := target["properties"].(map[string]any)["event_id"]; !ok {
-		t.Fatal("get_message_context event schema carries no event_id: the target must use the message shape")
+	if _, ok := target["properties"].(map[string]any)["message_id"]; !ok {
+		t.Fatal("get_message_context event schema carries no message_id: the target must use the message shape")
 	}
 
-	// list_participants: one required room, and every participant field in the
-	// output schema.
-	participantsTool := toolByName(t, res.Tools, "list_participants")
-	participantsSchema := schemaMap(t, participantsTool)
-	if req := requiredFields(t, participantsSchema); len(req) != 1 || req[0] != "room_id" {
-		t.Fatalf("list_participants required = %v, want [room_id]", req)
+	// list_chat_contacts: one chat (with its alias), and every contact field in
+	// the output schema.
+	contactsTool := toolByName(t, res.Tools, "list_chat_contacts")
+	contactsSchema := schemaMap(t, contactsTool)
+	if req := requiredFields(t, contactsSchema); len(req) != 0 {
+		t.Fatalf("list_chat_contacts required = %v, want none (the chat accepts an alias)", req)
 	}
-	participantsOut := envelopeProperties(t, participantsTool)
-	pItems, ok := participantsOut["participants"].(map[string]any)["items"].(map[string]any)
-	if !ok {
-		t.Fatalf("list_participants output schema has no participants items object")
-	}
-	pProps := pItems["properties"].(map[string]any)
-	for _, field := range []string{"user_id", "display_name", "membership", "bridged", "bridge_kind"} {
-		if _, ok := pProps[field]; !ok {
-			t.Fatalf("list_participants participant schema has no %q property", field)
+	for _, field := range []string{"chat_id", "room_id"} {
+		if _, ok := schemaProperties(t, contactsSchema)[field]; !ok {
+			t.Fatalf("list_chat_contacts schema has no %q property", field)
 		}
 	}
-	if desc, _ := pProps["bridge_kind"].(map[string]any)["description"].(string); !strings.Contains(desc, "whatsapp_contact") || !strings.Contains(desc, "whatsapp_bot") {
-		t.Fatalf("bridge_kind description = %q, want it to name both bridge kinds", desc)
+	contactsOut := envelopeProperties(t, contactsTool)
+	cItems, ok := contactsOut["contacts"].(map[string]any)["items"].(map[string]any)
+	if !ok {
+		t.Fatalf("list_chat_contacts output schema has no contacts items object")
+	}
+	cProps := cItems["properties"].(map[string]any)
+	for _, field := range []string{"user_id", "display_name", "membership", "whatsapp", "contact_type"} {
+		if _, ok := cProps[field]; !ok {
+			t.Fatalf("list_chat_contacts contact schema has no %q property", field)
+		}
+	}
+	contactDesc, _ := cProps["contact_type"].(map[string]any)["description"].(string)
+	for _, want := range []string{"whatsapp_contact", "bridge_bot", "matrix_user"} {
+		if !strings.Contains(contactDesc, want) {
+			t.Fatalf("contact_type description = %q, want it to name %q", contactDesc, want)
+		}
 	}
 
-	// get_media: the room and event are required, the dimension bound is
-	// optional, and the input schema documents every budget the handler
-	// enforces.
+	// get_media: a chat and a message, the dimension bound optional, and every
+	// budget the handler enforces documented.
 	mediaTool := toolByName(t, res.Tools, "get_media")
 	mediaSchema := schemaMap(t, mediaTool)
-	mediaReq := requiredFields(t, mediaSchema)
-	if len(mediaReq) != 2 || mediaReq[0] != "room_id" || mediaReq[1] != "event_id" {
-		t.Fatalf("get_media required = %v, want [room_id event_id]", mediaReq)
+	if req := requiredFields(t, mediaSchema); len(req) != 0 {
+		t.Fatalf("get_media required = %v, want none (the chat and message accept aliases)", req)
 	}
-	mediaProps := mediaSchema["properties"].(map[string]any)
+	mediaProps := schemaProperties(t, mediaSchema)
+	for _, field := range []string{"chat_id", "room_id", "message_id", "event_id"} {
+		if _, ok := mediaProps[field]; !ok {
+			t.Fatalf("get_media schema has no %q property", field)
+		}
+	}
 	maxDim, ok := mediaProps["max_dimension"].(map[string]any)
 	if !ok || maxDim["type"] != "integer" {
 		t.Fatalf("get_media max_dimension = %v, want an integer", mediaProps["max_dimension"])
@@ -603,7 +645,7 @@ func TestToolsListHasNineToolsWithSchemas(t *testing.T) {
 		t.Fatalf("get_media max_dimension description = %q, want the default and clamp", desc)
 	}
 	mediaDesc := mediaTool.Description
-	for _, want := range []string{"1568", "1.5", "25", "mxc URI", "downscaled", "reason"} {
+	for _, want := range []string{"1568", "1.5", "25", "media_uri", "downscaled", "reason"} {
 		if !strings.Contains(mediaDesc, want) {
 			t.Fatalf("get_media description = %q, want it to state %q", mediaDesc, want)
 		}
@@ -611,22 +653,22 @@ func TestToolsListHasNineToolsWithSchemas(t *testing.T) {
 	mediaOut := envelopeProperties(t, mediaTool)
 	for _, field := range []string{
 		"mimetype", "filename", "size_bytes", "width", "height", "duration_ms",
-		"mxc_uri", "encrypted", "downscaled", "included", "reason",
+		"media_uri", "encrypted", "downscaled", "included", "reason",
 	} {
 		if _, ok := mediaOut[field]; !ok {
 			t.Fatalf("get_media output schema has no %q property", field)
 		}
 	}
 
-	// send_media: one room, one of two payload sources, and the same
+	// send_media: one chat, one of two payload sources, and the same
 	// idempotency contract send_message documents.
 	sendMediaTool := toolByName(t, res.Tools, "send_media")
 	sendMediaSchema := schemaMap(t, sendMediaTool)
-	if req := requiredFields(t, sendMediaSchema); len(req) != 1 || req[0] != "room_id" {
-		t.Fatalf("send_media required = %v, want [room_id]", req)
+	if req := requiredFields(t, sendMediaSchema); len(req) != 0 {
+		t.Fatalf("send_media required = %v, want none (the chat accepts an alias)", req)
 	}
-	sendMediaProps := sendMediaSchema["properties"].(map[string]any)
-	for _, field := range []string{"path", "data_base64", "mimetype", "caption", "filename", "reply_to", "idempotency_key"} {
+	sendMediaProps := schemaProperties(t, sendMediaSchema)
+	for _, field := range []string{"chat_id", "room_id", "path", "data_base64", "mimetype", "caption", "filename", "reply_to", "idempotency_key"} {
 		prop, ok := sendMediaProps[field].(map[string]any)
 		if !ok {
 			t.Fatalf("send_media schema has no %q property", field)
@@ -642,31 +684,46 @@ func TestToolsListHasNineToolsWithSchemas(t *testing.T) {
 		t.Fatalf("send_media idempotency_key description = %q, want the 128-character cap", key["description"])
 	}
 	sendMediaDesc := sendMediaTool.Description
-	for _, want := range []string{"m.image", "m.video", "m.audio", "m.file", "allow-listed", "50", "idempotency_key"} {
+	for _, want := range []string{"image", "video", "audio", "document", "allow-listed", "50", "idempotency_key"} {
 		if !strings.Contains(sendMediaDesc, want) {
 			t.Fatalf("send_media description = %q, want it to state %q", sendMediaDesc, want)
 		}
 	}
 	sendMediaOut := envelopeProperties(t, sendMediaTool)
-	for _, field := range []string{"event_id", "deduplicated", "msgtype", "mxc_uri"} {
+	for _, field := range []string{"message_id", "deduplicated", "type", "media_uri"} {
 		if _, ok := sendMediaOut[field]; !ok {
 			t.Fatalf("send_media output schema has no %q property", field)
 		}
 	}
 
-	recent := schemaMap(t, toolByName(t, res.Tools, "get_recent_triggers"))
+	// get_new_messages: an optional since (with its alias) and limit, and the
+	// trigger shape under the new names.
+	recentTool := toolByName(t, res.Tools, "get_new_messages")
+	recent := schemaMap(t, recentTool)
 	if len(requiredFields(t, recent)) != 0 {
-		t.Fatalf("get_recent_triggers required = %v, want none", requiredFields(t, recent))
+		t.Fatalf("get_new_messages required = %v, want none", requiredFields(t, recent))
+	}
+	for _, field := range []string{"since", "since_timestamp", "limit"} {
+		if _, ok := schemaProperties(t, recent)[field]; !ok {
+			t.Fatalf("get_new_messages schema has no %q property", field)
+		}
+	}
+	recentOut := outputProperties(t, recentTool)
+	for _, field := range []string{"message_id", "chat_id", "chat_name", "from", "text", "type", "timestamp"} {
+		if _, ok := recentOut[field]; !ok {
+			t.Fatalf("get_new_messages output schema has no %q property", field)
+		}
 	}
 
+	// send_message: text is the only required input, because the chat may
+	// arrive under either name.
 	sendTool := toolByName(t, res.Tools, "send_message")
 	send := schemaMap(t, sendTool)
-	req := requiredFields(t, send)
-	if len(req) != 2 || req[0] != "room_id" || req[1] != "text" {
-		t.Fatalf("send_message required = %v, want [room_id text]", req)
+	if req := requiredFields(t, send); len(req) != 1 || req[0] != "text" {
+		t.Fatalf("send_message required = %v, want [text]", req)
 	}
-	sendProps := send["properties"].(map[string]any)
-	for _, field := range []string{"reply_to", "idempotency_key"} {
+	sendProps := schemaProperties(t, send)
+	for _, field := range []string{"chat_id", "room_id", "reply_to", "idempotency_key"} {
 		prop, ok := sendProps[field].(map[string]any)
 		if !ok {
 			t.Fatalf("send_message schema has no %q property", field)
@@ -682,7 +739,7 @@ func TestToolsListHasNineToolsWithSchemas(t *testing.T) {
 		t.Fatalf("idempotency_key description = %q, want it to document the 128-character cap", key["description"])
 	}
 	sendOut := envelopeProperties(t, sendTool)
-	for _, field := range []string{"event_id", "deduplicated"} {
+	for _, field := range []string{"message_id", "deduplicated"} {
 		if _, ok := sendOut[field]; !ok {
 			t.Fatalf("send_message output schema has no %q property", field)
 		}
@@ -691,7 +748,7 @@ func TestToolsListHasNineToolsWithSchemas(t *testing.T) {
 	// Annotations are part of the tool contract: readOnlyHint keeps a client
 	// from treating a read as a write, and destructiveHint/idempotentHint on
 	// send_message keep it from retrying a send that is neither.
-	for _, name := range []string{"list_rooms", "read_messages", "search_messages", "get_message_context", "list_participants", "get_media", "get_recent_triggers"} {
+	for _, name := range []string{"list_chats", "get_messages", "search_messages", "get_message_context", "list_chat_contacts", "get_media", "get_new_messages"} {
 		ann := toolByName(t, res.Tools, name).Annotations
 		if ann == nil {
 			t.Fatalf("%s has no annotations, want readOnlyHint true", name)
@@ -733,7 +790,18 @@ func TestToolsListHasNineToolsWithSchemas(t *testing.T) {
 	}
 }
 
-func TestListRoomsKeepsRoomsWithFailedProbes(t *testing.T) {
+// schemaProperties returns a schema's properties, so a test can name a field
+// without going through the required list.
+func schemaProperties(t *testing.T, schema map[string]any) map[string]any {
+	t.Helper()
+	props, ok := schema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("schema has no properties: %v", schema)
+	}
+	return props
+}
+
+func TestListChatsKeepsChatsWithFailedProbes(t *testing.T) {
 	svc := &fakeMatrix{rooms: []matrix.Room{
 		{ID: "!a:test", Name: "Alpha"},
 		{ID: "!b:test", Name: ""},
@@ -746,27 +814,27 @@ func TestListRoomsKeepsRoomsWithFailedProbes(t *testing.T) {
 	session, cleanup := connect(t, srv)
 	defer cleanup()
 
-	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "list_rooms"})
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "list_chats"})
 	if err != nil {
-		t.Fatalf("list_rooms: %v", err)
+		t.Fatalf("list_chats: %v", err)
 	}
 	if res.IsError {
-		t.Fatalf("list_rooms returned error: %s", resultErrorText(t, res))
+		t.Fatalf("list_chats returned error: %s", resultErrorText(t, res))
 	}
-	rooms := decodeStructured[[]roomResult](t, res)
+	rooms := decodeStructured[[]chatResult](t, res)
 	if len(rooms) != 2 {
-		t.Fatalf("list_rooms returned %d rooms, want 2", len(rooms))
+		t.Fatalf("list_chats returned %d rooms, want 2", len(rooms))
 	}
-	if rooms[0].RoomID != "!a:test" || rooms[0].Name != "Alpha" || !rooms[0].Bridged {
-		t.Fatalf("rooms[0] = %+v, want !a:test/Alpha/bridged", rooms[0])
+	if rooms[0].ChatID != "!a:test" || rooms[0].Name != "Alpha" || !rooms[0].WhatsApp {
+		t.Fatalf("chats[0] = %+v, want !a:test/Alpha/whatsapp", rooms[0])
 	}
-	if rooms[1].RoomID != "!b:test" || rooms[1].Name != "#beta:test" || rooms[1].Bridged {
-		t.Fatalf("rooms[1] = %+v, want !b:test alias fallback and bridged=false despite probe error", rooms[1])
+	if rooms[1].ChatID != "!b:test" || rooms[1].Name != "#beta:test" || rooms[1].WhatsApp {
+		t.Fatalf("chats[1] = %+v, want !b:test alias fallback and whatsapp=false despite probe error", rooms[1])
 	}
 }
 
 // outputProperties returns the properties of a tool's structured output, which
-// is an array schema for list_rooms and get_recent_triggers.
+// is an array schema for list_chats and get_new_messages.
 func outputProperties(t *testing.T, tool *mcp.Tool) map[string]any {
 	t.Helper()
 	schema, ok := tool.OutputSchema.(map[string]any)
@@ -785,7 +853,7 @@ func outputProperties(t *testing.T, tool *mcp.Tool) map[string]any {
 }
 
 // envelopeProperties returns the properties of a tool's object-shaped output
-// (read_messages and send_message).
+// (get_messages and send_message).
 func envelopeProperties(t *testing.T, tool *mcp.Tool) map[string]any {
 	t.Helper()
 	schema, ok := tool.OutputSchema.(map[string]any)
@@ -799,7 +867,7 @@ func envelopeProperties(t *testing.T, tool *mcp.Tool) map[string]any {
 	return props
 }
 
-// messageProperties returns the schema of one message inside read_messages'
+// messageProperties returns the schema of one message inside get_messages'
 // output envelope, so a field cannot be dropped from the message shape without
 // failing the tools/list test.
 func messageProperties(t *testing.T, tool *mcp.Tool) map[string]any {
@@ -819,7 +887,7 @@ func messageProperties(t *testing.T, tool *mcp.Tool) map[string]any {
 	return props
 }
 
-func TestReadMessagesOrdersAndClamps(t *testing.T) {
+func TestGetMessagesOrdersAndClamps(t *testing.T) {
 	svc := &fakeMatrix{msgs: []matrix.Message{
 		{EventID: "$2", RoomID: "!r:test", Body: "new", Timestamp: 200},
 		{EventID: "$1", RoomID: "!r:test", Body: "old", Timestamp: 100},
@@ -830,11 +898,11 @@ func TestReadMessagesOrdersAndClamps(t *testing.T) {
 
 	for _, limit := range []int{0, 1, 100, 500} {
 		_, err := session.CallTool(context.Background(), &mcp.CallToolParams{
-			Name:      "read_messages",
-			Arguments: map[string]any{"room_id": "!r:test", "limit": limit},
+			Name:      "get_messages",
+			Arguments: map[string]any{"chat_id": "!r:test", "limit": limit},
 		})
 		if err != nil {
-			t.Fatalf("read_messages(limit=%d): %v", limit, err)
+			t.Fatalf("get_messages(limit=%d): %v", limit, err)
 		}
 	}
 
@@ -849,22 +917,23 @@ func TestReadMessagesOrdersAndClamps(t *testing.T) {
 	}
 
 	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
-		Name:      "read_messages",
-		Arguments: map[string]any{"room_id": "!r:test", "limit": 100},
+		Name:      "get_messages",
+		Arguments: map[string]any{"chat_id": "!r:test", "limit": 100},
 	})
 	if err != nil {
-		t.Fatalf("read_messages: %v", err)
+		t.Fatalf("get_messages: %v", err)
 	}
-	msgs := decodeStructured[readMessagesResult](t, res).Messages
-	if len(msgs) != 2 || msgs[0].EventID != "$1" || msgs[1].EventID != "$2" {
-		t.Fatalf("read_messages = %+v, want [$1 $2] oldest first", msgs)
+	msgs := decodeStructured[getMessagesResult](t, res).Messages
+	if len(msgs) != 2 || msgs[0].MessageID != "$1" || msgs[1].MessageID != "$2" {
+		t.Fatalf("get_messages = %+v, want [$1 $2] oldest first", msgs)
 	}
 }
 
-// TestReadMessagesCarriesMsgType proves the live media defect is closed at the
-// MCP boundary: every message reports its msgtype and encryption flag, and the
-// media placeholder produced by the Matrix layer is passed through untouched.
-func TestReadMessagesCarriesMsgType(t *testing.T) {
+// TestGetMessagesCarriesType proves the live media defect is closed at the MCP
+// boundary: every message reports its WhatsApp type and encryption flag, and
+// the placeholder text produced by the Matrix layer is passed through
+// untouched.
+func TestGetMessagesCarriesType(t *testing.T) {
 	svc := &fakeMatrix{msgs: []matrix.Message{
 		{EventID: "$img", RoomID: "!r:test", Body: "[image]", MsgType: "m.image", Timestamp: 200},
 		{EventID: "$txt", RoomID: "!r:test", Body: "hello", MsgType: "m.text", Timestamp: 100, Encrypted: true},
@@ -874,24 +943,24 @@ func TestReadMessagesCarriesMsgType(t *testing.T) {
 	defer cleanup()
 
 	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
-		Name:      "read_messages",
-		Arguments: map[string]any{"room_id": "!r:test"},
+		Name:      "get_messages",
+		Arguments: map[string]any{"chat_id": "!r:test"},
 	})
 	if err != nil {
-		t.Fatalf("read_messages: %v", err)
+		t.Fatalf("get_messages: %v", err)
 	}
 	if res.IsError {
-		t.Fatalf("read_messages returned error: %s", resultErrorText(t, res))
+		t.Fatalf("get_messages returned error: %s", resultErrorText(t, res))
 	}
-	msgs := decodeStructured[readMessagesResult](t, res).Messages
+	msgs := decodeStructured[getMessagesResult](t, res).Messages
 	if len(msgs) != 2 {
-		t.Fatalf("read_messages returned %d messages, want 2", len(msgs))
+		t.Fatalf("get_messages returned %d messages, want 2", len(msgs))
 	}
-	if msgs[0].EventID != "$txt" || msgs[0].MsgType != "m.text" || !msgs[0].Encrypted || msgs[0].Body != "hello" {
-		t.Fatalf("msgs[0] = %+v, want $txt/m.text/encrypted with body hello", msgs[0])
+	if msgs[0].MessageID != "$txt" || msgs[0].Type != "text" || !msgs[0].Encrypted || msgs[0].Text != "hello" || msgs[0].From != "" {
+		t.Fatalf("msgs[0] = %+v, want $txt/text/encrypted with text hello", msgs[0])
 	}
-	if msgs[1].EventID != "$img" || msgs[1].MsgType != "m.image" || msgs[1].Body != "[image]" {
-		t.Fatalf("msgs[1] = %+v, want $img/m.image with body [image]", msgs[1])
+	if msgs[1].MessageID != "$img" || msgs[1].Type != "image" || msgs[1].Text != "[image]" {
+		t.Fatalf("msgs[1] = %+v, want $img/image with text [image]", msgs[1])
 	}
 }
 
@@ -905,15 +974,15 @@ func TestGetRecentTriggersSinceAndLimit(t *testing.T) {
 	defer cleanup()
 
 	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
-		Name:      "get_recent_triggers",
-		Arguments: map[string]any{"since_timestamp": 50, "limit": 500},
+		Name:      "get_new_messages",
+		Arguments: map[string]any{"since": 50, "limit": 500},
 	})
 	if err != nil {
-		t.Fatalf("get_recent_triggers: %v", err)
+		t.Fatalf("get_new_messages: %v", err)
 	}
 	triggers := decodeStructured[[]triggerResult](t, res)
-	if len(triggers) != 2 || triggers[0].EventID != "$t2" || triggers[1].EventID != "$t1" {
-		t.Fatalf("get_recent_triggers = %+v, want [$t2 $t1]", triggers)
+	if len(triggers) != 2 || triggers[0].MessageID != "$t2" || triggers[1].MessageID != "$t1" {
+		t.Fatalf("get_new_messages = %+v, want [$t2 $t1]", triggers)
 	}
 	since, limit := recent.lastCall()
 	if since != 50 || limit != 100 {
@@ -929,7 +998,7 @@ func TestSendMessageSuccess(t *testing.T) {
 
 	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 		Name:      "send_message",
-		Arguments: map[string]any{"room_id": "!ok:test", "text": "hello"},
+		Arguments: map[string]any{"chat_id": "!ok:test", "text": "hello"},
 	})
 	if err != nil {
 		t.Fatalf("send_message: %v", err)
@@ -938,8 +1007,8 @@ func TestSendMessageSuccess(t *testing.T) {
 		t.Fatalf("send_message returned error: %s", resultErrorText(t, res))
 	}
 	got := decodeStructured[sendMessageResult](t, res)
-	if got.EventID != "$sent" {
-		t.Fatalf("send_message event id = %q, want $sent", got.EventID)
+	if got.MessageID != "$sent" {
+		t.Fatalf("send_message event id = %q, want $sent", got.MessageID)
 	}
 	if len(svc.sentRoom) != 1 || svc.sentRoom[0] != "!ok:test" || len(svc.sentText) != 1 || svc.sentText[0] != "hello" {
 		t.Fatalf("matrix saw sends room=%v text=%v, want [!ok:test] [hello]", svc.sentRoom, svc.sentText)
@@ -955,7 +1024,7 @@ func TestSendMessageRejections(t *testing.T) {
 
 		res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 			Name:      "send_message",
-			Arguments: map[string]any{"room_id": "!ok:test", "text": "hello"},
+			Arguments: map[string]any{"chat_id": "!ok:test", "text": "hello"},
 		})
 		if err != nil {
 			t.Fatalf("send_message: %v", err)
@@ -976,7 +1045,7 @@ func TestSendMessageRejections(t *testing.T) {
 
 		res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 			Name:      "send_message",
-			Arguments: map[string]any{"room_id": "!other:test", "text": "hello"},
+			Arguments: map[string]any{"chat_id": "!other:test", "text": "hello"},
 		})
 		if err != nil {
 			t.Fatalf("send_message: %v", err)
@@ -998,7 +1067,7 @@ func TestSendMessageRejections(t *testing.T) {
 		for _, text := range []string{"", "   ", "\t\n"} {
 			res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 				Name:      "send_message",
-				Arguments: map[string]any{"room_id": "!ok:test", "text": text},
+				Arguments: map[string]any{"chat_id": "!ok:test", "text": text},
 			})
 			if err != nil {
 				t.Fatalf("send_message(%q): %v", text, err)
@@ -1020,7 +1089,7 @@ func TestSendMessageRejections(t *testing.T) {
 
 		first, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 			Name:      "send_message",
-			Arguments: map[string]any{"room_id": "!ok:test", "text": "one"},
+			Arguments: map[string]any{"chat_id": "!ok:test", "text": "one"},
 		})
 		if err != nil {
 			t.Fatalf("first send: %v", err)
@@ -1030,7 +1099,7 @@ func TestSendMessageRejections(t *testing.T) {
 		}
 		second, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 			Name:      "send_message",
-			Arguments: map[string]any{"room_id": "!ok:test", "text": "two"},
+			Arguments: map[string]any{"chat_id": "!ok:test", "text": "two"},
 		})
 		if err != nil {
 			t.Fatalf("second send: %v", err)
@@ -1051,7 +1120,7 @@ func TestSendMessageRejections(t *testing.T) {
 
 		rejected, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 			Name:      "send_message",
-			Arguments: map[string]any{"room_id": "!other:test", "text": "nope"},
+			Arguments: map[string]any{"chat_id": "!other:test", "text": "nope"},
 		})
 		if err != nil {
 			t.Fatalf("rejected send: %v", err)
@@ -1061,7 +1130,7 @@ func TestSendMessageRejections(t *testing.T) {
 		}
 		allowed, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 			Name:      "send_message",
-			Arguments: map[string]any{"room_id": "!ok:test", "text": "ok"},
+			Arguments: map[string]any{"chat_id": "!ok:test", "text": "ok"},
 		})
 		if err != nil {
 			t.Fatalf("allowed send after rejection: %v", err)
@@ -1125,7 +1194,7 @@ func TestSendGateEmptyAllowlistRejects(t *testing.T) {
 }
 
 // TestSendGateFollowsAllowlistFile proves the live allowlist: a room enrolled
-// by writing the file (which is what `rooms allow` does) becomes sendable in
+// by writing the file (which is what `chats allow` does) becomes sendable in
 // the running server, and removing it revokes that, with no restart.
 func TestSendGateFollowsAllowlistFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "allow.txt")
@@ -1139,7 +1208,7 @@ func TestSendGateFollowsAllowlistFile(t *testing.T) {
 		t.Helper()
 		res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 			Name:      "send_message",
-			Arguments: map[string]any{"room_id": "!enrolled:test", "text": "hello"},
+			Arguments: map[string]any{"chat_id": "!enrolled:test", "text": "hello"},
 		})
 		if err != nil {
 			t.Fatalf("send_message: %v", err)
@@ -1159,8 +1228,8 @@ func TestSendGateFollowsAllowlistFile(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("send after enrollment = %q, want success", resultErrorText(t, res))
 	}
-	if got := decodeStructured[sendMessageResult](t, res); got.EventID != "$sent" {
-		t.Fatalf("send after enrollment returned %q, want $sent", got.EventID)
+	if got := decodeStructured[sendMessageResult](t, res); got.MessageID != "$sent" {
+		t.Fatalf("send after enrollment returned %q, want $sent", got.MessageID)
 	}
 
 	if _, err := allowlist.Remove(path, "!enrolled:test"); err != nil {
@@ -1192,11 +1261,11 @@ func TestSendGateUnionOfEnvAndFile(t *testing.T) {
 	}
 }
 
-// TestReadMessagesPagination proves the tool pages history: the envelope
+// TestGetMessagesPagination proves the tool pages history: the envelope
 // carries has_more and next_token, and the next call's before reaches the
 // Matrix layer untouched. Without a token the call still starts at the newest
 // message.
-func TestReadMessagesPagination(t *testing.T) {
+func TestGetMessagesPagination(t *testing.T) {
 	svc := &fakeMatrix{
 		msgs:     []matrix.Message{{EventID: "$2", RoomID: "!r:test", Body: "new", Timestamp: 200}},
 		msgsNext: "token-1",
@@ -1206,27 +1275,27 @@ func TestReadMessagesPagination(t *testing.T) {
 	session, cleanup := connect(t, srv)
 	defer cleanup()
 
-	call := func(t *testing.T, args map[string]any) readMessagesResult {
+	call := func(t *testing.T, args map[string]any) getMessagesResult {
 		t.Helper()
-		res, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "read_messages", Arguments: args})
+		res, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "get_messages", Arguments: args})
 		if err != nil {
-			t.Fatalf("read_messages: %v", err)
+			t.Fatalf("get_messages: %v", err)
 		}
 		if res.IsError {
-			t.Fatalf("read_messages returned error: %s", resultErrorText(t, res))
+			t.Fatalf("get_messages returned error: %s", resultErrorText(t, res))
 		}
-		return decodeStructured[readMessagesResult](t, res)
+		return decodeStructured[getMessagesResult](t, res)
 	}
 
-	first := call(t, map[string]any{"room_id": "!r:test"})
+	first := call(t, map[string]any{"chat_id": "!r:test"})
 	if first.NextToken != "token-1" || !first.HasMore {
 		t.Fatalf("first page = next_token %q, has_more %t; want the fake's token and more", first.NextToken, first.HasMore)
 	}
-	if len(first.Messages) != 1 || first.Messages[0].EventID != "$2" {
+	if len(first.Messages) != 1 || first.Messages[0].MessageID != "$2" {
 		t.Fatalf("first page messages = %+v, want [$2]", first.Messages)
 	}
 
-	second := call(t, map[string]any{"room_id": "!r:test", "before": first.NextToken})
+	second := call(t, map[string]any{"chat_id": "!r:test", "before": first.NextToken})
 	if second.NextToken != "token-1" {
 		t.Fatalf("second page next_token = %q, want the fake's token passed through", second.NextToken)
 	}
@@ -1236,10 +1305,10 @@ func TestReadMessagesPagination(t *testing.T) {
 	}
 }
 
-// TestReadMessagesRelations proves the relation fields cross the MCP boundary:
+// TestGetMessagesRelations proves the relation fields cross the MCP boundary:
 // replies keep their parent, edits are marked rather than dropped, mentions are
 // listed, and a redacted message stays in the page with no body.
-func TestReadMessagesRelations(t *testing.T) {
+func TestGetMessagesRelations(t *testing.T) {
 	svc := &fakeMatrix{msgs: []matrix.Message{
 		{EventID: "$edit", RoomID: "!r:test", Body: "* fixed", MsgType: "m.text", Timestamp: 300, EditOf: "$orig"},
 		{EventID: "$gone", RoomID: "!r:test", MsgType: "", Timestamp: 200, Redacted: true},
@@ -1251,48 +1320,48 @@ func TestReadMessagesRelations(t *testing.T) {
 	defer cleanup()
 
 	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
-		Name:      "read_messages",
-		Arguments: map[string]any{"room_id": "!r:test"},
+		Name:      "get_messages",
+		Arguments: map[string]any{"chat_id": "!r:test"},
 	})
 	if err != nil {
-		t.Fatalf("read_messages: %v", err)
+		t.Fatalf("get_messages: %v", err)
 	}
 	if res.IsError {
-		t.Fatalf("read_messages returned error: %s", resultErrorText(t, res))
+		t.Fatalf("get_messages returned error: %s", resultErrorText(t, res))
 	}
-	msgs := decodeStructured[readMessagesResult](t, res).Messages
+	msgs := decodeStructured[getMessagesResult](t, res).Messages
 	if len(msgs) != 3 {
-		t.Fatalf("read_messages returned %d messages, want 3 (a redacted one is not dropped)", len(msgs))
+		t.Fatalf("get_messages returned %d messages, want 3 (a deleted one is not dropped)", len(msgs))
 	}
 	// Oldest first: the reply, then the redacted message, then the edit.
-	if msgs[0].EventID != "$reply" || msgs[0].ReplyTo != "$parent" || strings.Join(msgs[0].Mentions, ",") != "@bot:test" {
+	if msgs[0].MessageID != "$reply" || msgs[0].ReplyTo != "$parent" || strings.Join(msgs[0].Mentions, ",") != "@bot:test" {
 		t.Fatalf("msgs[0] = %+v, want the reply with its parent and mention", msgs[0])
 	}
-	if msgs[1].EventID != "$gone" || !msgs[1].Redacted || msgs[1].Body != "" {
+	if msgs[1].MessageID != "$gone" || !msgs[1].Deleted || msgs[1].Text != "" {
 		t.Fatalf("msgs[1] = %+v, want the redacted message with no body", msgs[1])
 	}
-	if msgs[2].EventID != "$edit" || msgs[2].EditOf != "$orig" || msgs[2].Body != "* fixed" {
+	if msgs[2].MessageID != "$edit" || msgs[2].EditOf != "$orig" || msgs[2].Text != "* fixed" {
 		t.Fatalf("msgs[2] = %+v, want the edit marked with edit_of and kept", msgs[2])
 	}
 }
 
-// TestReadMessagesErrorSurfaces proves a Matrix failure is reported as a tool
+// TestGetMessagesErrorSurfaces proves a Matrix failure is reported as a tool
 // error rather than an empty page.
-func TestReadMessagesErrorSurfaces(t *testing.T) {
+func TestGetMessagesErrorSurfaces(t *testing.T) {
 	svc := &fakeMatrix{msgsErr: errors.New("boom from the homeserver")}
 	srv := New(svc, &fakeProber{}, &fakeRecent{}, nil)
 	session, cleanup := connect(t, srv)
 	defer cleanup()
 
 	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
-		Name:      "read_messages",
-		Arguments: map[string]any{"room_id": "!r:test"},
+		Name:      "get_messages",
+		Arguments: map[string]any{"chat_id": "!r:test"},
 	})
 	if err != nil {
-		t.Fatalf("read_messages: %v", err)
+		t.Fatalf("get_messages: %v", err)
 	}
 	if text := resultErrorText(t, res); !strings.Contains(text, "boom") {
-		t.Fatalf("read_messages error = %q, want the Matrix failure", text)
+		t.Fatalf("get_messages error = %q, want the Matrix failure", text)
 	}
 }
 
@@ -1304,7 +1373,7 @@ func TestSendMessageReplyThreading(t *testing.T) {
 
 	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 		Name:      "send_message",
-		Arguments: map[string]any{"room_id": "!ok:test", "text": "hello", "reply_to": "$parent"},
+		Arguments: map[string]any{"chat_id": "!ok:test", "text": "hello", "reply_to": "$parent"},
 	})
 	if err != nil {
 		t.Fatalf("send_message: %v", err)
@@ -1312,7 +1381,7 @@ func TestSendMessageReplyThreading(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("send_message returned error: %s", resultErrorText(t, res))
 	}
-	if got := decodeStructured[sendMessageResult](t, res); got.EventID != "$sent" || got.Deduplicated {
+	if got := decodeStructured[sendMessageResult](t, res); got.MessageID != "$sent" || got.Deduplicated {
 		t.Fatalf("send_message = %+v, want $sent and not deduplicated", got)
 	}
 	rooms, texts, replies := svc.sends()
@@ -1333,7 +1402,7 @@ func TestSendMessageRejectsMalformedReply(t *testing.T) {
 	for _, bad := range []string{"not-an-event", "abc", "$", "$a b"} {
 		res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 			Name:      "send_message",
-			Arguments: map[string]any{"room_id": "!ok:test", "text": "hello", "reply_to": bad},
+			Arguments: map[string]any{"chat_id": "!ok:test", "text": "hello", "reply_to": bad},
 		})
 		if err != nil {
 			t.Fatalf("send_message(reply_to=%q): %v", bad, err)
@@ -1349,7 +1418,7 @@ func TestSendMessageRejectsMalformedReply(t *testing.T) {
 	// A rejected malformed reply must not consume the rate-limit token.
 	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 		Name:      "send_message",
-		Arguments: map[string]any{"room_id": "!ok:test", "text": "hello", "reply_to": "$parent"},
+		Arguments: map[string]any{"chat_id": "!ok:test", "text": "hello", "reply_to": "$parent"},
 	})
 	if err != nil {
 		t.Fatalf("corrected send: %v", err)
@@ -1373,7 +1442,7 @@ func TestSendMessageIdempotency(t *testing.T) {
 			t.Helper()
 			res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 				Name:      "send_message",
-				Arguments: map[string]any{"room_id": "!ok:test", "text": "hello", "idempotency_key": "k1"},
+				Arguments: map[string]any{"chat_id": "!ok:test", "text": "hello", "idempotency_key": "k1"},
 			})
 			if err != nil {
 				t.Fatalf("send_message: %v", err)
@@ -1385,13 +1454,13 @@ func TestSendMessageIdempotency(t *testing.T) {
 		}
 
 		first := send(t)
-		if first.EventID != "$first" || first.Deduplicated {
+		if first.MessageID != "$first" || first.Deduplicated {
 			t.Fatalf("first send = %+v, want the new event and deduplicated false", first)
 		}
 		// The retry must not need a rate-limit token either, which is why the
 		// dedup lookup happens before the gate.
 		second := send(t)
-		if second.EventID != "$first" || !second.Deduplicated {
+		if second.MessageID != "$first" || !second.Deduplicated {
 			t.Fatalf("retry = %+v, want the original $first with deduplicated true", second)
 		}
 		if _, texts, _ := svc.sends(); len(texts) != 1 {
@@ -1407,13 +1476,13 @@ func TestSendMessageIdempotency(t *testing.T) {
 
 		if _, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 			Name:      "send_message",
-			Arguments: map[string]any{"room_id": "!ok:test", "text": "hello", "idempotency_key": "k1"},
+			Arguments: map[string]any{"chat_id": "!ok:test", "text": "hello", "idempotency_key": "k1"},
 		}); err != nil {
 			t.Fatalf("first send: %v", err)
 		}
 		res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 			Name:      "send_message",
-			Arguments: map[string]any{"room_id": "!ok:test", "text": "something else", "idempotency_key": "k1"},
+			Arguments: map[string]any{"chat_id": "!ok:test", "text": "something else", "idempotency_key": "k1"},
 		})
 		if err != nil {
 			t.Fatalf("second send: %v", err)
@@ -1434,13 +1503,13 @@ func TestSendMessageIdempotency(t *testing.T) {
 
 		if _, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 			Name:      "send_message",
-			Arguments: map[string]any{"room_id": "!ok:test", "text": "hello", "idempotency_key": "k1"},
+			Arguments: map[string]any{"chat_id": "!ok:test", "text": "hello", "idempotency_key": "k1"},
 		}); err != nil {
 			t.Fatalf("first send: %v", err)
 		}
 		res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 			Name:      "send_message",
-			Arguments: map[string]any{"room_id": "!ok2:test", "text": "hello", "idempotency_key": "k1"},
+			Arguments: map[string]any{"chat_id": "!ok2:test", "text": "hello", "idempotency_key": "k1"},
 		})
 		if err != nil {
 			t.Fatalf("second send: %v", err)
@@ -1461,7 +1530,7 @@ func TestSendMessageIdempotency(t *testing.T) {
 
 		res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 			Name: "send_message",
-			Arguments: map[string]any{"room_id": "!ok:test", "text": "hello",
+			Arguments: map[string]any{"chat_id": "!ok:test", "text": "hello",
 				"idempotency_key": strings.Repeat("k", maxIdempotencyKeyLen+1)},
 		})
 		if err != nil {
@@ -1496,7 +1565,7 @@ func TestSendMessageIdempotencyConcurrent(t *testing.T) {
 			defer wg.Done()
 			res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 				Name:      "send_message",
-				Arguments: map[string]any{"room_id": "!ok:test", "text": "hello", "idempotency_key": "same-key"},
+				Arguments: map[string]any{"chat_id": "!ok:test", "text": "hello", "idempotency_key": "same-key"},
 			})
 			if err != nil {
 				errs[i] = err
@@ -1518,8 +1587,8 @@ func TestSendMessageIdempotencyConcurrent(t *testing.T) {
 	}
 	fresh := 0
 	for i, got := range results {
-		if got.EventID != "$once" {
-			t.Fatalf("caller %d got event %q, want the one send's $once", i, got.EventID)
+		if got.MessageID != "$once" {
+			t.Fatalf("caller %d got event %q, want the one send's $once", i, got.MessageID)
 		}
 		if !got.Deduplicated {
 			fresh++
@@ -1549,7 +1618,7 @@ func TestSendMessageIdempotencyInFlightPastTTL(t *testing.T) {
 	send := func() (sendMessageResult, error) {
 		res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
 			Name:      "send_message",
-			Arguments: map[string]any{"room_id": "!ok:test", "text": "hello", "idempotency_key": "k"},
+			Arguments: map[string]any{"chat_id": "!ok:test", "text": "hello", "idempotency_key": "k"},
 		})
 		if err != nil {
 			return sendMessageResult{}, err
@@ -1599,7 +1668,7 @@ func TestSendMessageIdempotencyInFlightPastTTL(t *testing.T) {
 	if gotFirst.err != nil {
 		t.Fatalf("first send: %v", gotFirst.err)
 	}
-	if gotFirst.result.EventID != "$once" || gotFirst.result.Deduplicated {
+	if gotFirst.result.MessageID != "$once" || gotFirst.result.Deduplicated {
 		t.Fatalf("first send = %+v, want the new event $once with deduplicated false", gotFirst.result)
 	}
 
@@ -1607,7 +1676,7 @@ func TestSendMessageIdempotencyInFlightPastTTL(t *testing.T) {
 	if gotSecond.err != nil {
 		t.Fatalf("retry: %v", gotSecond.err)
 	}
-	if gotSecond.result.EventID != "$once" || !gotSecond.result.Deduplicated {
+	if gotSecond.result.MessageID != "$once" || !gotSecond.result.Deduplicated {
 		t.Fatalf("retry = %+v, want $once replayed with deduplicated true", gotSecond.result)
 	}
 
@@ -1616,7 +1685,7 @@ func TestSendMessageIdempotencyInFlightPastTTL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("third call: %v", err)
 	}
-	if third.EventID != "$once" || !third.Deduplicated {
+	if third.MessageID != "$once" || !third.Deduplicated {
 		t.Fatalf("third call = %+v, want $once replayed", third)
 	}
 
@@ -1659,13 +1728,13 @@ func (p *deadlineProber) seen() []time.Duration {
 	return append([]time.Duration(nil), p.remaining...)
 }
 
-// TestListRoomsBoundsTheProbePhase is R8's list_rooms half: every probe runs
+// TestListChatsBoundsTheProbePhase is R8's list_chats half: every probe runs
 // under one overall deadline, so a large account costs a bounded wait instead
 // of two sequential 10s requests per room. The tool description states that
 // bound, and its numbers come from the same constants as the code.
-func TestListRoomsBoundsTheProbePhase(t *testing.T) {
-	if listRoomsTimeout <= 0 {
-		t.Fatalf("listRoomsTimeout = %s, want a positive bound", listRoomsTimeout)
+func TestListChatsBoundsTheProbePhase(t *testing.T) {
+	if listChatsTimeout <= 0 {
+		t.Fatalf("listChatsTimeout = %s, want a positive bound", listChatsTimeout)
 	}
 	rooms := []matrix.Room{
 		{ID: "!a:test", Name: "Alpha"},
@@ -1676,27 +1745,27 @@ func TestListRoomsBoundsTheProbePhase(t *testing.T) {
 	session, cleanup := connect(t, srv)
 	defer cleanup()
 
-	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "list_rooms"})
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: "list_chats"})
 	if err != nil {
-		t.Fatalf("list_rooms: %v", err)
+		t.Fatalf("list_chats: %v", err)
 	}
 	if res.IsError {
-		t.Fatalf("list_rooms returned error: %s", resultErrorText(t, res))
+		t.Fatalf("list_chats returned error: %s", resultErrorText(t, res))
 	}
-	if got := decodeStructured[[]roomResult](t, res); len(got) != len(rooms) {
-		t.Fatalf("list_rooms returned %d rooms, want %d", len(got), len(rooms))
+	if got := decodeStructured[[]chatResult](t, res); len(got) != len(rooms) {
+		t.Fatalf("list_chats returned %d chats, want %d", len(got), len(rooms))
 	}
 
 	seen := prober.seen()
-	if len(seen) != 3 { // Alpha's bridged probe, plus the alias and bridged probe for !b:test
+	if len(seen) != 3 { // Alpha's WhatsApp probe, plus the alias and WhatsApp probe for !b:test
 		t.Fatalf("recorded %d probe contexts, want 3", len(seen))
 	}
 	for i, remaining := range seen {
 		if remaining <= 0 {
 			t.Fatalf("probe %d ran without a deadline: the probe phase is unbounded", i)
 		}
-		if remaining > listRoomsTimeout {
-			t.Fatalf("probe %d had %s left, want at most the %s bound", i, remaining, listRoomsTimeout)
+		if remaining > listChatsTimeout {
+			t.Fatalf("probe %d had %s left, want at most the %s bound", i, remaining, listChatsTimeout)
 		}
 	}
 
@@ -1704,10 +1773,10 @@ func TestListRoomsBoundsTheProbePhase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tools/list: %v", err)
 	}
-	desc := toolByName(t, tools.Tools, "list_rooms").Description
-	for _, want := range []string{fmt.Sprint(listProbeParallel), listRoomsTimeout.String(), "cut off"} {
+	desc := toolByName(t, tools.Tools, "list_chats").Description
+	for _, want := range []string{fmt.Sprint(listProbeParallel), listChatsTimeout.String(), "cut off"} {
 		if !strings.Contains(desc, want) {
-			t.Fatalf("list_rooms description = %q, want it to state %q", desc, want)
+			t.Fatalf("list_chats description = %q, want it to state %q", desc, want)
 		}
 	}
 }

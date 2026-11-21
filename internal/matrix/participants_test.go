@@ -214,7 +214,7 @@ func TestParticipantsHonoursCancellation(t *testing.T) {
 }
 
 // TestClassifyBridgeUser pins the one heuristic behind both IsBridged and
-// list_participants, including the deliberate looseness IsBridged has always
+// list_chat_contacts, including the deliberate looseness IsBridged has always
 // had: any localpart containing whatsapp counts, because bridges rename ghosts.
 func TestClassifyBridgeUser(t *testing.T) {
 	cases := map[string]string{
@@ -274,7 +274,7 @@ func TestIsBridgedFalseWithoutBridgeEvidence(t *testing.T) {
 }
 
 // TestParticipantTimeoutsArePinned pins the shipped bounds: participantTimeout
-// is the only thing keeping a huge room from hanging list_participants, and the
+// is the only thing keeping a huge chat from hanging list_chat_contacts, and the
 // per-profile fan-out is what keeps a room of unnamed members bounded. Both are
 // numbers a refactor could quietly change without any behavioural test failing.
 func TestParticipantTimeoutsArePinned(t *testing.T) {

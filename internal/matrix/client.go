@@ -25,6 +25,7 @@ import (
 
 	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/allowlist"
 	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/config"
+	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/whatsapp"
 )
 
 // Room is a joined Matrix room. Name falls back to the room ID when the room
@@ -380,7 +381,7 @@ func (c *Client) CanonicalAlias(ctx context.Context, roomID string) string {
 // room as bridged; failing that, a joined member whose localpart contains
 // "whatsapp" does. Any probe error (including an inaccessible room or a
 // timeout) is treated as not bridged, so a single room never fails the whole
-// list_rooms call.
+// list_chats call.
 func (c *Client) IsBridged(ctx context.Context, roomID string) bool {
 	ctx, cancel := context.WithTimeout(ctx, nameFetchTimeout)
 	defer cancel()
@@ -654,18 +655,11 @@ func relationFields(msg *event.MessageEventContent) (replyTo, editOf string, men
 // placeholderBody substitutes a short bracketed marker for a media event that
 // carries no text body: bridges commonly send m.image/m.video/m.file events
 // with body "" (the caption, if any, is elsewhere), and an empty string reads
-// to an AI client as a blank message. The marker is derived from the msgtype
-// alone and never from the event's content; text-like bodies are returned
-// verbatim.
+// to an AI client as a blank message. The marker names the WhatsApp type the
+// tools report, derived from the msgtype alone and never from the event's
+// content; text-like bodies are returned verbatim.
 func placeholderBody(msgtype event.MessageType, body string) string {
-	if body != "" {
-		return body
-	}
-	switch msgtype {
-	case event.MsgText, event.MsgNotice, event.MsgEmote, "":
-		return body
-	}
-	return "[" + strings.TrimPrefix(string(msgtype), "m.") + "]"
+	return whatsapp.Body(string(msgtype), body)
 }
 
 func (c *Client) decrypt(ctx context.Context, evt *event.Event) *event.Event {
