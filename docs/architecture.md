@@ -110,6 +110,43 @@ stalling. Every worker exits on context cancellation and is joined by `Close`.
 Transport errors are stripped of the URL, so a webhook URL carrying credentials in
 its path or query cannot reach the log.
 
+The payload speaks the same WhatsApp vocabulary as the tools. A text message carries
+seven keys, and a message with an attachment adds the attachment fields:
+
+```json
+{
+  "message_id": "$abc123",
+  "chat_id": "!cafe:example.com",
+  "chat_name": "Cafe",
+  "from": "@whatsapp_15551234:example.com",
+  "text": "dinner at 8",
+  "type": "text",
+  "timestamp": 1763600000000
+}
+```
+
+```json
+{
+  "message_id": "$photo",
+  "chat_id": "!family:example.com",
+  "chat_name": "Family",
+  "from": "@whatsapp_15559999:example.com",
+  "text": "[image]",
+  "type": "image",
+  "timestamp": 1763600000000,
+  "mimetype": "image/jpeg",
+  "filename": "dinner.jpg",
+  "size_bytes": 2048,
+  "media_uri": "mxc://example.com/abc"
+}
+```
+
+`type` is the same WhatsApp type the tools report (`text`, `image`, `video`, `audio`,
+`document`, `sticker`, `location`, `other`), a captionless media message uses the same
+bracketed placeholder as the tools (`[image]`, `[document]`, …), and none of the
+Matrix-era keys (`room_id`, `event_id`, `sender`, `body`, `msgtype`) appear in the
+payload. The attachment fields are omitted when the message carries no attachment.
+
 The buffer and the queue are process-local: a restart starts empty.
 
 ## Read paths

@@ -3,8 +3,11 @@
 Nine tools, seven that only read and two that send or upload. Every tool is
 registered with a JSON schema, a description, and MCP annotations; every result is
 structured JSON, and `get_media` additionally returns the payload as an MCP content
-block. A call that cannot be answered fails as an MCP error with a message that names
-the reason — no tool returns an empty result to mean "something went wrong".
+block. A call that cannot be answered fails as an MCP error with a short WhatsApp-
+facing message — no tool returns an empty result to mean "something went wrong".
+
+Every tool that acts on a chat accepts the chat either by `chat_id` or by `chat`, a
+name or a unique case-insensitive substring of one (see [Chat by name](#chat-by-name)).
 
 ## Terminology
 
@@ -13,8 +16,8 @@ underneath are Matrix IDs, supplied by the bridge.
 
 | Word | Meaning |
 | --- | --- |
-| `chat`, `chat_id` | One WhatsApp conversation. The ID is a Matrix room ID such as `!abc:example.com`; the bridge sometimes omits the `:server` part, which is valid. |
-| `message`, `message_id` | One WhatsApp message. The ID is a Matrix event ID such as `$abc123`. |
+| `chat`, `chat_id`, `chat` (input) | One WhatsApp conversation. The ID is a chat reference such as `!abc:example.com`; the bridge sometimes omits the `:server` part, which is valid. The `chat` input also accepts the display name. |
+| `message`, `message_id` | One WhatsApp message. The ID is a message reference such as `$abc123`. |
 | `contact` | A participant in a chat: a WhatsApp contact or group, the bridge bot, or a plain Matrix account. |
 | `type` | `text`, `image`, `video`, `audio`, `document`, `sticker`, `location`, or `other`. |
 | `whatsapp` | Whether the chat or contact belongs to WhatsApp rather than being a plain Matrix room or account. |
@@ -33,14 +36,13 @@ the canonical name wins when both are sent. The old **output** names are gone; a
 never carries `room_id`, `event_id`, `body`, `msgtype`, `redacted`, `mxc_uri`, `bridged` or
 `bridge_kind`.
 
-Two things deliberately keep Matrix vocabulary: the underlying error strings from the
-client layer (`matrix: invalid room ID`, `matrix: event not found in room`, and so on,
-quoted in the tables below), and the configuration surface (`MATRIX_*`,
-`ALLOWED_SEND_ROOMS`, the allowlist file). Both name the Matrix mechanism they configure,
-not the WhatsApp conversation the caller cares about. The webhook payload
-(`TRIGGER_WEBHOOK_URL`) keeps its field names too, because consumers outside the MCP
-surface parse it; only its placeholder text for a captionless file follows the new
-vocabulary (`[document]`).
+Two things deliberately keep Matrix vocabulary: the configuration surface (`MATRIX_*`,
+`ALLOWED_SEND_ROOMS`, the allowlist file), which names the mechanism it configures, and
+the `matrix_user` contact type, which names a participant who is not a WhatsApp contact.
+Everything an agent reads — tool descriptions, errors, results and the webhook payload —
+speaks WhatsApp. The webhook (`TRIGGER_WEBHOOK_URL`) carries `chat_id`, `chat_name`,
+`message_id`, `from`, `text`, `type`, `timestamp` and, when the message has an
+attachment, `mimetype`, `filename`, `size_bytes` and `media_uri`.
 
 ## Conventions
 
@@ -52,6 +54,27 @@ IDs without one. The deprecated alias `room_id` is validated identically.
 **Message IDs.** Where a message ID is accepted (`message_id`, `reply_to`), it must be a `$`
 sigil followed by the ID, at most 255 bytes, with no whitespace or control characters. A
 malformed one is rejected before any request is made. `event_id` is its deprecated alias.
+
+### Chat by name
+
+`get_messages`, `search_messages` (when scoped), `get_message_context`,
+`list_chat_contacts`, `get_media`, `send_message` and `send_media` accept `chat` as an
+alternative to `chat_id`. Resolution order is:
+
+1. an exact chat ID from the joined-chat list;
+2. an exact name, case-insensitive;
+3. a case-insensitive substring of exactly one name.
+
+An ambiguous query and a query that matches nothing are errors that list candidate chat
+names (at most 10), so a model can correct itself without another listing call. Sending
+`chat` and `chat_id` together is an error, never a silent preference.
+
+A name is only a way to find a chat. The resolved chat ID goes through exactly the same
+checks as one passed as `chat_id`, which means the send allowlist still decides whether
+`send_message` and `send_media` may write to it: naming a chat never grants permission.
+
+Resolving a name reads the joined-chat list, so a call by `chat_id` is the cheaper path
+when the ID is already known.
 
 **Limits.** For every `limit` argument, an omitted, zero or negative value means 20, and
 anything above 100 means 100. `limit_before` and `limit_after` on `get_message_context` are
@@ -69,8 +92,8 @@ shape.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `chat_id` | string | The chat the message belongs to: a Matrix room ID. |
-| `message_id` | string | The message ID: a Matrix event ID. |
+| `chat_id` | string | The chat the message belongs to: a chat reference such as `!abc:server`. |
+| `message_id` | string | The message ID: a message reference such as `$abc123`. |
 | `from` | string | The sender's user ID. |
 | `text` | string | The message text. A media message with no caption gets a bracketed type marker such as `[image]` or `[document]`, derived from `type` alone; a deleted message has empty text. |
 | `type` | string | The WhatsApp type: `text`, `image`, `video`, `audio`, `document`, `sticker`, `location`, or `other`. See the mapping below. |
@@ -85,7 +108,7 @@ shape.
 | `size_bytes` | integer, optional | The attachment size the sender declared, in bytes. |
 | `width` / `height` | integer, optional | Pixel dimensions the sender declared, typically for an image or a video. |
 | `duration_ms` | integer, optional | The duration the sender declared, in milliseconds, typically for audio or a video. |
-| `media_uri` | string, optional | An opaque reference to the attachment's stored bytes, valid for plaintext and encrypted media alike. Pass it back to the homeserver's media API, or use `get_media` to fetch the bytes. |
+| `media_uri` | string, optional | An opaque reference to the attachment's stored bytes, valid for plaintext and encrypted media alike. Pass it back to the server's media API, or use `get_media` to fetch the bytes. |
 
 The media fields are additive: a message with no attachment omits all seven, and the `text`
 placeholder (`[image]`, `[audio]`, `[document]`, …) is unchanged apart from the file marker,
@@ -129,7 +152,8 @@ Reads one page of a chat's history, oldest first.
 
 | Input | Required | Default | Notes |
 | --- | --- | --- | --- |
-| `chat_id` | yes | — | The chat to read. `room_id` is its deprecated alias. |
+| `chat_id` | one of | — | The chat to read, or omit it and pass `chat`. `room_id` is its deprecated alias. |
+| `chat` | one of | — | The chat's name, or a unique case-insensitive substring of one. Not with `chat_id`. |
 | `limit` | no | 20 | Clamped to 1..100. |
 | `before` | no | — | The `next_token` of an earlier result. Opaque: it is not a message ID. Omit it to start at the newest message. |
 
@@ -147,15 +171,15 @@ The envelope exists because `structuredContent` is a JSON object and the cursor 
 somewhere to live. `next_token` is present only when there is history behind this page: pass
 it back as `before` and repeat until `has_more` is false.
 
-**The token.** `before` is issued by the running process: the homeserver's pagination cursor
+**The token.** `before` is issued by the running process: the server's pagination cursor
 plus the chat it was issued for, signed with a per-process HMAC key and base64url-encoded.
 It is opaque to the caller and holds no secret, so it is safe to log. Before any request:
 
 - a malformed, edited or foreign token, or one minted by a previous process, fails with
-  `matrix: invalid page token` (wrapped `matrix.ErrInvalidPageToken`);
-- a token this process issued but the homeserver no longer accepts fails with
-  `matrix: page token is no longer valid` (`matrix.ErrStalePageToken`) — start again without
-  `before`.
+  `invalid page token` (wrapped `matrix.ErrInvalidPageToken`);
+- a token this process issued but the server no longer accepts fails with
+  `page token is no longer valid: the server rejected it, so call again without before`
+  (`matrix.ErrStalePageToken`).
 
 A restart invalidates outstanding tokens by design. They have no clock of ours.
 
@@ -164,7 +188,7 @@ or without a token. A busy chat's stream is mostly non-message entries, which is
 of raw entries can yield fewer messages than asked for; the call keeps paging until it has
 enough messages, the chat is exhausted, or a bound is reached.
 
-**`has_more`** reports that the homeserver has more entries behind the page, not that the
+**`has_more`** reports that the server has more entries behind the page, not that the
 next page contains messages. The remaining entries can be membership or other non-message
 changes, in which case the next page is empty and carries its own `next_token`.
 
@@ -172,19 +196,22 @@ changes, in which case the next page is empty and carries its own `next_token`.
 
 ## search_messages
 
-Answers "where did someone say this", using the homeserver's search index first and a
+Answers "where did someone say this", using the server's search index first and a
 bounded scan when the server has no index.
 
 | Input | Required | Default | Notes |
 | --- | --- | --- | --- |
 | `query` | yes | — | Trimmed; must not be empty and is capped at 512 characters. |
-| `chat_id` | no | — | Restricts the search to one chat. Omit it to search every joined chat, within the scan budget. `room_id` is its deprecated alias. |
+| `chat` | no | — | Restricts the search to the named chat, or a unique case-insensitive substring of its name. Not with `chat_id`. |
+| `chat_id` | no | — | Restricts the search to one chat. Omit both it and `chat` to search every joined chat, within the scan budget. `room_id` is its deprecated alias. |
 | `limit` | no | 20 | Clamped to 1..100. |
 | `since` | no | — | Unix milliseconds; keeps messages sent at or after this time (inclusive). `since_timestamp` is its deprecated alias. |
 
 The query is validated before any request: empty or whitespace-only is
-`matrix: search query is empty` (`matrix.ErrEmptyQuery`), and more than 512 characters is an
-error naming the cap.
+`search query is empty` (`matrix.ErrEmptyQuery`), and more than 512 characters is an
+error naming the cap. An unavailable search index is `search is unavailable on this server`
+when the failure is not the endpoint itself; a server without that endpoint degrades to
+the bounded scan instead.
 
 **Output**
 
@@ -206,7 +233,7 @@ true when more matches exist than were returned, when the server reports a next 
 when its count exceeds what it returned. `scanned_chats` and `scanned_messages` are 0 because
 nothing was scanned. `since` is applied to what the server returned.
 
-**Fallback path.** A homeserver that does not implement `/search` — `M_UNRECOGNIZED`,
+**Fallback path.** A server that does not implement `/search` — `M_UNRECOGNIZED`,
 `M_NOT_FOUND`, `M_INVALID_PARAM`, `405`, `501`, or a bare 404 route — does not fail the call.
 The refusal is remembered for the life of the process, and later searches skip the doomed
 request. A network or authorization error is not treated this way: it is returned to the
@@ -235,27 +262,28 @@ Reads one message with its neighbourhood and resolves what it answers or replace
 
 | Input | Required | Default | Notes |
 | --- | --- | --- | --- |
-| `chat_id` | yes | — | The chat the message belongs to. `room_id` is its deprecated alias. |
-| `message_id` | yes | — | Matrix event ID; validated before any request. `event_id` is its deprecated alias. |
+| `chat` | one of | — | The chat's name, or a unique case-insensitive substring of one. Not with `chat_id`. |
+| `chat_id` | one of | — | The chat the message belongs to, or omit it and pass `chat`. `room_id` is its deprecated alias. |
+| `message_id` | yes | — | Message reference such as `$abc123`; validated before any request. `event_id` is its deprecated alias. |
 | `limit_before` | no | 10 | Clamped to 0..50; `0` returns none. |
 | `limit_after` | no | 10 | Clamped to 0..50; `0` returns none. |
 
 The two limits are nullable integers on purpose: an omitted field means 10, while an explicit
 `0` means "nothing on that side", which a plain integer could not express.
 
-**Output:** `{events_before, event, events_after, reply_to, edit_of, source, truncated}`.
+**Output:** `{messages_before, message, messages_after, reply_to, edit_of, source, truncated}`.
 
 | Field | Meaning |
 | --- | --- |
-| `event` | The target message, in the message shape above. |
-| `events_before` | Up to `limit_before` messages before it, oldest first; messages only. |
-| `events_after` | Up to `limit_after` messages after it, oldest first; messages only. |
+| `message` | The target message, in the message shape above. |
+| `messages_before` | Up to `limit_before` messages before it, oldest first; messages only. |
+| `messages_after` | Up to `limit_after` messages after it, oldest first; messages only. |
 | `reply_to` | The message the target answers, resolved to a full message when it is in the window or can be fetched; absent when the target is not a reply or the message is gone. The target's own `reply_to` field still carries the bare message ID. |
 | `edit_of` | The message the target replaces, resolved the same way. |
 | `source` | `context` when the chat's `/context` endpoint answered, `fallback` when the neighbourhood was found by scanning. |
 | `truncated` | True only on the fallback path, when its fixed budget ran out before the requested window was covered. |
 
-**Fallback.** When the homeserver does not implement `/context`, the message is fetched by ID
+**Fallback.** When the server does not implement `/context`, the message is fetched by ID
 and the chat's history is walked backward until the target and the window are covered, the
 timeline ends, or a fixed budget of 5 pages × 100 raw entries (`matrix.ContextScanPages`,
 `matrix.ContextScanPageLimit`) is spent. The refusal is remembered per process. Resolving
@@ -266,10 +294,10 @@ outside it; a failed resolution leaves that one field absent rather than failing
 
 | Situation | Error |
 | --- | --- |
-| `message_id` is not a Matrix event ID | `matrix: invalid event ID`, before any request |
-| `chat_id` is not a valid chat ID | `matrix: invalid room ID`, before any request |
-| the message is not in the chat (`M_NOT_FOUND`) | `matrix: event not found in room` |
-| the entry exists but is not a message | `matrix: event is not a message` |
+| `message_id` is not a message reference | `invalid message ID: expected a message reference such as $abc123`, before any request |
+| `chat_id` is not a valid chat ID | `invalid chat ID: expected a chat reference such as !abc:server`, before any request |
+| the message is not in the chat (`M_NOT_FOUND`) | `message not found in this chat` |
+| the entry exists but is not a message | `this message is not a text message` |
 
 **Annotations:** `readOnlyHint: true`.
 
@@ -277,7 +305,7 @@ outside it; a failed resolution leaves that one field absent rather than failing
 
 Lists every joined contact in a chat.
 
-- **Input:** `chat_id` (required; `room_id` is its deprecated alias).
+- **Input:** `chat_id` or `chat` (exactly one; `room_id` is the deprecated alias of `chat_id`).
 - **Output:** `{contacts: [{user_id, display_name, membership, whatsapp, contact_type}]}`,
   sorted by display name (case-insensitive) and then user ID. `membership` is `join` for
   every entry, because the chat is asked for its joined contacts only.
@@ -304,8 +332,9 @@ as JSON, followed by an `image` or `audio` block when the payload qualifies.
 
 | Input | Required | Default | Notes |
 | --- | --- | --- | --- |
-| `chat_id` | yes | — | The chat the message belongs to. `room_id` is its deprecated alias. |
-| `message_id` | yes | — | Matrix event ID; validated before any request. `event_id` is its deprecated alias. |
+| `chat` | one of | — | The chat's name, or a unique case-insensitive substring of one. Not with `chat_id`. |
+| `chat_id` | one of | — | The chat the message belongs to, or omit it and pass `chat`. `room_id` is its deprecated alias. |
+| `message_id` | yes | — | Message reference such as `$abc123`; validated before any request. `event_id` is its deprecated alias. |
 | `max_dimension` | no | 1568 | Longest edge an inline image may keep, clamped to 256..4096. An omitted or zero value means the default. |
 
 **Metadata.** The first block's text is this JSON, and the same object is the tool's
@@ -313,7 +342,7 @@ structured content:
 
 | Field | Meaning |
 | --- | --- |
-| `mimetype` | The MIME type the message declares; when it declares none, the type the homeserver served; when that is only `application/octet-stream`, the type the bytes themselves indicate. Used to choose the content block. |
+| `mimetype` | The MIME type the message declares; when it declares none, the type the server served; when that is only `application/octet-stream`, the type the bytes themselves indicate. Used to choose the content block. |
 | `filename` | The filename the sender set, when it set one. |
 | `size_bytes` | The size of the payload that was downloaded; for encrypted media, the decrypted size. |
 | `width` / `height` | The image's pixel size: the returned image after downscaling, or the source image when its payload did not fit. |
@@ -345,7 +374,7 @@ not fit, the call returns its metadata and a reason.
 
 | Budget | Value | Behaviour |
 | --- | --- | --- |
-| Download | 25 MiB (`matrix.MaxMediaDownloadBytes`) | A larger attachment is refused with `matrix: media is larger than the download limit`, checked against the declared length before a byte is read and against the actual bytes while reading. Nothing is truncated. |
+| Download | 25 MiB (`matrix.MaxMediaDownloadBytes`) | A larger attachment is refused with `attachment is too large to download`, checked against the declared length before a byte is read and against the actual bytes while reading. Nothing is truncated. |
 | `max_dimension` | default 1568, clamped to 256..4096 | An image whose long edge is longer is scaled down with Catmull-Rom interpolation, preserving the aspect ratio. |
 | Inline payload | about 1.5 MiB of base64 | The re-encoder lowers JPEG quality (85, 75, 65, 55, 45, 35) and then shrinks the image by 3/4 steps down to a 64-pixel long edge. PNG is kept where it fits; otherwise the image becomes JPEG, with transparency flattened onto white. An image that still does not fit returns metadata and a `reason`. |
 
@@ -357,23 +386,23 @@ animation.
 it is decrypted here: the message is decrypted with the crypto helper, then the attachment
 with the key it carries, including the SHA-256 integrity check. With
 `MATRIX_E2EE_ENABLED=false`, encrypted media is refused with
-`matrix: media is encrypted and MATRIX_E2EE_ENABLED is false` rather than returned as
-ciphertext.
+`this message is encrypted and end-to-end encryption is switched off on the server; set MATRIX_E2EE_ENABLED=true`
+rather than returned as ciphertext.
 
 **Errors** are typed, because "no payload" from a download failure would claim something
 different:
 
 | Situation | Error |
 | --- | --- |
-| `message_id` is not a Matrix event ID | `matrix: invalid event ID`, before any request |
-| `chat_id` is not a valid chat ID | `matrix: invalid room ID`, before any request |
-| the message is not in the chat (`M_NOT_FOUND`) | `matrix: event not found in room` |
-| the message exists but carries no attachment | `matrix: event carries no media attachment` |
-| the message is encrypted and E2EE is off | `matrix: media is encrypted and MATRIX_E2EE_ENABLED is false` |
-| E2EE is on but the attachment cannot be decrypted | `matrix: encrypted media could not be decrypted` |
-| the download is refused or fails | `matrix: media download failed` |
-| the attachment is over 25 MiB | `matrix: media is larger than the download limit` |
-| an unsupported image format or encryption algorithm | `matrix: unsupported media codec` |
+| `message_id` is not a message reference | `invalid message ID: expected a message reference such as $abc123`, before any request |
+| `chat_id` is not a valid chat ID | `invalid chat ID: expected a chat reference such as !abc:server`, before any request |
+| the message is not in the chat (`M_NOT_FOUND`) | `message not found in this chat` |
+| the message exists but carries no attachment | `this message has no attachment` |
+| the message is encrypted and E2EE is off | `this message is encrypted and end-to-end encryption is switched off on the server; set MATRIX_E2EE_ENABLED=true` |
+| E2EE is on but the attachment cannot be decrypted | `this attachment could not be decrypted` |
+| the download is refused or fails | `could not download the attachment` |
+| the attachment is over 25 MiB | `attachment is too large to download` |
+| an unsupported image format or encryption algorithm | `unsupported attachment format` |
 
 **Annotations:** `readOnlyHint: true`.
 
@@ -401,7 +430,8 @@ Sends a plain-text message to a chat.
 
 | Input | Required | Default | Notes |
 | --- | --- | --- | --- |
-| `chat_id` | yes | — | Must be on the send allowlist. `room_id` is its deprecated alias. |
+| `chat_id` | one of | — | The chat to send to, or omit it and pass `chat`. Must be on the send allowlist. `room_id` is its deprecated alias. |
+| `chat` | one of | — | The chat's name, or a unique case-insensitive substring of one. Not with `chat_id`. Resolving a name never grants send permission. |
 | `text` | yes | — | Must not be empty or whitespace-only. |
 | `reply_to` | no | — | Message ID to answer, sent as a reply relation that the bridge renders as a quote. The replied-to message can be in any chat; only the target chat must be allow-listed. |
 | `idempotency_key` | no | — | At most 128 characters. Makes a retry safe. |
@@ -409,7 +439,7 @@ Sends a plain-text message to a chat.
 **Output:** `{message_id, deduplicated}`. `message_id` is the sent message's ID, or the
 original send's when the call was deduplicated.
 
-**The gate.** Before anything reaches the homeserver:
+**The gate.** Before anything reaches the server, and after `chat` is resolved to an ID:
 
 1. The chat is checked against the effective allowlist — `ALLOWED_SEND_ROOMS` unioned with
    `MATRIX_ALLOWLIST_FILE`, consulted per send. Both empty rejects every send with a read-only
@@ -418,7 +448,7 @@ original send's when the call was deduplicated.
 2. One token bucket grants at most one message every 3 seconds across all chats. A throttled
    call returns `rate limited, retry in Ns` instead of blocking.
 
-The Matrix layer checks the same allowlist again, so the two cannot disagree.
+The client layer checks the same allowlist again, so the two cannot disagree.
 
 **Replies.** A `reply_to` that is not a well-formed message ID is rejected before the
 idempotency key is claimed and before the rate-limit token is spent.
@@ -427,7 +457,7 @@ idempotency key is claimed and before the rate-limit token is spent.
 original message ID with `deduplicated: true` and sends nothing. The same key with a
 different chat or text is an error, never a second send. A call that arrives while the first
 is still in flight waits for it and returns its message ID rather than racing it to the
-homeserver. A deduplicated call does not consume a rate-limit token, and a send that failed
+server. A deduplicated call does not consume a rate-limit token, and a send that failed
 releases its key so a retry can send. The map is in-process, capped at 256 entries with the
 oldest evicted, and has no persistence: a restart forgets every key. An in-flight entry is
 never expired or evicted, so a hung send cannot turn a retry into a second message.
@@ -435,19 +465,18 @@ never expired or evicted, so a hung send cannot turn a retry into a second messa
 `idempotentHint` therefore stays `false`: only a keyed retry is idempotent, and the default
 is not.
 
-**Bridge acknowledgement.** Matrix accepting a message does not prove the bridge forwarded
+**Bridge acknowledgement.** The server accepting a message does not prove the bridge forwarded
 it. After the send, the server polls the chat's newest entries every 100ms for up to
 `MATRIX_BRIDGE_ACK_TIMEOUT` (default 1s), looking for a notice from another account whose
 relation points at the sent message. If one appears, the call fails with
-`matrix: bridge did not bridge the message: event $...: <notice>`: the notice is flattened to
-one line, control characters are replaced, and the text is capped at 300 characters before an
-ellipsis. No notice within the window means success. Setting the timeout to `0` disables the
+`WhatsApp did not deliver the message: <notice>`: the notice is flattened to one line,
+control characters are replaced, and the text is capped at 300 characters before an ellipsis. No notice within the window means success. Setting the timeout to `0` disables the
 guard and issues no extra request. A failing probe is logged once and leaves the send a
 success.
 
 **Encryption.** When `MATRIX_E2EE_ENABLED` is false and the chat is encrypted, the send is
-refused with `matrix: room is encrypted and MATRIX_E2EE_ENABLED is false` instead of posting
-plaintext.
+refused with `this chat is encrypted and end-to-end encryption is switched off on the server; set MATRIX_E2EE_ENABLED=true`
+instead of posting plaintext.
 
 **Annotations:** `destructiveHint: true`, `idempotentHint: false`, `readOnlyHint: false`.
 
@@ -457,7 +486,8 @@ Uploads one attachment and sends it as a single media message.
 
 | Input | Required | Default | Notes |
 | --- | --- | --- | --- |
-| `chat_id` | yes | — | Must be on the send allowlist. `room_id` is its deprecated alias. |
+| `chat_id` | one of | — | The chat to send to, or omit it and pass `chat`. Must be on the send allowlist. `room_id` is its deprecated alias. |
+| `chat` | one of | — | The chat's name, or a unique case-insensitive substring of one. Not with `chat_id`. Resolving a name never grants send permission. |
 | `path` | one of | — | Absolute path of a local file. It must exist, be readable, be a regular file and be at most 50 MiB. Pass exactly one of `path` and `data_base64`. |
 | `data_base64` | one of | — | The payload as standard base64, at most 50 MiB once decoded. `mimetype` is required alongside it. |
 | `mimetype` | with `data_base64` | — | The payload's MIME type, for example `image/jpeg`. With `path` it overrides the type detected from the file, which is otherwise taken from the extension and then sniffed from the bytes. |
@@ -490,7 +520,7 @@ point: a media message is no less a message to the people in the chat.
 1. The chat is checked against the effective allowlist — `ALLOWED_SEND_ROOMS` unioned with
    `MATRIX_ALLOWLIST_FILE`, consulted per send. Both empty rejects every upload and every send
    with the read-only error; a chat outside a non-empty list is rejected without consuming
-   the rate-limit token. The Matrix layer checks the same store again before uploading.
+   the rate-limit token. The client layer checks the same store again before uploading.
 2. One token bucket grants at most one message every 3 seconds across all chats, and it is
    the same bucket `send_message` draws from: a text message and a media message cannot be
    sent within 3 seconds of each other. A throttled call returns `rate limited, retry in Ns`
@@ -499,7 +529,7 @@ point: a media message is no less a message to the people in the chat.
    `send_message` does, and fails the call with the notice rather than reporting a message as
    delivered that WhatsApp refused.
 
-Everything that can be rejected without the homeserver is rejected before the gate: a payload
+Everything that can be rejected without the server is rejected before the gate: a payload
 source that is neither `path` nor `data_base64` (or both), a path that is not absolute,
 unreadable, a directory or not a regular file, invalid base64, a `data_base64` call without
 `mimetype`, a payload over 50 MiB, a malformed `reply_to` and an over-long
@@ -516,7 +546,8 @@ in-memory lifetime and the 256-entry cap are the ones described under `send_mess
 **Encryption.** With E2EE on and an encrypted chat, the attachment is encrypted before upload
 and the message carries its encrypted descriptor, so the media repository never holds a
 readable copy. With E2EE off, an encrypted chat is refused with
-`matrix: room is encrypted and MATRIX_E2EE_ENABLED is false`, exactly as a text send is.
+`this chat is encrypted and end-to-end encryption is switched off on the server; set MATRIX_E2EE_ENABLED=true`,
+exactly as a text send is.
 
 **Logging.** The payload bytes are never logged, and neither is a file's contents; errors name
 the failure, the file path and the size, never the bytes.
@@ -538,14 +569,24 @@ the failure, the file path and the size, never the bytes.
 | `send_media` | false | true | false |
 
 `openWorldHint` is left unset on every tool, which means true: each one reaches a real
-homeserver and, through it, real people.
+server and, through it, real people.
 
 ## Examples
 
-Page back through a chat:
+Page back through a chat, by ID or by its name:
 
 ```json
 {"name": "get_messages", "arguments": {"chat_id": "!cafe:example.com", "limit": 30}}
+```
+
+```json
+{"name": "get_messages", "arguments": {"chat": "Cafe", "limit": 30}}
+```
+
+Send to a chat by a unique name fragment; the allowlist still applies:
+
+```json
+{"name": "send_message", "arguments": {"chat": "family", "text": "8pm works"}}
 ```
 
 ```json

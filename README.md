@@ -50,9 +50,16 @@ The old **input** names are still accepted, as deprecated aliases documented in 
 schema, so a model that guesses `room_id` still works. The old **output** names are gone: no
 result carries `room_id`, `event_id`, `body` or `msgtype` any more. Configuration keeps its
 Matrix vocabulary (`MATRIX_*`, `ALLOWED_SEND_ROOMS`), and `rooms` remains a hidden CLI alias
-of `chats`. The webhook payload (`TRIGGER_WEBHOOK_URL`) also keeps its field names, because
-consumers outside the MCP surface parse it; only its placeholder text for a captionless file
-follows the new vocabulary (`[document]`).
+of `chats`. Error text speaks WhatsApp too: the `matrix:` prefix is gone, a bad ID asks for a
+chat or message reference, and a refused send is `WhatsApp did not deliver the message: …`.
+
+Every chat-scoped tool also takes `chat`, a chat name or a unique case-insensitive substring
+of one, resolved against the joined chats. Passing `chat` and `chat_id` together is an error,
+and a resolved name still has to pass the send allowlist.
+
+The webhook payload (`TRIGGER_WEBHOOK_URL`) uses the same vocabulary as the tools:
+`chat_id`, `chat_name`, `message_id`, `from`, `text`, `type`, `timestamp`, plus `mimetype`,
+`filename`, `size_bytes` and `media_uri` when the message carries an attachment.
 
 ## Features
 
@@ -179,7 +186,7 @@ What the client sees:
 - `list_chats` → `[{chat_id, name, whatsapp}]`
 - `get_messages` → `{messages: [...], has_more, next_token}`, oldest first
 - `search_messages` → `{results: [...], truncated, scanned_chats, scanned_messages, source}`
-- `get_message_context` → `{events_before, event, events_after, reply_to?, edit_of?, source, truncated}`
+- `get_message_context` → `{messages_before, message, messages_after, reply_to?, edit_of?, source, truncated}`
 - `list_chat_contacts` → `{contacts: [{user_id, display_name, membership, whatsapp, contact_type}]}`
 - `get_media` → a `text` block with the metadata JSON, plus an `image` or `audio` block when the payload qualifies
 - `get_new_messages` → `[{message_id, chat_id, chat_name, from, text, type, timestamp}]`, newest first

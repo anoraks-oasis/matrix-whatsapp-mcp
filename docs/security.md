@@ -56,7 +56,7 @@ created, so there is nothing to leave behind in `/tmp`, and a restart cannot lea
 payload that a previous process held.
 
 - **Download cap.** A `get_media` attachment larger than 25 MiB is refused with
-  `matrix: media is larger than the download limit`. The declared `Content-Length`
+  `attachment is too large to download`. The declared `Content-Length`
   is checked before a byte is read and the actual bytes are counted while reading,
   so a chunked response cannot exceed the cap either. A payload is never truncated:
   the call returns an error, not half a file.
@@ -67,7 +67,7 @@ payload that a previous process held.
   before the gate, so no rate-limit token is spent and nothing is uploaded.
 - **Encrypted media.** Media in an encrypted room is ciphertext on the media
   repository. With `MATRIX_E2EE_ENABLED=false` the call fails with
-  `matrix: media is encrypted and MATRIX_E2EE_ENABLED is false` instead of returning
+  `this message is encrypted and end-to-end encryption is switched off on the server; set MATRIX_E2EE_ENABLED=true` instead of returning
   bytes that decode to nothing; with E2EE on, the event is decrypted with the crypto
   helper and the attachment with the key and SHA-256 hash its own content carries.
   `send_media` encrypts the attachment before upload in an encrypted room, so the
