@@ -8,6 +8,8 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -65,7 +67,7 @@ func TestRingBufferWrapsAtCapacity(t *testing.T) {
 	// The 50 oldest (1..50) must have been evicted.
 	seen := make(map[string]bool, len(got))
 	for _, tr := range got {
-		seen[tr.EventID] = true
+		seen[tr.MessageID] = true
 	}
 	for i := 1; i <= 50; i++ {
 		if seen[fmt.Sprintf("e%03d", i)] {
@@ -91,7 +93,7 @@ func TestRecentSinceTimestampBoundary(t *testing.T) {
 	d.Handle(context.Background(), msgEvent("e101", "!r:test", "@alice:test", 101, "new"))
 
 	got := d.Recent(100, 0)
-	if len(got) != 1 || got[0].EventID != "e101" {
+	if len(got) != 1 || got[0].MessageID != "e101" {
 		t.Fatalf("Recent(100) = %+v, want exactly [e101] (strictly newer than since)", got)
 	}
 	if both := d.Recent(99, 0); len(both) != 2 {
@@ -111,6 +113,119 @@ func TestHandleIgnoresNonMessageEvents(t *testing.T) {
 	d.Handle(context.Background(), &event.Event{Type: event.EventEncrypted, ID: "$x", RoomID: "!r:test"})
 	if got := d.Recent(0, 0); len(got) != 0 {
 		t.Fatalf("non-message events recorded %d triggers, want 0", len(got))
+	}
+}
+
+// TestWebhookPayloadSpeaksWhatsApp pins the JSON a webhook consumer parses: the
+// WhatsApp field names and no Matrix-era key, with the attachment fields
+// present only when the message carries an attachment.
+func TestWebhookPayloadSpeaksWhatsApp(t *testing.T) {
+	tests := []struct {
+		name      string
+		content   *event.MessageEventContent
+		wantKeys  []string
+		wantType  string
+		wantText  string
+		wantMedia string
+	}{
+		{
+			name:     "text",
+			content:  &event.MessageEventContent{MsgType: event.MsgText, Body: "hello"},
+			wantKeys: []string{"chat_id", "chat_name", "from", "message_id", "text", "timestamp", "type"},
+			wantType: "text",
+			wantText: "hello",
+		},
+		{
+			name: "media",
+			content: &event.MessageEventContent{
+				MsgType: event.MsgImage, FileName: "dinner.jpg", URL: "mxc://example.com/abc",
+				Info: &event.FileInfo{MimeType: "image/jpeg", Size: 2048},
+			},
+			wantKeys:  []string{"chat_id", "chat_name", "filename", "from", "media_uri", "message_id", "mimetype", "size_bytes", "text", "timestamp", "type"},
+			wantType:  "image",
+			wantText:  "[image]",
+			wantMedia: "mxc://example.com/abc",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := make(chan map[string]any, 1)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var decoded map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&decoded); err != nil {
+					t.Errorf("decode webhook payload: %v", err)
+				}
+				got <- decoded
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer srv.Close()
+
+			d := New(srv.URL, nil, discardLogger())
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			d.Start(ctx)
+			d.Handle(ctx, &event.Event{
+				Type:      event.EventMessage,
+				ID:        id.EventID("$evt1"),
+				RoomID:    id.RoomID("!cafe:example.com"),
+				Sender:    id.UserID("@wa_alice:example.com"),
+				Timestamp: 1763600000000,
+				Content:   event.Content{Parsed: tc.content},
+			})
+
+			var payload map[string]any
+			select {
+			case payload = <-got:
+			case <-time.After(2 * time.Second):
+				t.Fatal("webhook never received the trigger")
+			}
+			if err := d.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+
+			keys := make([]string, 0, len(payload))
+			for key := range payload {
+				keys = append(keys, key)
+			}
+			sort.Strings(keys)
+			if strings.Join(keys, ",") != strings.Join(tc.wantKeys, ",") {
+				t.Fatalf("payload keys = %v, want %v", keys, tc.wantKeys)
+			}
+			for _, old := range []string{"room_id", "event_id", "sender", "body", "msgtype"} {
+				if _, ok := payload[old]; ok {
+					t.Fatalf("payload still carries the Matrix-era key %q: %v", old, payload)
+				}
+			}
+			if payload["message_id"] != "$evt1" {
+				t.Fatalf("message_id = %v, want $evt1", payload["message_id"])
+			}
+			if payload["chat_id"] != "!cafe:example.com" {
+				t.Fatalf("chat_id = %v, want the chat ID", payload["chat_id"])
+			}
+			if payload["chat_name"] != "!cafe:example.com" {
+				t.Fatalf("chat_name = %v, want the chat ID when no namer is set", payload["chat_name"])
+			}
+			if payload["from"] != "@wa_alice:example.com" {
+				t.Fatalf("from = %v, want the sender", payload["from"])
+			}
+			if payload["type"] != tc.wantType {
+				t.Fatalf("type = %v, want %q", payload["type"], tc.wantType)
+			}
+			if payload["text"] != tc.wantText {
+				t.Fatalf("text = %v, want %q", payload["text"], tc.wantText)
+			}
+			if payload["timestamp"] != float64(1763600000000) {
+				t.Fatalf("timestamp = %v, want 1763600000000", payload["timestamp"])
+			}
+			if tc.wantMedia != "" {
+				if payload["media_uri"] != tc.wantMedia {
+					t.Fatalf("media_uri = %v, want %q", payload["media_uri"], tc.wantMedia)
+				}
+				if payload["mimetype"] != "image/jpeg" || payload["size_bytes"] != float64(2048) || payload["filename"] != "dinner.jpg" {
+					t.Fatalf("attachment fields = %v, want mimetype/filename/size_bytes carried", payload)
+				}
+			}
+		})
 	}
 }
 
@@ -274,23 +389,23 @@ func mediaEvent(evID, roomID, sender string, ts int64, msgtype event.MessageType
 	}
 }
 
-// TestHandleMediaPlaceholderAndMsgType closes the live media defect on the
+// TestHandleMediaPlaceholderAndType closes the live media defect on the
 // trigger path: a photo with an empty body must not reach a webhook consumer as
-// a blank string, and the msgtype must be carried through.
-func TestHandleMediaPlaceholderAndMsgType(t *testing.T) {
+// a blank string, and the WhatsApp type must be carried through.
+func TestHandleMediaPlaceholderAndType(t *testing.T) {
 	tests := []struct {
-		name        string
-		msgtype     event.MessageType
-		body        string
-		wantBody    string
-		wantMsgType string
+		name     string
+		msgtype  event.MessageType
+		body     string
+		wantBody string
+		wantType string
 	}{
-		{"image with empty body", event.MsgImage, "", "[image]", "m.image"},
-		{"video with empty body", event.MsgVideo, "", "[video]", "m.video"},
-		{"audio with empty body", event.MsgAudio, "", "[audio]", "m.audio"},
-		{"file with empty body", event.MsgFile, "", "[document]", "m.file"},
-		{"image with caption", event.MsgImage, "a caption", "a caption", "m.image"},
-		{"text keeps its body", event.MsgText, "hello there", "hello there", "m.text"},
+		{"image with empty body", event.MsgImage, "", "[image]", "image"},
+		{"video with empty body", event.MsgVideo, "", "[video]", "video"},
+		{"audio with empty body", event.MsgAudio, "", "[audio]", "audio"},
+		{"file with empty body", event.MsgFile, "", "[document]", "document"},
+		{"image with caption", event.MsgImage, "a caption", "a caption", "image"},
+		{"text keeps its body", event.MsgText, "hello there", "hello there", "text"},
 	}
 	for i, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -300,11 +415,11 @@ func TestHandleMediaPlaceholderAndMsgType(t *testing.T) {
 			if len(got) != 1 {
 				t.Fatalf("Recent = %d triggers, want 1", len(got))
 			}
-			if got[0].Body != tc.wantBody {
-				t.Fatalf("Body = %q, want %q", got[0].Body, tc.wantBody)
+			if got[0].Text != tc.wantBody {
+				t.Fatalf("Text = %q, want %q", got[0].Text, tc.wantBody)
 			}
-			if got[0].MsgType != tc.wantMsgType {
-				t.Fatalf("MsgType = %q, want %q", got[0].MsgType, tc.wantMsgType)
+			if got[0].Type != tc.wantType {
+				t.Fatalf("Type = %q, want %q", got[0].Type, tc.wantType)
 			}
 			payload, err := json.Marshal(got[0])
 			if err != nil {
@@ -314,11 +429,11 @@ func TestHandleMediaPlaceholderAndMsgType(t *testing.T) {
 			if err := json.Unmarshal(payload, &decoded); err != nil {
 				t.Fatalf("unmarshal trigger: %v", err)
 			}
-			if decoded["msgtype"] != tc.wantMsgType {
-				t.Fatalf("trigger JSON msgtype = %v, want %q", decoded["msgtype"], tc.wantMsgType)
+			if decoded["type"] != tc.wantType {
+				t.Fatalf("trigger JSON type = %v, want %q", decoded["type"], tc.wantType)
 			}
-			if decoded["body"] != tc.wantBody {
-				t.Fatalf("trigger JSON body = %v, want %q", decoded["body"], tc.wantBody)
+			if decoded["text"] != tc.wantBody {
+				t.Fatalf("trigger JSON text = %v, want %q", decoded["text"], tc.wantBody)
 			}
 		})
 	}

@@ -34,18 +34,24 @@ const (
 	workerCount       = 4
 )
 
-// Trigger is a normalized incoming message. Timestamp is unix milliseconds.
-// A media event (m.image, m.video, ...) that carries no text body gets a
-// bracketed type marker such as "[image]" instead of an empty string, so a
-// webhook or trigger consumer never sees a silently blank body.
+// Trigger is a normalized incoming message, in the WhatsApp vocabulary every
+// other surface speaks. Timestamp is unix milliseconds. A media event that
+// carries no caption gets a bracketed type marker such as "[image]" instead of
+// an empty string, so a webhook consumer never sees a silently blank text.
+// Mimetype, Filename, SizeBytes and MediaURI are present only when the message
+// carries an attachment.
 type Trigger struct {
-	EventID   string `json:"event_id"`
-	RoomID    string `json:"room_id"`
-	RoomName  string `json:"room_name"`
-	Sender    string `json:"sender"`
-	Body      string `json:"body"`
-	MsgType   string `json:"msgtype"`
+	MessageID string `json:"message_id"`
+	ChatID    string `json:"chat_id"`
+	ChatName  string `json:"chat_name"`
+	From      string `json:"from"`
+	Text      string `json:"text"`
+	Type      string `json:"type"`
 	Timestamp int64  `json:"timestamp"`
+	Mimetype  string `json:"mimetype,omitempty"`
+	Filename  string `json:"filename,omitempty"`
+	SizeBytes int64  `json:"size_bytes,omitempty"`
+	MediaURI  string `json:"media_uri,omitempty"`
 }
 
 // RoomNamer resolves a room's display name without network access.
@@ -117,14 +123,15 @@ func (d *Dispatcher) Handle(_ context.Context, evt *event.Event) {
 		name = d.namer.RoomName(roomID)
 	}
 	t := Trigger{
-		EventID:   evt.ID.String(),
-		RoomID:    roomID,
-		RoomName:  name,
-		Sender:    evt.Sender.String(),
-		Body:      bodyOrPlaceholder(msg.MsgType, msg.Body),
-		MsgType:   string(msg.MsgType),
+		MessageID: evt.ID.String(),
+		ChatID:    roomID,
+		ChatName:  name,
+		From:      evt.Sender.String(),
+		Text:      bodyOrPlaceholder(msg.MsgType, msg.Body),
+		Type:      whatsapp.Type(string(msg.MsgType)),
 		Timestamp: evt.Timestamp,
 	}
+	attachMedia(&t, msg)
 	if !d.record(t) {
 		return
 	}
@@ -140,12 +147,29 @@ func bodyOrPlaceholder(msgtype event.MessageType, body string) string {
 	return whatsapp.Body(string(msgtype), body)
 }
 
+// attachMedia records the attachment an event carries, in the same fields and
+// from the same content the tools report. A message with no attachment leaves
+// all four fields out of the payload.
+func attachMedia(t *Trigger, msg *event.MessageEventContent) {
+	if msg.Info != nil {
+		t.Mimetype = msg.Info.MimeType
+		t.SizeBytes = int64(msg.Info.Size)
+	}
+	t.Filename = msg.FileName
+	switch {
+	case msg.File != nil && msg.File.URL != "":
+		t.MediaURI = string(msg.File.URL)
+	case msg.URL != "":
+		t.MediaURI = string(msg.URL)
+	}
+}
+
 func (d *Dispatcher) record(t Trigger) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if t.EventID != "" {
+	if t.MessageID != "" {
 		for i := 0; i < d.count; i++ {
-			if d.ring[i].EventID == t.EventID {
+			if d.ring[i].MessageID == t.MessageID {
 				return false
 			}
 		}
@@ -170,7 +194,7 @@ func (d *Dispatcher) enqueue(t Trigger) {
 	select {
 	case d.queue <- t:
 	default:
-		d.log.Printf("webhook queue full; dropping trigger %s", t.EventID)
+		d.log.Printf("webhook queue full; dropping trigger %s", t.MessageID)
 	}
 }
 
@@ -244,7 +268,7 @@ func (d *Dispatcher) worker(ctx context.Context) {
 func (d *Dispatcher) deliver(ctx context.Context, t Trigger) {
 	body, err := json.Marshal(t)
 	if err != nil {
-		d.log.Printf("webhook encode failed for %s: %v", t.EventID, err)
+		d.log.Printf("webhook encode failed for %s: %v", t.MessageID, err)
 		return
 	}
 	for attempt := 0; ; attempt++ {
@@ -253,7 +277,7 @@ func (d *Dispatcher) deliver(ctx context.Context, t Trigger) {
 			return
 		}
 		if attempt >= d.retries {
-			d.log.Printf("webhook delivery failed for %s after %d retries: %v", t.EventID, d.retries, err)
+			d.log.Printf("webhook delivery failed for %s after %d retries: %v", t.MessageID, d.retries, err)
 			return
 		}
 		timer := time.NewTimer(d.retryDelay)
