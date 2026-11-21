@@ -50,7 +50,9 @@ The old **input** names are still accepted, as deprecated aliases documented in 
 schema, so a model that guesses `room_id` still works. The old **output** names are gone: no
 result carries `room_id`, `event_id`, `body` or `msgtype` any more. Configuration keeps its
 Matrix vocabulary (`MATRIX_*`, `ALLOWED_SEND_ROOMS`), and `rooms` remains a hidden CLI alias
-of `chats`.
+of `chats`. The webhook payload (`TRIGGER_WEBHOOK_URL`) also keeps its field names, because
+consumers outside the MCP surface parse it; only its placeholder text for a captionless file
+follows the new vocabulary (`[document]`).
 
 ## Features
 

@@ -37,7 +37,10 @@ Two things deliberately keep Matrix vocabulary: the underlying error strings fro
 client layer (`matrix: invalid room ID`, `matrix: event not found in room`, and so on,
 quoted in the tables below), and the configuration surface (`MATRIX_*`,
 `ALLOWED_SEND_ROOMS`, the allowlist file). Both name the Matrix mechanism they configure,
-not the WhatsApp conversation the caller cares about.
+not the WhatsApp conversation the caller cares about. The webhook payload
+(`TRIGGER_WEBHOOK_URL`) keeps its field names too, because consumers outside the MCP
+surface parse it; only its placeholder text for a captionless file follows the new
+vocabulary (`[document]`).
 
 ## Conventions
 
