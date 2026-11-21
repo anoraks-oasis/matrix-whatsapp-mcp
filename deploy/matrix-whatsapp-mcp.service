@@ -17,7 +17,7 @@ Environment=MCP_TRANSPORT=http
 Environment=HTTP_ADDR=127.0.0.1:8080
 
 # Holds MATRIX_HOMESERVER, MATRIX_USER_ID, MATRIX_ACCESS_TOKEN and any optional
-# variables. Keep it root:matrix-mcp 0640 so `rooms allow` can be run as the
+# variables. Keep it root:matrix-mcp 0640 so `chats allow` can be run as the
 # service user.
 EnvironmentFile=/etc/matrix-whatsapp-mcp/env
 

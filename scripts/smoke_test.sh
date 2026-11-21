@@ -4,7 +4,7 @@
 #
 # It builds the binary with the pure-Go olm backend (the goolm tag), verifies
 # the configuration error path, exercises a real stdio JSON-RPC round trip, and
-# optionally checks homeserver reachability and the authenticated list_rooms
+# optionally checks homeserver reachability and the authenticated list_chats
 # path. It never prints the access token and never stores secrets.
 #
 # Usage:
@@ -58,7 +58,7 @@ pass "binary exits non-zero and names every missing variable"
 
 # 2b. The subcommands must fail the same way without configuration, and must not
 #     fall through to serving MCP (which would hang on stdin).
-for cmd in rooms doctor; do
+for cmd in chats rooms doctor; do
 	set +e
 	sub_out="$(env -i "$BIN" "$cmd" 2>&1)"
 	sub_status=$?
@@ -72,7 +72,7 @@ for cmd in rooms doctor; do
 		fi
 	done
 done
-pass "rooms and doctor exit non-zero and name every missing variable"
+pass "chats, rooms and doctor exit non-zero and name every missing variable"
 
 # 3. Read-only homeserver reachability check (skipped without credentials).
 if [ -n "${MATRIX_HOMESERVER:-}" ] && [ -n "${MATRIX_USER_ID:-}" ] && [ -n "${MATRIX_ACCESS_TOKEN:-}" ]; then
@@ -110,7 +110,7 @@ run_stdio_round_trip() {
 # 4. Offline stdio round trip: assert all nine tool names come back.
 info "running offline stdio JSON-RPC round trip"
 stdio_out="$(run_stdio_round_trip)"
-for tool in list_rooms read_messages search_messages get_message_context list_participants get_media get_recent_triggers send_message send_media; do
+for tool in list_chats get_messages search_messages get_message_context list_chat_contacts get_media get_new_messages send_message send_media; do
 	if ! grep -qF "\"name\":\"$tool\"" <<<"$stdio_out"; then
 		fail "tools/list response is missing $tool: $stdio_out"
 	fi
@@ -119,8 +119,8 @@ pass "stdio round trip returned all nine tools"
 
 # 5. Authenticated section: only when a real token is present. Never printed.
 if [ -n "${MATRIX_HOMESERVER:-}" ] && [ -n "${MATRIX_USER_ID:-}" ] && [ -n "${MATRIX_ACCESS_TOKEN:-}" ]; then
-	info "running authenticated list_rooms through the MCP server"
-	LIST_ROOMS_JSON='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_rooms","arguments":{}}}'
+	info "running authenticated list_chats through the MCP server"
+	LIST_CHATS_JSON='{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_chats","arguments":{}}}'
 	auth_out="$(env -i PATH="$PATH" \
 		MATRIX_HOMESERVER="${MATRIX_HOMESERVER}" \
 		MATRIX_USER_ID="${MATRIX_USER_ID}" \
@@ -129,13 +129,13 @@ if [ -n "${MATRIX_HOMESERVER:-}" ] && [ -n "${MATRIX_USER_ID:-}" ] && [ -n "${MA
 		ALLOWED_SEND_ROOMS="${ALLOWED_SEND_ROOMS:-}" \
 		MCP_TRANSPORT="stdio" \
 		"$BIN" 2>/dev/null < <({
-			printf '%s\n' "$INIT_JSON" "$INITIALIZED_JSON" "$LIST_TOOLS_JSON" "$LIST_ROOMS_JSON"
+			printf '%s\n' "$INIT_JSON" "$INITIALIZED_JSON" "$LIST_TOOLS_JSON" "$LIST_CHATS_JSON"
 			sleep "$SMOKE_STDIO_SETTLE"
 		}))"
 	if grep -qF '"id":3' <<<"$auth_out"; then
-		pass "authenticated list_rooms returned a result"
+		pass "authenticated list_chats returned a result"
 	else
-		warn "authenticated list_rooms produced no id:3 response"
+		warn "authenticated list_chats produced no id:3 response"
 	fi
 else
 	info "skipping authenticated section: MATRIX_HOMESERVER/MATRIX_USER_ID/MATRIX_ACCESS_TOKEN not all set"

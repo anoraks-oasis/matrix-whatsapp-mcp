@@ -13,7 +13,7 @@ A single Go binary that keeps a Matrix `/sync` listener on a mautrix/whatsapp br
 
 ## What it does
 
-The binary logs into a Matrix homeserver as an ordinary account, syncs bridged rooms, and answers MCP tool calls about them: list rooms, read a page of history, search it, read the messages around one event, list a room's participants, fetch an attachment, replay the incoming-message triggers it has seen, and send a reply or a photo. Sending is disabled by default and fails closed: only rooms on an allowlist can receive a message. It also listens for room invitations and can join them on its own, so a newly bridged chat becomes usable without opening Element.
+The binary logs into a Matrix homeserver as an ordinary account, syncs the chats the bridge relays, and answers MCP tool calls about them: list chats, read a page of history, search it, read the messages around one message, list a chat's contacts, fetch an attachment, replay the incoming messages it has seen, and send a reply or a photo. Sending is disabled by default and fails closed: only chats on an allowlist can receive a message. It also listens for chat invitations and can join them on its own, so a newly relayed chat becomes usable without opening Element.
 
 ```mermaid
 flowchart LR
@@ -23,34 +23,63 @@ flowchart LR
   bridge <--> whatsapp["WhatsApp"]
 ```
 
+## Terminology
+
+The tools speak WhatsApp, because the agent calling them is doing WhatsApp work. The IDs
+underneath are still Matrix IDs, handed out by the bridge.
+
+| Word | Meaning |
+| --- | --- |
+| `chat`, `chat_id` | One WhatsApp conversation. The ID is a Matrix room ID such as `!abc:example.com`; the bridge sometimes omits the `:server` part, which is valid. |
+| `message`, `message_id` | One WhatsApp message. The ID is a Matrix event ID such as `$abc123`. |
+| `contact` | A participant in a chat: a WhatsApp contact or group, the bridge bot, or a plain Matrix account. |
+| `type` | `text`, `image`, `video`, `audio`, `document`, `sticker`, `location`, or `other`. |
+| `whatsapp` | Whether the chat or contact belongs to WhatsApp rather than being a plain Matrix room or account. |
+| `media_uri` | An opaque reference to an attachment's stored bytes. |
+
+Renamed from the Matrix-era surface:
+
+| Old | New |
+| --- | --- |
+| `list_rooms`, `read_messages`, `list_participants`, `get_recent_triggers` | `list_chats`, `get_messages`, `list_chat_contacts`, `get_new_messages` |
+| `room_id`, `event_id`, `since_timestamp` | `chat_id`, `message_id`, `since` |
+| `room_name`, `sender`, `body`, `msgtype`, `redacted`, `mxc_uri`, `bridged`, `bridge_kind` | `chat_name`, `from`, `text`, `type`, `deleted`, `media_uri`, `whatsapp`, `contact_type` |
+| `scanned_rooms`, `scanned_events`, `participants` | `scanned_chats`, `scanned_messages`, `contacts` |
+
+The old **input** names are still accepted, as deprecated aliases documented in each tool's
+schema, so a model that guesses `room_id` still works. The old **output** names are gone: no
+result carries `room_id`, `event_id`, `body` or `msgtype` any more. Configuration keeps its
+Matrix vocabulary (`MATRIX_*`, `ALLOWED_SEND_ROOMS`), and `rooms` remains a hidden CLI alias
+of `chats`.
+
 ## Features
 
 **Read**
 
-- `list_rooms` — every joined room, its display name, and a best-effort flag for whether it comes from WhatsApp.
-- `read_messages` — one page of a room's history, oldest first, behind an opaque `next_token`. Each message carries `reply_to`, `edit_of`, `mentions` and `redacted`, so a client reads a conversation instead of isolated events, plus `mimetype`, `filename`, `size_bytes`, `width`, `height`, `duration_ms` and `mxc_uri` when it has an attachment.
-- `search_messages` — the homeserver's own search index first; when it has none, a bounded scan of the 50 newest messages in at most 10 rooms, with `truncated`, `scanned_rooms`, `scanned_events` and `source` reporting what actually happened.
+- `list_chats` — every joined chat, its display name, and a best-effort flag for whether it is a WhatsApp chat relayed by the bridge.
+- `get_messages` — one page of a chat's history, oldest first, behind an opaque `next_token`. Each message carries `reply_to`, `edit_of`, `mentions` and `deleted`, so a client reads a conversation instead of isolated messages, plus `mimetype`, `filename`, `size_bytes`, `width`, `height`, `duration_ms` and `media_uri` when it has an attachment.
+- `search_messages` — the homeserver's own search index first; when it has none, a bounded scan of the 50 newest messages in at most 10 chats, with `truncated`, `scanned_chats`, `scanned_messages` and `source` reporting what actually happened.
 - `get_message_context` — one message with up to 50 messages on each side, and `reply_to`/`edit_of` resolved to full messages.
-- `list_participants` — joined members with `bridged` and `bridge_kind` (`whatsapp_contact`, `whatsapp_bot`, or empty).
-- `get_media` — one message's attachment, returned as a text block with its metadata (mimetype, filename, size, dimensions, whether it was downscaled, mxc URI) plus an `image` or `audio` content block when the payload fits about 1.5 MiB of base64. Images are downscaled to `max_dimension` (default 1568) and re-encoded; a 25 MiB download cap applies, and nothing is cached or written to disk.
-- `get_recent_triggers` — the newest 100 incoming messages the process has seen, newest first.
+- `list_chat_contacts` — joined contacts with `whatsapp` and `contact_type` (`whatsapp_contact`, `bridge_bot`, or `matrix_user`).
+- `get_media` — one message's attachment, returned as a text block with its metadata (mimetype, filename, size, dimensions, whether it was downscaled, media URI) plus an `image` or `audio` content block when the payload fits about 1.5 MiB of base64. Images are downscaled to `max_dimension` (default 1568) and re-encoded; a 25 MiB download cap applies, and nothing is cached or written to disk.
+- `get_new_messages` — the newest 100 incoming messages the process has seen, newest first, each with `chat_id`, `chat_name`, `message_id`, `from`, `text`, `type` and `timestamp`.
 
 **Write**
 
 - `send_message` — plain text, optionally as a reply (`reply_to`) and optionally idempotent (`idempotency_key`, 10-minute window).
 - `send_media` — an image, video, voice note or file from an absolute path or base64 data, with a caption that WhatsApp shows under it, the same `reply_to` and `idempotency_key` handling, and a 50 MiB upload cap.
-- Fail-closed allowlist: an empty allowlist makes the server read-only, and a room missing from a non-empty one is rejected.
-- One message per 3 seconds across all rooms, shared by both sending tools, with the retry delay in the error.
+- Fail-closed allowlist: an empty allowlist makes the server read-only, and a chat missing from a non-empty one is rejected.
+- One message per 3 seconds across all chats, shared by both sending tools, with the retry delay in the error.
 - Bridge-ack guard: a message the WhatsApp bridge refuses is reported as a failure with the bridge's own notice, not as success.
 
 **Operate**
 
-- CLI: `rooms`, `rooms allow|deny`, `doctor`.
-- Live allowlist file: `rooms allow` takes effect in the running server within a second, with no restart and no `.env` edit.
-- Auto-join of room invitations, optionally restricted to an inviter allowlist.
+- CLI: `chats`, `chats allow|deny`, `doctor`. `rooms` and `rooms allow|deny` still work as hidden aliases.
+- Live allowlist file: `chats allow` takes effect in the running server within a second, with no restart and no `.env` edit.
+- Auto-join of chat invitations, optionally restricted to an inviter allowlist.
 - Optional webhook: every incoming message is also POSTed as JSON (5-second timeout, one retry); the newest 100 are always kept in an in-memory ring buffer.
 - Streamable HTTP or stdio transport.
-- End-to-end encryption behind `MATRIX_E2EE_ENABLED`, with a SQLite crypto store; plaintext sends into an encrypted room are refused while it is off.
+- End-to-end encryption behind `MATRIX_E2EE_ENABLED`, with a SQLite crypto store; plaintext sends into an encrypted chat are refused while it is off.
 
 ## Quick start
 
@@ -145,35 +174,35 @@ Streamable HTTP — start the server with `MCP_TRANSPORT=http` first, then point
 
 What the client sees:
 
-- `list_rooms` → `[{room_id, name, bridged}]`
-- `read_messages` → `{messages: [...], has_more, next_token}`, oldest first
-- `search_messages` → `{results: [...], truncated, scanned_rooms, scanned_events, source}`
+- `list_chats` → `[{chat_id, name, whatsapp}]`
+- `get_messages` → `{messages: [...], has_more, next_token}`, oldest first
+- `search_messages` → `{results: [...], truncated, scanned_chats, scanned_messages, source}`
 - `get_message_context` → `{events_before, event, events_after, reply_to?, edit_of?, source, truncated}`
-- `list_participants` → `{participants: [{user_id, display_name, membership, bridged, bridge_kind}]}`
+- `list_chat_contacts` → `{contacts: [{user_id, display_name, membership, whatsapp, contact_type}]}`
 - `get_media` → a `text` block with the metadata JSON, plus an `image` or `audio` block when the payload qualifies
-- `get_recent_triggers` → `[{event_id, room_id, room_name, sender, body, msgtype, timestamp}]`, newest first
-- `send_message` → `{event_id, deduplicated}`
-- `send_media` → `{event_id, deduplicated, msgtype, mxc_uri}`
+- `get_new_messages` → `[{message_id, chat_id, chat_name, from, text, type, timestamp}]`, newest first
+- `send_message` → `{message_id, deduplicated}`
+- `send_media` → `{message_id, deduplicated, type, media_uri}`
 
 The full contract — every input, clamp, annotation and error — is in [docs/tools.md](docs/tools.md).
 
 ## CLI
 
-`rooms` lists joined rooms and whether each one is send-allowed; `doctor` checks the configuration against the homeserver.
+`chats` lists joined chats and whether each one is send-allowed; `doctor` checks the configuration against the homeserver. `rooms` is still accepted as a hidden alias of `chats`.
 
 ```
-$ matrix-whatsapp-mcp rooms
-  #  NAME             ROOM ID              BRIDGED  SEND
-  1  Cafe             !cafe:example.com    no       no
-  2  Family WhatsApp  !family:example.com  yes      yes
+$ matrix-whatsapp-mcp chats
+  #  NAME             CHAT ID              WHATSAPP  SEND
+  1  Family WhatsApp  !family:example.com  yes       yes
+  2  Cafe             !cafe:example.com    no        no
 
-2 room(s), 1 send-allowed
+2 chat(s), 1 send-allowed
 allowlist: 1 from ALLOWED_SEND_ROOMS, 0 from /home/me/.config/matrix-whatsapp-mcp/allow.txt (not created yet)
 ```
 
 ```
-$ matrix-whatsapp-mcp rooms allow --index 1
-allowed "Cafe" (!cafe:example.com)
+$ matrix-whatsapp-mcp chats allow --index 1
+allowed "Family WhatsApp" (!family:example.com)
 wrote /home/me/.config/matrix-whatsapp-mcp/allow.txt
 the running server picks this up within a second; no restart needed
 ```
@@ -191,16 +220,16 @@ config
 checks
   [ok  ] versions        HTTP 200 in 0s, 2 versions, newest v1.11
   [ok  ] whoami          @bot:example.com (device DEVICE)
-  [ok  ] joined rooms    2 joined, 1 bridged from WhatsApp
+  [ok  ] joined chats    2 joined, 1 on WhatsApp
   [ok  ] send allowlist  1 from ALLOWED_SEND_ROOMS, 1 from /home/me/.config/matrix-whatsapp-mcp/allow.txt
   [ok  ] crypto db       not needed, MATRIX_E2EE_ENABLED is false
 
-joined rooms
-  #  NAME             ROOM ID              BRIDGED  SEND
-  1  Cafe             !cafe:example.com    no       yes
-  2  Family WhatsApp  !family:example.com  yes      yes
+joined chats
+  #  NAME             CHAT ID              WHATSAPP  SEND
+  1  Family WhatsApp  !family:example.com  yes       yes
+  2  Cafe             !cafe:example.com    no        yes
 
-2 room(s), 2 send-allowed
+2 chat(s), 2 send-allowed
 allowlist: 1 from ALLOWED_SEND_ROOMS, 1 from /home/me/.config/matrix-whatsapp-mcp/allow.txt
 
 send allowlist
@@ -213,19 +242,19 @@ send allowlist
 all 5 checks passed
 ```
 
-These samples come from a real run of the built binary against a local fixture homeserver; names, IDs and timings are that fixture's. Exit status is `0` when everything passed, `1` when a check failed, and `2` for a usage error. `rooms allow|deny` also accepts a room ID, an exact name, or a case-insensitive part of either, and refuses to guess between several matches:
+These samples show the output format of the built binary; names, IDs and timings come from a fixture account. Exit status is `0` when everything passed, `1` when a check failed, and `2` for a usage error. `chats allow|deny` also accepts a chat ID, an exact name, or a case-insensitive part of either, and refuses to guess between several matches:
 
 ```
-$ matrix-whatsapp-mcp rooms allow family
-error: "family" matches 2 rooms, refusing to guess:
+$ matrix-whatsapp-mcp chats allow family
+error: "family" matches 2 chats, refusing to guess:
   "Family Photos" (!family2:example.com)
   "Family WhatsApp" (!family:example.com)
-name one of them exactly, pass the room ID, or use --index N
+name one of them exactly, pass the chat ID, or use --index N
 ```
 
 ## WhatsApp delivery needs relay mode
 
-The bridge only forwards a message when the sending account has a WhatsApp login it can speak for. That means `bridge.relay.enabled` must be set in the bridge's config and the account must be permitted to relay through the bridge bot (`!wa set-relay` in the room); otherwise the bridge has no login to use and rejects the message. Matrix still accepts the event, so without a check the send would look successful. That is why the bridge-ack guard exists: for `MATRIX_BRIDGE_ACK_TIMEOUT` (1s by default) the server watches the room for the bridge's rejection notice and fails the send with the notice's text. If your bridge is slow, raise the timeout; the guard can only report what it sees inside the window.
+The bridge only forwards a message when the sending account has a WhatsApp login it can speak for. That means `bridge.relay.enabled` must be set in the bridge's config and the account must be permitted to relay through the bridge bot (`!wa set-relay` in the chat); otherwise the bridge has no login to use and rejects the message. Matrix still accepts the message, so without a check the send would look successful. That is why the bridge-ack guard exists: for `MATRIX_BRIDGE_ACK_TIMEOUT` (1s by default) the server watches the chat for the bridge's rejection notice and fails the send with the notice's text. If your bridge is slow, raise the timeout; the guard can only report what it sees inside the window.
 
 ## Docs
 
@@ -239,7 +268,7 @@ The bridge only forwards a message when the sending account has a WhatsApp login
 
 ## Security
 
-The access token and pickle key live only in the environment, are never logged, and are redacted from any rendering of the configuration; the send allowlist fails closed, so an unconfigured server cannot write to a room. Please never paste tokens into an issue. Details, including how to report a vulnerability privately, are in [docs/security.md](docs/security.md).
+The access token and pickle key live only in the environment, are never logged, and are redacted from any rendering of the configuration; the send allowlist fails closed, so an unconfigured server cannot write to a chat. Please never paste tokens into an issue. Details, including how to report a vulnerability privately, are in [docs/security.md](docs/security.md).
 
 ## License
 

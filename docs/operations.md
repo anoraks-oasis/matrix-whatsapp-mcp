@@ -24,7 +24,7 @@ Network exposure:
   of it — the MCP transport carries none — so bind it to `127.0.0.1` and put a
   reverse proxy with authentication in front if anything else must reach it.
 
-The account needs no special power beyond being joined to the rooms it should read.
+The account needs no special power beyond being joined to the chats it should read.
 Its access token is the whole of its identity, and it must belong to `MATRIX_USER_ID`
 (the server checks this on the first sync and refuses to run on a mismatch).
 
@@ -123,16 +123,17 @@ redirect output to a file instead (`StandardOutput=append:/var/log/...`), use
 logrotate with `copytruncate`: the process holds stderr open and has no reopen
 signal.
 
-## Enrolling a room
+## Enrolling a chat
 
-Enrolling a room is three steps: invite the bot from Element, find the room with
-`rooms`, then allow it with `rooms allow --index N`. When the service runs as another
+Enrolling a chat is three steps: invite the bot from Element, find the chat with
+`chats`, then allow it with `chats allow --index N`. When the service runs as another
 user, both the service and your shell must resolve the same allowlist path — that is
-the one difference.
+the one difference. `rooms` and `rooms allow|deny` still work as hidden aliases, so a
+script written before the rename keeps working.
 
 ```sh
-sudo -u matrix-mcp bash -c 'set -a; . /etc/matrix-whatsapp-mcp/env; set +a; exec matrix-whatsapp-mcp rooms'
-sudo -u matrix-mcp bash -c 'set -a; . /etc/matrix-whatsapp-mcp/env; set +a; exec matrix-whatsapp-mcp rooms allow --index 2'
+sudo -u matrix-mcp bash -c 'set -a; . /etc/matrix-whatsapp-mcp/env; set +a; exec matrix-whatsapp-mcp chats'
+sudo -u matrix-mcp bash -c 'set -a; . /etc/matrix-whatsapp-mcp/env; set +a; exec matrix-whatsapp-mcp chats allow --index 2'
 ```
 
 The running server re-reads the file within a second; nothing restarts.
@@ -148,7 +149,7 @@ matrix-whatsapp-mcp doctor
 | `config` | Every required variable is set and well formed. A failure prints every problem at once and stops the run. |
 | `versions` | `GET {MATRIX_HOMESERVER}/_matrix/client/versions` answers `200`, which separates a wrong URL or an unreachable homeserver from a bad token. It is unauthenticated, so no secret is sent. |
 | `whoami` | The token is valid and belongs to `MATRIX_USER_ID`. A mismatch names both IDs. |
-| `joined rooms` | The rooms the account can see and how many look bridged from WhatsApp. The bridged probes are cut off after 20 seconds and the output says so. |
+| `joined chats` | The chats the account can see and how many are on WhatsApp. The WhatsApp probes are cut off after 20 seconds and the output says so. |
 | `send allowlist` | The effective allowlist and where each entry came from: `ALLOWED_SEND_ROOMS`, the allowlist file, or both. Empty is reported as read-only, which is a valid state. |
 | `crypto db` | Only with E2EE on: the SQLite crypto store is writable. This is a `[warn]` and still exits non-zero, because the server cannot start without it. |
 
@@ -167,19 +168,19 @@ for a usage error. Failures never echo the access token or the pickle key.
 - **`M_UNKNOWN_TOKEN` / authentication errors** — the access token was revoked or
   expired. Issue a new one, update the environment file, restart. The process exits
   non-zero on an invalid token so a supervisor can restart it once the fix is in.
-- **`list_rooms` returns nothing** — the account has joined no rooms, the rooms are
+- **`list_chats` returns nothing** — the account has joined no chats, they are
   inaccessible to the token, or the bridge has not populated them yet.
-- **Sending is rejected** — sending fails closed. Run `rooms` and read the `SEND`
-  column, then `rooms allow --index N`. An empty allowlist means read-only.
-- **`rooms allow` did not make a room sendable** — the running server and the command
+- **Sending is rejected** — sending fails closed. Run `chats` and read the `SEND`
+  column, then `chats allow --index N`. An empty allowlist means read-only.
+- **`chats allow` did not make a chat sendable** — the running server and the command
   resolved different `MATRIX_ALLOWLIST_FILE` paths. Set the same absolute path in
   both places.
-- **`rooms deny` exits non-zero and the room stays sendable** — the room is listed in
+- **`chats deny` exits non-zero and the chat stays sendable** — the chat is listed in
   `ALLOWED_SEND_ROOMS`, which the command does not edit. Remove it there and restart.
 - **The bot never joins after an invite** — look for an `auto-join:` line. Without
   `MATRIX_AUTO_JOIN_INVITES=true` nothing joins for you; with
   `MATRIX_INVITE_ALLOWLIST` set, other inviters are refused by design.
 - **`--index 3` says it is out of range** — the numbers come from the current
-  listing; re-run `rooms` and use the number printed there.
+  listing; re-run `chats` and use the number printed there.
 - **Every send succeeds but nothing arrives on WhatsApp** — relay mode. See the
   relay section of the [README](../README.md#whatsapp-delivery-needs-relay-mode).

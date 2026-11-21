@@ -15,7 +15,7 @@ flowchart TB
     allow["internal/allowlist<br/>env ∪ file"]
     trig["internal/trigger<br/>ring buffer, webhook"]
     mcp["internal/mcpserver<br/>nine tools, send gate"]
-    cli["internal/cli<br/>rooms, doctor"]
+    cli["internal/cli<br/>chats, doctor"]
   end
   mcp --> mtx
   mcp --> trig
@@ -44,7 +44,7 @@ flowchart TB
 | `internal/allowlist` | The effective send allowlist: the `ALLOWED_SEND_ROOMS` baseline unioned with a plain-text file that is re-read as it changes. |
 | `internal/trigger` | Turns `m.room.message` events into triggers, keeps the newest 100, and optionally POSTs them to a webhook. |
 | `internal/mcpserver` | The MCP server: nine tool handlers, the send gate (allowlist plus rate limit), the idempotency cache, and the in-memory image handling `get_media` needs. |
-| `internal/cli` | `rooms`, `rooms allow`/`rooms deny`, `doctor`. Every process edge is injectable, so the commands are tested without a homeserver or a terminal. |
+| `internal/cli` | `chats`, `chats allow`/`chats deny`, `doctor`; `rooms` stays a hidden alias of the same commands. Every process edge is injectable, so the commands are tested without a homeserver or a terminal. |
 
 The `MatrixService` interface is the seam: the MCP layer and the CLI are written
 against it, so unit tests replace the homeserver with a mock and no test needs a
@@ -97,9 +97,10 @@ and a join by `Close`. A refusal is logged and leaves the invitation pending.
 
 ## The ring buffer and webhook
 
-The dispatcher keeps the newest 100 triggers (`trigger.BufferSize`) in a
-mutex-protected ring. `get_recent_triggers` reads from it newest first; a trigger
-whose event ID is already in the buffer is not recorded twice.
+The dispatcher keeps the newest 100 incoming messages (`trigger.BufferSize`) in a
+mutex-protected ring. `get_new_messages` reads from it newest first, presenting them
+with the WhatsApp field names; a message whose ID is already in the buffer is not
+recorded twice.
 
 Webhook delivery is separate from recording. When `TRIGGER_WEBHOOK_URL` is set, each
 new trigger is queued (256 slots, four workers) and POSTed as JSON with a 5-second
@@ -132,18 +133,18 @@ endpoint for the life of the process. Full bounds and error semantics are in
 
 ## Media
 
-`get_media` is a read path with its own shape: it fetches one event, reads the
+`get_media` is a read path with its own shape: it fetches one message, reads the
 attachment descriptor from `content.url` or `content.file` plus `content.info`, and
 downloads the payload into memory. Nothing is cached and nothing touches disk.
 
 ```
 get_media
-  → event_id validation (matrix.ValidEventID) before any request
+  → message_id validation (matrix.ValidEventID) before any request
   → GET /rooms/{roomId}/event/{eventId}
-  → m.room.encrypted? decrypt with the crypto helper, or refuse when E2EE is off
-  → attachment descriptor: mxc URI, mimetype, filename, size, w/h/duration
+  → encrypted? decrypt with the crypto helper, or refuse when E2EE is off
+  → attachment descriptor: media URI, mimetype, filename, size, w/h/duration
   → GET /_matrix/client/v1/media/download/{serverName}/{mediaId}, capped at 25 MiB
-  → content.file? decrypt with the key and SHA-256 embedded in the event
+  → encrypted attachment? decrypt with the key and SHA-256 embedded in the message
   → images: decode, fit max_dimension (256..4096, default 1568), re-encode within
     about 1.5 MiB of base64 — JPEG quality 85..35, then 3/4 dimension steps to 64 px
   → text block with the metadata, plus an image or audio block when it fits
@@ -164,7 +165,7 @@ send_media
   → exactly one of path / data_base64, absolutism, readability, regular file, 50 MiB
   → idempotency claim keyed by SHA-256 of the payload (a replay uploads nothing)
   → send gate: effective allowlist, then the same one-token-per-3-seconds bucket
-  → media encryption when the room is encrypted (content.file rather than content.url)
+  → media encryption when the chat is encrypted (the encrypted descriptor rather than the plaintext one)
   → POST /_matrix/media/v3/upload
   → POST /rooms/{roomId}/send/m.room.message with m.image|m.video|m.audio|m.file
   → bridge-ack guard, then settle the idempotency key
@@ -177,46 +178,45 @@ send_message
   → text / reply_to / idempotency_key validation
   → idempotency claim (replay or reservation)
   → send gate: effective allowlist, then one token per 3 seconds
-  → matrix.SendText: room ID, allowlist again, text, reply ID
-  → encryption check (refuse plaintext in an encrypted room when E2EE is off)
+  → matrix.SendText: chat ID, allowlist again, text, reply ID
+  → encryption check (refuse plaintext in an encrypted chat when E2EE is off)
   → POST /rooms/{roomId}/send/m.room.message
   → bridge-ack guard: poll for the bridge's rejection notice
-  → settle the idempotency key with the event ID
+  → settle the idempotency key with the message ID
 ```
 
 **The gate.** `sendGate` combines the live allowlist with a single-token bucket.
-An empty allowlist rejects every send as read-only; a room outside a non-empty list
+An empty allowlist rejects every send as read-only; a chat outside a non-empty list
 is rejected without spending the token; a throttled call returns
 `rate limited, retry in Ns` rather than blocking. The allowlist is consulted per
-send, which is why `rooms allow` takes effect without a restart. `SendText` checks
+send, which is why `chats allow` takes effect without a restart. `SendText` checks
 the same store again, so a caller that reaches it by another route is still gated.
 
-**The bridge-ack guard.** Matrix accepting an event does not prove WhatsApp saw it.
-A bridge that cannot forward a message posts an `m.notice` into the room that relates
-to the sent event. After sending, `SendText` polls the room's 20 newest events every
+**The bridge-ack guard.** Matrix accepting a message does not prove WhatsApp saw it.
+A bridge that cannot forward a message posts a notice into the chat that relates to
+the sent message. After sending, `SendText` polls the chat's 20 newest entries every
 100ms for up to `MATRIX_BRIDGE_ACK_TIMEOUT` and looks for a notice from another
-account whose relation — flat `m.relates_to.event_id` or the reply form
-`m.relates_to.m.in_reply_to.event_id` — points at the sent event. A match becomes a
-`BridgeNoticeError`, which matches `matrix.ErrNotBridged`, carries the sent event ID
-and the notice text flattened to one line, and fails the tool call. No match inside
+account whose relation — flat or the reply form — points at the sent message. A
+match becomes a `BridgeNoticeError`, which matches `matrix.ErrNotBridged`, carries the
+sent message ID and the notice text flattened to one line, and fails the tool call. No match inside
 the window means success. The guard starts no goroutine, honours the caller's
 context, and issues no request at all when the timeout is `0`.
 
 ## The allowlist file
 
-`allowlist.Store` is the single answer to "may this room receive a message": the
+`allowlist.Store` is the single answer to "may this chat receive a message": the
 `ALLOWED_SEND_ROOMS` baseline unioned with the file, deduplicated, sorted. Both the
 MCP send gate and the Matrix client hold the same instance.
 
 The file is read at most once per second and only when the allowlist is consulted —
-on the next send, or the next `rooms`/`doctor` run. There is no watcher goroutine,
+on the next send, or the next `chats`/`doctor` run. There is no watcher goroutine,
 so there is nothing to leak and no restart to forget. A re-read compares the bytes it
 got with the bytes it has instead of trusting `mtime`, because timestamp resolution
 varies by filesystem and a same-size rewrite inside one tick would otherwise go
 unnoticed. An unreadable file keeps the last known list and logs the problem once; a
 malformed line is a warning naming its line number and is otherwise skipped.
 
-`Add` and `Remove` (behind `rooms allow` and `rooms deny`) rewrite the file through a
+`Add` and `Remove` (behind `chats allow` and `chats deny`) rewrite the file through a
 temporary file in the same directory plus a `rename`, after an `fsync`, with `0600`
 on the file and `0700` on a directory they create. A concurrent reader sees either
 the old file or the new one. Existing comments and ordering are kept. An empty
@@ -226,10 +226,10 @@ result is still read-only: the store offers no way to make the gate permissive.
 
 With `MATRIX_E2EE_ENABLED=true`, the first sync initialises
 `mautrix/crypto/cryptohelper` with a SQLite store at `MATRIX_CRYPTO_DB_PATH` and the
-key from `MATRIX_PICKLE_KEY`. `SendText` then encrypts for the room. With E2EE off,
-an encrypted room is refused at send time rather than receiving plaintext. An
-encrypted event that cannot be decrypted is returned with `encrypted: true` and a
-fixed placeholder body, never ciphertext.
+key from `MATRIX_PICKLE_KEY`. `SendText` then encrypts for the chat. With E2EE off,
+an encrypted chat is refused at send time rather than receiving plaintext. An
+encrypted message that cannot be decrypted is returned with `encrypted: true` and a
+fixed placeholder text, never ciphertext.
 
 The crypto store is state: back it up or lose the ability to decrypt that session,
 and keep it out of version control (`.gitignore` covers `*.db`, `*.db-wal` and
@@ -260,14 +260,14 @@ unbounded fan-out.
 
 | Path | Bound |
 | --- | --- |
-| `list_rooms` probes | 8 concurrent, 10-second phase deadline; unfinished rooms are listed unprobed |
-| `read_messages` | 10 `/messages` pages, `5 × limit` raw events |
-| `search_messages` scan | 10 rooms, 50 messages per room |
+| `list_chats` probes | 8 concurrent, 10-second phase deadline; unfinished chats are listed unprobed |
+| `get_messages` | 10 `/messages` pages, `5 × limit` raw entries |
+| `search_messages` scan | 10 chats, 50 messages per chat |
 | `get_message_context` fallback | 5 pages × 100 raw events |
-| `list_participants` | 10-second call, 8 concurrent profile lookups of 2 seconds each |
+| `list_chat_contacts` | 10-second call, 8 concurrent profile lookups of 2 seconds each |
 | `send_message`, `send_media` | one send per 3 seconds, shared between them; bridge-ack poll bounded by `MATRIX_BRIDGE_ACK_TIMEOUT` |
 | `get_media` | 25 MiB download cap; images downscaled to `max_dimension` and re-encoded within about 1.5 MiB of base64 |
 | `send_media` | 50 MiB upload cap |
 | `Sync` | 30-second auto-join; backoff capped at 1 minute |
-| CLI commands | 30-second command budget, 20-second bridged-probe phase |
+| CLI commands | 30-second command budget, 20-second WhatsApp-probe phase |
 | HTTP server | 5s read-header, 30s read, 120s idle, 10s graceful shutdown |

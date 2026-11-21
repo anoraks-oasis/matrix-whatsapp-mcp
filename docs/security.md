@@ -31,21 +31,21 @@ Sending fails closed by construction:
 
 - An empty effective allowlist — `ALLOWED_SEND_ROOMS` and the allowlist file both
   empty — rejects every send as read-only.
-- A room outside a non-empty allowlist is rejected without spending a rate-limit
+- A chat outside a non-empty allowlist is rejected without spending a rate-limit
   token, and the Matrix layer checks the same store again before sending, so a
   caller that reaches `SendText` another way is still gated.
 - The allowlist is the union of the environment variable and the file, consulted per
-  send. `rooms allow` writes only the file; `rooms deny` edits only the file, and
-  exits non-zero when `ALLOWED_SEND_ROOMS` still permits the room instead of
+  send. `chats allow` writes only the file; `chats deny` edits only the file, and
+  exits non-zero when `ALLOWED_SEND_ROOMS` still permits the chat instead of
   pretending it was denied.
 - The file is `0600` in a `0700` directory when the CLI creates it, and writes go
   through a temporary file plus a rename, so a half-written allowlist is never read.
 
-**Reading is not gated.** `list_rooms`, `read_messages`, `search_messages`,
-`get_message_context`, `list_participants` and `get_media` see every room the account
+**Reading is not gated.** `list_chats`, `get_messages`, `search_messages`,
+`get_message_context`, `list_chat_contacts` and `get_media` see every chat the account
 has joined. The allowlist governs writing, not reading. If a deployment needs a narrower read
-scope, the correct control is the account's room membership: leave the bot out of
-rooms it should not read.
+scope, the correct control is the account's chat membership: leave the bot out of
+chats it should not read.
 
 ## Media
 
@@ -107,7 +107,7 @@ tell you an image is safe, and it does not try.
 ## Rate limiting
 
 `send_message` and `send_media` share one bucket: at most one message every 3
-seconds across all rooms, and a throttled call returns `rate limited, retry in Ns`
+seconds across all chats, and a throttled call returns `rate limited, retry in Ns`
 instead of blocking. This is not a defence against a determined attacker with the
 token — it is a bound on accident: an agent stuck in a retry loop cannot fill a
 family chat, and prompt-injected text that asks for a burst of messages produces one
@@ -162,7 +162,7 @@ echo the token.
 | File | Contains | Protection |
 | --- | --- | --- |
 | `.env` / `/etc/matrix-whatsapp-mcp/env` | access token, pickle key | outside the repository; `0600` or `0640 root:matrix-mcp` |
-| allowlist file | room IDs only | `0600` in a `0700` directory as created by `rooms allow` |
+| allowlist file | chat IDs only | `0600` in a `0700` directory as created by `chats allow` |
 | `matrix-crypto.db` | olm/megolm session state for E2EE | treat as key material; private, backed up, never committed |
 | nothing else | media is streamed through memory; no attachment is cached or written | — |
 | built binary | nothing secret | gitignored |

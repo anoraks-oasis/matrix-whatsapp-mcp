@@ -71,13 +71,13 @@ It builds the binary with `-tags goolm` into a temporary directory and:
 1. asserts the build produced an executable;
 2. runs the binary with an empty environment and checks it exits non-zero naming
    `MATRIX_HOMESERVER`, `MATRIX_USER_ID` and `MATRIX_ACCESS_TOKEN`;
-3. runs `rooms` and `doctor` the same way, proving they do not fall through to
-   serving MCP and hang on stdin;
+3. runs `chats`, `rooms` and `doctor` the same way, proving they do not fall through
+   to serving MCP and hang on stdin;
 4. performs a real stdio JSON-RPC round trip — `initialize`, `notifications/initialized`,
    `tools/list` — against a throwaway `127.0.0.1:9` configuration and asserts all
    nine tool names come back;
 5. only when `MATRIX_HOMESERVER`, `MATRIX_USER_ID` and `MATRIX_ACCESS_TOKEN` are all
-   set, checks `/versions` reachability and an authenticated `list_rooms` call.
+   set, checks `/versions` reachability and an authenticated `list_chats` call.
 
 The script never prints the access token. Overrides: `GOOLM_TAG` (build tag) and
 `SMOKE_STDIO_SETTLE` (seconds stdin is held open, default 2).
@@ -127,13 +127,13 @@ test "$unformatted" -eq 0
 
 ```
 cmd/server/            entrypoint: config, wiring, serve, shutdown
-internal/config/       environment → Config, room-ID rule
+internal/config/       environment → Config, chat-ID rule
 internal/logger/       the stderr logger
 internal/matrix/       mautrix wrapper: sync, reads, search, context, send, E2EE
 internal/allowlist/    env ∪ file send allowlist, atomic edits
 internal/trigger/      m.room.message → ring buffer + webhook
 internal/mcpserver/    nine tools, send gate, idempotency cache, in-memory media
-internal/cli/          rooms, rooms allow|deny, doctor
+internal/cli/          chats, chats allow|deny (rooms is a hidden alias), doctor
 scripts/smoke_test.sh  end-to-end smoke checks
 deploy/                systemd unit
 docs/                  tool reference, architecture, operations, security, reviews
