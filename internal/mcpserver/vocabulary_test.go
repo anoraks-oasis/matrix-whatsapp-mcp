@@ -3,6 +3,13 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -285,11 +292,15 @@ func TestMessageTypeMapping(t *testing.T) {
 	}
 }
 
-// TestDescriptionsSpeakWhatsApp keeps the Matrix vocabulary out of everything a
-// model reads: no tool or schema description says msgtype, bridged or mxc, and
-// "room" and "event" appear only where the Matrix ID format is being explained
-// or the deprecated alias is being named.
-func TestDescriptionsSpeakWhatsApp(t *testing.T) {
+// TestVocabularySpeaksWhatsApp is the leak scan: every error string the tool
+// packages can produce, every tool and schema description, and the server's
+// handshake instructions must read like a WhatsApp tool. Matrix vocabulary is
+// allowed only where it names a real identifier: an environment variable such
+// as MATRIX_E2EE_ENABLED, the ALLOWED_SEND_ROOMS variable, or the matrix_user
+// contact type. The ID formats themselves stay (`!abc:server`, `$abc123`) but
+// are described as chat and message references, so they carry no banned word.
+func TestVocabularySpeaksWhatsApp(t *testing.T) {
+	texts := errorTexts(t)
 	srv := New(&fakeMatrix{}, &fakeProber{}, &fakeRecent{}, nil)
 	session, cleanup := connect(t, srv)
 	defer cleanup()
@@ -298,26 +309,118 @@ func TestDescriptionsSpeakWhatsApp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tools/list: %v", err)
 	}
-	allowed := []string{"matrix room id", "matrix event id", "room_id", "event_id", "events_before", "events_after"}
+	texts = append(texts, instructions)
 	for _, tool := range res.Tools {
-		for _, desc := range descriptions(t, tool) {
-			lower := strings.ToLower(desc)
-			for _, banned := range []string{"msgtype", "bridged", "mxc"} {
-				if strings.Contains(lower, banned) {
-					t.Fatalf("%s description %q still says %q", tool.Name, desc, banned)
-				}
-			}
-			rest := lower
-			for _, phrase := range allowed {
-				rest = strings.ReplaceAll(rest, phrase, "")
-			}
-			for _, banned := range []string{"room", "event"} {
-				if strings.Contains(rest, banned) {
-					t.Fatalf("%s description %q uses %q outside an ID-format explanation", tool.Name, desc, banned)
-				}
+		texts = append(texts, descriptions(t, tool)...)
+	}
+
+	// Prove the scan sees all three sources, so a parser drift cannot turn
+	// this test into a silent pass.
+	for _, want := range []string{"could not read chat history", "this message has no attachment", "Tools for an agent working a WhatsApp account"} {
+		found := false
+		for _, text := range texts {
+			if strings.Contains(text, want) {
+				found = true
+				break
 			}
 		}
+		if !found {
+			t.Fatalf("scan did not collect %q; it is not looking at the right source", want)
+		}
 	}
+
+	for _, text := range texts {
+		if leak := matrixWord(text); leak != "" {
+			t.Errorf("tool-visible text %q still says %q", text, leak)
+		}
+	}
+}
+
+// allowedVocabulary strips the identifiers that legitimately carry Matrix
+// vocabulary: configuration names and the non-WhatsApp contact type.
+var allowedVocabulary = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)MATRIX_[A-Z0-9_]+`),
+	regexp.MustCompile(`(?i)ALLOWED_SEND_ROOMS`),
+}
+
+// matrixWord returns the first banned word in text, or "" when the text speaks
+// WhatsApp. The match is whole-word and case-insensitive, so "prevent" and
+// "eventual" are not flagged while "event" is.
+func matrixWord(text string) string {
+	for _, allowed := range allowedVocabulary {
+		text = allowed.ReplaceAllString(text, "")
+	}
+	for _, word := range []string{"matrix", "room", "event", "mxc"} {
+		if regexp.MustCompile(`(?i)\b` + word + `\b`).MatchString(text) {
+			return word
+		}
+	}
+	return ""
+}
+
+// errorTexts parses the packages behind the tool surface and returns every
+// string literal passed to errors.New or fmt.Errorf, so the scan covers errors
+// that are not exported constants too.
+func errorTexts(t *testing.T) []string {
+	t.Helper()
+	dirs := []string{"../matrix", "../mcpserver", "../trigger", "../allowlist"}
+	var out []string
+	for _, dir := range dirs {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("read %s: %v", dir, err)
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+				continue
+			}
+			path := filepath.Join(dir, name)
+			file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+			if err != nil {
+				t.Fatalf("parse %s: %v", path, err)
+			}
+			ast.Inspect(file, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok || len(call.Args) == 0 {
+					return true
+				}
+				switch fn := call.Fun.(type) {
+				case *ast.SelectorExpr:
+					pkg, ok := fn.X.(*ast.Ident)
+					if !ok {
+						return true
+					}
+					// failedText carries the tool-facing text of a failed
+					// transport call, with the raw cause kept out of it.
+					if fn.Sel.Name == "failedText" {
+						break
+					}
+					if (pkg.Name != "errors" || fn.Sel.Name != "New") && (pkg.Name != "fmt" || fn.Sel.Name != "Errorf") {
+						return true
+					}
+				case *ast.Ident:
+					// invalidPageToken attaches a short reason to the sentinel;
+					// that reason reaches the caller too.
+					if fn.Name != "invalidPageToken" {
+						return true
+					}
+				default:
+					return true
+				}
+				if lit, ok := call.Args[0].(*ast.BasicLit); ok && lit.Kind == token.STRING {
+					if text, err := strconv.Unquote(lit.Value); err == nil {
+						out = append(out, text)
+					}
+				}
+				return true
+			})
+		}
+	}
+	if len(out) == 0 {
+		t.Fatal("parsed no error strings; the scan is not looking at the source")
+	}
+	return out
 }
 
 // descriptions returns a tool's own description plus every description in its

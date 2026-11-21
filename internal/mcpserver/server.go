@@ -53,6 +53,15 @@ const (
 	listChatsTimeout = 10 * time.Second
 )
 
+// instructions is the handshake text every MCP client reads first. It
+// introduces the server as a WhatsApp tool, in the vocabulary the tools use.
+const instructions = "Tools for an agent working a WhatsApp account, relayed through the bridge the account runs on. " +
+	"Chats and messages use the IDs the bridge assigns, and every chat-scoped tool also accepts a chat name or a unique " +
+	"case-insensitive substring of one. Sending is fail-closed: a chat can receive messages only when it is on the server's " +
+	"send allowlist (ALLOWED_SEND_ROOMS unioned with the allowlist file, so adding a chat to the allowlist takes effect " +
+	"without a restart), and naming a chat never grants that permission. " +
+	"At most one message is accepted every 3 seconds, across all chats."
+
 // RoomProber is the best-effort chat detail probe backed by *matrix.Client.
 type RoomProber interface {
 	// IsBridged reports whether a chat looks like a WhatsApp chat without
@@ -114,36 +123,33 @@ func newServerWithBudget(svc matrix.MatrixService, prober RoomProber, recent Tri
 	}
 
 	mcpServer := mcp.NewServer(&mcp.Implementation{Name: Name, Version: Version}, &mcp.ServerOptions{
-		Instructions: "Tools for a WhatsApp account relayed through a Matrix bridge. " +
-			"Sending is fail-closed: a chat may receive messages only when it is in ALLOWED_SEND_ROOMS or in the allowlist file " +
-			"(the two are unioned, so `matrix-whatsapp-mcp chats allow` makes a chat sendable without a restart). " +
-			"At most one message is accepted every 3 seconds, across all chats.",
+		Instructions: instructions,
 	})
 
 	mcp.AddTool(mcpServer, &mcp.Tool{
 		Name: "list_chats",
-		Description: fmt.Sprintf("List every chat the account is in, with the resolved display name and whether it is a WhatsApp chat relayed by the bridge. "+
-			"Chat probes run %d at a time and the whole probe phase is cut off after %s, so a large account answers promptly: "+
-			"a chat whose probes did not finish is still listed, with whatsapp false and the name the joined-chat list carried.",
+		Description: fmt.Sprintf("List every chat the account is in, with its display name and whether it is a WhatsApp chat. "+
+			"Use a chat's name as the chat argument of another tool. Chat probes run %d at a time and the whole probe phase is cut off after %s, "+
+			"so a large account answers promptly: a chat whose probes did not finish is still listed, with whatsapp false and the name the joined-chat list carried.",
 			listProbeParallel, listChatsTimeout),
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, s.handleListChats)
 
 	mcp.AddTool(mcpServer, &mcp.Tool{
 		Name: "get_messages",
-		Description: "Get messages from a chat, oldest first. Without a cursor this returns the newest messages; pass before with the next_token of an earlier get_messages result " +
-			"to page further back, and follow next_token while has_more is true. Every message carries its relations: the message it replies to, the message it edits, " +
-			"mentioned user IDs, and whether it was deleted. chat_id is the canonical name for the chat it reads and room_id is still accepted as a deprecated alias.",
+		Description: "Get messages from a chat, oldest first. Name the chat with chat_id from list_chats, or with chat: a chat name or a unique case-insensitive substring of one. " +
+			"Without a cursor this returns the newest messages; pass before with the next_token of an earlier get_messages result to page further back, and follow next_token while has_more is true. " +
+			"Every message carries its relations: the message it replies to, the message it edits, mentioned user IDs, and whether it was deleted.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, s.handleGetMessages)
 
 	mcp.AddTool(mcpServer, &mcp.Tool{
 		Name: "search_messages",
 		Description: fmt.Sprintf("Search message text case-insensitively and return the matches newest first. "+
-			"The homeserver's own search index answers when it implements /search; when it does not, the call degrades to a bounded scan of the most recent %d messages "+
+			"Scope the search to one chat with chat_id or chat, or omit both to search every joined chat within the scan budget. "+
+			"The server's own search index answers when it has one; when it does not, the call degrades to a bounded scan of the most recent %d messages "+
 			"in each of at most %d chats (%d messages in total) instead of failing, and truncated reports that the budget cut the search short. "+
-			"scanned_chats and scanned_messages say what the scan actually read, and are 0 when the index answered. "+
-			"chat_id and since are the canonical input names; room_id and since_timestamp are still accepted as deprecated aliases.",
+			"scanned_chats and scanned_messages say what the scan actually read, and are 0 when the index answered.",
 			matrix.SearchEventsPerRoom, matrix.SearchMaxRooms, matrix.SearchMaxRooms*matrix.SearchEventsPerRoom),
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, s.handleSearchMessages)
@@ -151,10 +157,9 @@ func newServerWithBudget(svc matrix.MatrixService, prober RoomProber, recent Tri
 	mcp.AddTool(mcpServer, &mcp.Tool{
 		Name: "get_message_context",
 		Description: fmt.Sprintf("Get one message with the messages around it: up to limit_before messages before it and up to limit_after after it, %d each by default and capped at %d. "+
-			"The message's reply_to and edit_of are resolved to the messages they point at, so a reply can be understood without fetching the whole chat. "+
-			"Uses the chat's /context endpoint and falls back to scanning the chat's recent history when the homeserver does not implement it; source reports which path answered. "+
-			"A message_id that is not in the chat is an error, not an empty result. "+
-			"message_id and chat_id are the canonical input names; event_id and room_id are still accepted as deprecated aliases.",
+			"Name the chat with chat_id or chat. The message's reply_to and edit_of are resolved to the messages they point at, so a reply can be understood without fetching the whole chat. "+
+			"The server's context endpoint answers when it has one, and the call falls back to scanning the chat's recent history when it does not; source reports which path answered. "+
+			"A message_id that is not in the chat is an error, not an empty result.",
 			defaultContextLimit, matrix.ContextMaxLimit),
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, s.handleMessageContext)
@@ -162,21 +167,21 @@ func newServerWithBudget(svc matrix.MatrixService, prober RoomProber, recent Tri
 	mcp.AddTool(mcpServer, &mcp.Tool{
 		Name: "list_chat_contacts",
 		Description: "List every contact in a chat with the display name the chat reports, whether the contact belongs to WhatsApp, and which kind of contact it is: " +
-			"whatsapp_contact for a WhatsApp contact or group, bridge_bot for the WhatsApp bridge bot, and matrix_user for a plain Matrix account. " +
-			"whatsapp uses the same heuristic as list_chats: a user ID whose localpart starts with a bridge prefix such as whatsapp_ or whatsapp_lid-/whatsapp-lid-, any other localpart containing whatsapp, " +
-			"or a bridge marker on the member. The call is bounded by a timeout, and a contact whose profile cannot be read is still listed.",
+			"whatsapp_contact for a WhatsApp contact or group, bridge_bot for the WhatsApp bridge bot, and matrix_user for a non-WhatsApp account. " +
+			"Name the chat with chat_id or chat. whatsapp uses the same rule as list_chats: a user ID whose localpart starts with a bridge prefix such as whatsapp_ or whatsapp_lid-/whatsapp-lid-, " +
+			"any other localpart containing whatsapp, or a bridge marker on the member. The call is bounded by a timeout, and a contact whose profile cannot be read is still listed.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, s.handleListChatContacts)
 
 	mcp.AddTool(mcpServer, &mcp.Tool{
 		Name: "get_media",
-		Description: fmt.Sprintf("Fetch one message's attachment and return it inline. The result is a text block with the attachment's metadata as JSON "+
+		Description: fmt.Sprintf("Fetch one message's attachment and return it inline. Name the chat with chat_id or chat, and the message with message_id. "+
+			"The result is a text block with the attachment's metadata as JSON "+
 			"(mimetype, filename, size, actual dimensions, whether it was downscaled, and media_uri, an opaque reference to the stored bytes) plus, when the payload qualifies, a second content block holding it: "+
 			"an image block for an image, an audio block for audio. An image is downscaled so its long edge is at most max_dimension (default %d, clamped to %d..%d) and "+
 			"re-encoded until the base64 payload fits about %.1f MiB; audio over that budget, and every other type such as video or a document, returns metadata and text only "+
 			"with reason saying why. Nothing is cached and nothing is written to disk, and a download larger than %d MiB is refused rather than truncated. "+
-			"Encrypted media is decrypted when MATRIX_E2EE_ENABLED is on and refused with a clear error when it is off. "+
-			"chat_id and message_id are the canonical input names; room_id and event_id are still accepted as deprecated aliases.",
+			"Encrypted media is decrypted when MATRIX_E2EE_ENABLED is on and refused with a clear error when it is off.",
 			defaultMediaDimension, minMediaDimension, maxMediaDimension, float64(defaultInlineMediaBudget)/(1<<20), matrix.MaxMediaDownloadBytes>>20),
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, s.handleGetMedia)
@@ -193,11 +198,10 @@ func newServerWithBudget(svc matrix.MatrixService, prober RoomProber, recent Tri
 
 	mcp.AddTool(mcpServer, &mcp.Tool{
 		Name: "send_message",
-		Description: "Send a plain-text message to a chat. Fails closed unless the chat is allow-listed, and is rate-limited to one message every 3 seconds. " +
-			"Set reply_to to answer a specific message, so the chat shows it as a quote; set idempotency_key to make a retry safe. " +
-			"A message can be accepted by Matrix and still be rejected by the WhatsApp bridge; when the bridge posts its rejection notice within the acknowledgement window, " +
-			"the send fails with that notice instead of reporting success. The usual cause is relay mode (bridge.relay.enabled) not being configured for the sender's account. " +
-			"chat_id is the canonical name and room_id is still accepted as a deprecated alias.",
+		Description: "Send a plain-text message to a chat, named by chat_id or chat. Fails closed unless the resolved chat is allow-listed: naming a chat never grants permission. " +
+			"Rate-limited to one message every 3 seconds. Set reply_to to answer a specific message, so the chat shows it as a quote; set idempotency_key to make a retry safe. " +
+			"The server can accept a message that WhatsApp still refuses: when the bridge posts its rejection notice within the acknowledgement window, " +
+			"the send fails with that notice instead of reporting success. The usual cause is relay mode (bridge.relay.enabled) not being configured for the sender's account.",
 		Annotations: &mcp.ToolAnnotations{
 			DestructiveHint: boolPtr(true),
 			IdempotentHint:  false,
@@ -207,12 +211,11 @@ func newServerWithBudget(svc matrix.MatrixService, prober RoomProber, recent Tri
 
 	mcp.AddTool(mcpServer, &mcp.Tool{
 		Name: "send_media",
-		Description: fmt.Sprintf("Upload one attachment and send it as a single media message. Pass exactly one of path (an absolute local file) or data_base64 (with mimetype); "+
+		Description: fmt.Sprintf("Upload one attachment and send it as a single media message to a chat named by chat_id or chat. Pass exactly one of path (an absolute local file) or data_base64 (with mimetype); "+
 			"the type reported follows the mimetype: image/* becomes image, video/* video, audio/* audio, anything else document. caption is sent as the message text, "+
-			"which WhatsApp shows under the media, and reply_to makes the message a quote. It goes through the same gate as send_message: the chat must be allow-listed, "+
+			"which WhatsApp shows under the media, and reply_to makes the message a quote. It goes through the same gate as send_message: the resolved chat must be allow-listed, "+
 			"at most one message is accepted every %s, a bridge rejection notice fails the call instead of reporting success, and idempotency_key makes a retry safe "+
-			"without uploading or sending twice. The payload is capped at %d MiB, and the bytes are held in memory only. "+
-			"chat_id is the canonical name and room_id is still accepted as a deprecated alias.",
+			"without uploading or sending twice. The payload is capped at %d MiB, and the bytes are held in memory only.",
 			sendInterval, maxMediaUploadBytes>>20),
 		Annotations: &mcp.ToolAnnotations{
 			DestructiveHint: boolPtr(true),
@@ -224,12 +227,14 @@ func newServerWithBudget(svc matrix.MatrixService, prober RoomProber, recent Tri
 	return mcpServer
 }
 
-// chatRef names the chat a call acts on. chat_id is the WhatsApp-facing name;
-// room_id is the Matrix-era name and stays accepted as a deprecated alias, so a
-// caller that guesses the old word still works.
+// chatRef names the chat a call acts on. A chat can be named by ID or by name:
+// Chat is what an agent naturally has, ChatID is what a previous result
+// carried. room_id stays accepted as a deprecated alias so a caller that
+// guesses the old word still works.
 type chatRef struct {
-	ChatID string `json:"chat_id,omitempty" jsonschema:"the chat ID: a Matrix room ID such as !abc:example.com. Required, unless the deprecated alias room_id is given instead. The WhatsApp bridge hands out IDs without a :server part, which is valid here"`
-	RoomID string `json:"room_id,omitempty" jsonschema:"deprecated alias of chat_id (the Matrix-era name); still accepted, and chat_id wins when both are set. New callers should send chat_id"`
+	Chat   string `json:"chat,omitempty" jsonschema:"the chat to act on, by name or a unique case-insensitive substring of a name, resolved against the chats the account has joined. Pass either chat or chat_id, never both. A resolved name is still subject to the send allowlist"`
+	ChatID string `json:"chat_id,omitempty" jsonschema:"the chat ID: a chat reference such as !abc:example.com, as list_chats reports it. Required unless chat names the chat. The bridge sometimes omits the :server part, which is valid here"`
+	RoomID string `json:"room_id,omitempty" jsonschema:"deprecated alias of chat_id; still accepted, and chat_id wins when both are set. Use chat_id in new calls"`
 }
 
 // id resolves the chat ID, preferring the canonical name over its alias.
@@ -243,8 +248,8 @@ func (c chatRef) chatID() string {
 // messageRef names the message a call acts on, with the same alias rule as
 // chatRef.
 type messageRef struct {
-	MessageID string `json:"message_id,omitempty" jsonschema:"the message ID: a Matrix event ID such as $abc123. It must start with $ or the call is rejected before anything is requested. Required, unless the deprecated alias event_id is given instead"`
-	EventID   string `json:"event_id,omitempty" jsonschema:"deprecated alias of message_id (the Matrix-era name); still accepted, and message_id wins when both are set. New callers should send message_id"`
+	MessageID string `json:"message_id,omitempty" jsonschema:"the message ID: a message reference such as $abc123. It must start with $ or the call is rejected before anything is requested. Required unless the deprecated alias event_id is given instead"`
+	EventID   string `json:"event_id,omitempty" jsonschema:"deprecated alias of message_id; still accepted, and message_id wins when both are set. Use message_id in new calls"`
 }
 
 // id resolves the message ID, preferring the canonical name over its alias.
@@ -258,8 +263,8 @@ func (m messageRef) messageID() string {
 type listChatsInput struct{}
 
 type chatResult struct {
-	ChatID   string `json:"chat_id" jsonschema:"the chat ID, a Matrix room ID such as !abc:example.com"`
-	Name     string `json:"name" jsonschema:"the display name; falls back to the canonical alias, then to 'unnamed'"`
+	ChatID   string `json:"chat_id" jsonschema:"the chat ID: a chat reference such as !abc:example.com, as list_chats reports it"`
+	Name     string `json:"name" jsonschema:"the display name; falls back to the chat's alternate name, then to 'unnamed'"`
 	WhatsApp bool   `json:"whatsapp" jsonschema:"true when this chat is a WhatsApp chat relayed by the bridge"`
 }
 
@@ -270,8 +275,8 @@ type getMessagesInput struct {
 }
 
 type messageResult struct {
-	ChatID     string   `json:"chat_id" jsonschema:"the chat the message is in, a Matrix room ID such as !abc:example.com"`
-	MessageID  string   `json:"message_id" jsonschema:"the message ID, a Matrix event ID such as $abc123"`
+	ChatID     string   `json:"chat_id" jsonschema:"the chat the message is in: a chat reference such as !abc:example.com"`
+	MessageID  string   `json:"message_id" jsonschema:"the message ID: a message reference such as $abc123"`
 	From       string   `json:"from" jsonschema:"the sender's user ID, for example @15551234:example.com"`
 	Text       string   `json:"text" jsonschema:"the message text; a media message with no caption carries a bracketed type marker such as [image] or [document]; a deleted message has empty text"`
 	Type       string   `json:"type" jsonschema:"the WhatsApp message type: text, image, video, audio, document, sticker, location, or other"`
@@ -287,13 +292,13 @@ type messageResult struct {
 	Width      int      `json:"width,omitempty" jsonschema:"the attachment's width in pixels when the sender reported one, as an image or video; absent otherwise"`
 	Height     int      `json:"height,omitempty" jsonschema:"the attachment's height in pixels when the sender reported one, as an image or video; absent otherwise"`
 	DurationMS int64    `json:"duration_ms,omitempty" jsonschema:"the attachment's duration in milliseconds when the sender reported one, as audio or video; absent otherwise"`
-	MediaURI   string   `json:"media_uri,omitempty" jsonschema:"an opaque reference to the attachment's stored bytes, valid for plaintext and encrypted media alike; pass it back to the homeserver's media API. Absent when the message carries no attachment"`
+	MediaURI   string   `json:"media_uri,omitempty" jsonschema:"an opaque reference to the attachment's stored bytes, valid for plaintext and encrypted media alike; pass it back to the server's media API. Absent when the message carries no attachment"`
 }
 
 type getMessagesResult struct {
 	Messages  []messageResult `json:"messages" jsonschema:"the messages in this page, oldest first"`
 	NextToken string          `json:"next_token,omitempty" jsonschema:"opaque token to pass back as before to read the next older page; absent when the chat's history ends here"`
-	HasMore   bool            `json:"has_more" jsonschema:"whether the homeserver has more entries behind this page, so a next_token is present. A later page can still contain no messages when the remaining entries are membership or other non-message changes"`
+	HasMore   bool            `json:"has_more" jsonschema:"whether the server has more entries behind this page, so a next_token is present. A later page can still contain no messages when the remaining entries are membership or other non-message changes"`
 }
 
 type searchMessagesInput struct {
@@ -301,7 +306,7 @@ type searchMessagesInput struct {
 	Query          string `json:"query" jsonschema:"the text to search for, matched against message text case-insensitively; every word of a multi-word query must appear when the bounded scan answers. It must not be empty and is capped at 512 characters"`
 	Limit          int    `json:"limit,omitempty" jsonschema:"maximum number of results to return; default 20, clamped to 1..100"`
 	Since          int64  `json:"since,omitempty" jsonschema:"only return messages sent at or after this unix-millisecond timestamp; omit it to search every message the search looks at"`
-	SinceTimestamp int64  `json:"since_timestamp,omitempty" jsonschema:"deprecated alias of since (the Matrix-era name); still accepted, and since wins when both are set"`
+	SinceTimestamp int64  `json:"since_timestamp,omitempty" jsonschema:"deprecated alias of since; still accepted, and since wins when both are set. Use since in new calls"`
 }
 
 type searchHitResult struct {
@@ -312,9 +317,9 @@ type searchHitResult struct {
 type searchMessagesResult struct {
 	Results         []searchHitResult `json:"results" jsonschema:"the matching messages, newest first, each in the same shape get_messages returns plus its chat name; empty when nothing matched"`
 	Truncated       bool              `json:"truncated" jsonschema:"true when the search stopped at a budget instead of covering everything it was asked to search: more matches than limit, a chat with history behind the page that was read, more chats than the scan may read, or a chat that could not be read. The results are then a partial answer"`
-	ScannedChats    int               `json:"scanned_chats" jsonschema:"how many chats the bounded fallback scan actually read; 0 when the homeserver's search index answered, because nothing was scanned"`
-	ScannedMessages int               `json:"scanned_messages" jsonschema:"how many messages the bounded fallback scan actually looked at; 0 when the homeserver's search index answered"`
-	Source          string            `json:"source" jsonschema:"which path produced the results: server when the homeserver's /search index answered, fallback when the bounded chat scan did"`
+	ScannedChats    int               `json:"scanned_chats" jsonschema:"how many chats the bounded fallback scan actually read; 0 when the server's search index answered, because nothing was scanned"`
+	ScannedMessages int               `json:"scanned_messages" jsonschema:"how many messages the bounded fallback scan actually looked at; 0 when the server's search index answered"`
+	Source          string            `json:"source" jsonschema:"which path produced the results: server when the server's search index answered, fallback when the bounded chat scan did"`
 }
 
 type getMessageContextInput struct {
@@ -325,13 +330,13 @@ type getMessageContextInput struct {
 }
 
 type getMessageContextResult struct {
-	EventsBefore []messageResult `json:"events_before" jsonschema:"the messages before the target, oldest first; only messages, so membership and other non-message entries in the window are not listed"`
-	Event        messageResult   `json:"event" jsonschema:"the target message, in the same shape get_messages returns"`
-	EventsAfter  []messageResult `json:"events_after" jsonschema:"the messages after the target, oldest first; only messages"`
-	ReplyTo      *messageResult  `json:"reply_to,omitempty" jsonschema:"the message the target replies to, resolved to its full text when it is in the window or can be fetched; absent when the target is not a reply or the message is no longer available. The target's own reply_to field carries the message ID alone"`
-	EditOf       *messageResult  `json:"edit_of,omitempty" jsonschema:"the message the target edits, resolved to its full text when it is in the window or can be fetched; absent when the target is not an edit or the message is no longer available. The target's own edit_of field carries the message ID alone"`
-	Source       string          `json:"source" jsonschema:"which path produced the context: context when the chat's /context endpoint answered, fallback when the neighbourhood was found by scanning the chat's recent messages"`
-	Truncated    bool            `json:"truncated" jsonschema:"true when the fallback scan ran out of its fixed budget before covering the requested window, so events_before or events_after are shorter than asked for"`
+	MessagesBefore []messageResult `json:"messages_before" jsonschema:"the messages before the target, oldest first; only messages, so membership and other non-message entries in the window are not listed"`
+	Message        messageResult   `json:"message" jsonschema:"the target message, in the same shape get_messages returns"`
+	MessagesAfter  []messageResult `json:"messages_after" jsonschema:"the messages after the target, oldest first; only messages"`
+	ReplyTo        *messageResult  `json:"reply_to,omitempty" jsonschema:"the message the target replies to, resolved to its full text when it is in the window or can be fetched; absent when the target is not a reply or the message is no longer available. The target's own reply_to field carries the message ID alone"`
+	EditOf         *messageResult  `json:"edit_of,omitempty" jsonschema:"the message the target edits, resolved to its full text when it is in the window or can be fetched; absent when the target is not an edit or the message is no longer available. The target's own edit_of field carries the message ID alone"`
+	Source         string          `json:"source" jsonschema:"which path produced the context: context when the server answered the chat's context request, fallback when the neighbourhood was found by scanning the chat's recent messages"`
+	Truncated      bool            `json:"truncated" jsonschema:"true when the fallback scan ran out of its fixed budget before covering the requested window, so messages_before or messages_after are shorter than asked for"`
 }
 
 type listChatContactsInput struct {
@@ -349,7 +354,7 @@ type contactResult struct {
 	DisplayName string `json:"display_name" jsonschema:"the display name the chat reports for the contact, or the contact's profile name when the member details carry none; empty when neither could be read"`
 	Membership  string `json:"membership" jsonschema:"the membership the chat reports for this contact, which is join for every entry in this list"`
 	WhatsApp    bool   `json:"whatsapp" jsonschema:"true when this contact belongs to WhatsApp: a WhatsApp contact or group, or the WhatsApp bridge bot"`
-	ContactType string `json:"contact_type" jsonschema:"the kind of contact: whatsapp_contact for a WhatsApp contact or group, bridge_bot for the WhatsApp bridge bot, and matrix_user for a plain Matrix account"`
+	ContactType string `json:"contact_type" jsonschema:"the kind of contact: whatsapp_contact for a WhatsApp contact or group, bridge_bot for the WhatsApp bridge bot, and matrix_user for a non-WhatsApp account"`
 }
 
 type listChatContactsResult struct {
@@ -358,13 +363,13 @@ type listChatContactsResult struct {
 
 type getNewMessagesInput struct {
 	Since          int64 `json:"since,omitempty" jsonschema:"only return messages newer than this unix-millisecond timestamp"`
-	SinceTimestamp int64 `json:"since_timestamp,omitempty" jsonschema:"deprecated alias of since (the Matrix-era name); still accepted, and since wins when both are set"`
+	SinceTimestamp int64 `json:"since_timestamp,omitempty" jsonschema:"deprecated alias of since; still accepted, and since wins when both are set. Use since in new calls"`
 	Limit          int   `json:"limit,omitempty" jsonschema:"maximum number of messages to return; default 20, clamped to 1..100"`
 }
 
 type triggerResult struct {
-	MessageID string `json:"message_id" jsonschema:"the message ID, a Matrix event ID such as $abc123"`
-	ChatID    string `json:"chat_id" jsonschema:"the chat ID, a Matrix room ID such as !abc:example.com"`
+	MessageID string `json:"message_id" jsonschema:"the message ID: a message reference such as $abc123"`
+	ChatID    string `json:"chat_id" jsonschema:"the chat ID: a chat reference such as !abc:example.com, as list_chats reports it"`
 	ChatName  string `json:"chat_name" jsonschema:"the display name of the chat"`
 	From      string `json:"from" jsonschema:"the sender's user ID"`
 	Text      string `json:"text" jsonschema:"the message text; a media message with no caption carries a bracketed type marker such as [image] or [document]"`
@@ -375,7 +380,7 @@ type triggerResult struct {
 type sendMessageInput struct {
 	chatRef
 	Text           string `json:"text" jsonschema:"the plain-text message to send"`
-	ReplyTo        string `json:"reply_to,omitempty" jsonschema:"optional message ID this one answers, for example $abc123. It must be a Matrix event ID ($ followed by the ID) or the call is rejected before anything is sent. The chat must still be allow-listed; the replied-to message can be in any chat"`
+	ReplyTo        string `json:"reply_to,omitempty" jsonschema:"optional message ID this one answers, for example $abc123. It must be a message reference ($ followed by the ID) or the call is rejected before anything is sent. The resolved chat must still be allow-listed; the replied-to message can be in any chat"`
 	IdempotencyKey string `json:"idempotency_key,omitempty" jsonschema:"optional key of at most 128 characters that makes a retry safe. A second call with the same key, chat and text within 10 minutes returns the first message ID with deduplicated true and sends nothing; the same key with a different chat or text is an error. Keys are held in memory only, so a restart forgets them"`
 }
 
@@ -432,7 +437,11 @@ func (s *Server) probeChat(ctx context.Context, r matrix.Room) chatResult {
 }
 
 func (s *Server) handleGetMessages(ctx context.Context, _ *mcp.CallToolRequest, in getMessagesInput) (*mcp.CallToolResult, getMessagesResult, error) {
-	page, err := s.matrix.Messages(ctx, in.chatID(), clampLimit(in.Limit), in.Before)
+	chatID, err := s.resolveChat(ctx, in.chatRef)
+	if err != nil {
+		return nil, getMessagesResult{}, err
+	}
+	page, err := s.matrix.Messages(ctx, chatID, clampLimit(in.Limit), in.Before)
 	if err != nil {
 		return nil, getMessagesResult{}, err
 	}
@@ -441,7 +450,7 @@ func (s *Server) handleGetMessages(ctx context.Context, _ *mcp.CallToolRequest, 
 		NextToken: page.NextToken,
 		HasMore:   page.HasMore,
 	}
-	// The Matrix API returns newest first; the tool contract is chronological.
+	// The server returns newest first; the tool contract is chronological.
 	for i, j := 0, len(out.Messages)-1; i < j; i, j = i+1, j-1 {
 		out.Messages[i], out.Messages[j] = out.Messages[j], out.Messages[i]
 	}
@@ -454,10 +463,14 @@ func (s *Server) handleGetMessages(ctx context.Context, _ *mcp.CallToolRequest, 
 func (s *Server) handleSearchMessages(ctx context.Context, _ *mcp.CallToolRequest, in searchMessagesInput) (*mcp.CallToolResult, searchMessagesResult, error) {
 	query := strings.TrimSpace(in.Query)
 	if query == "" {
-		return nil, searchMessagesResult{}, fmt.Errorf("%w: query must not be empty", matrix.ErrEmptyQuery)
+		return nil, searchMessagesResult{}, matrix.ErrEmptyQuery
 	}
 	if utf8.RuneCountInString(query) > maxSearchQueryLen {
 		return nil, searchMessagesResult{}, fmt.Errorf("query must be at most %d characters", maxSearchQueryLen)
+	}
+	chatID, err := s.resolveChat(ctx, in.chatRef)
+	if err != nil {
+		return nil, searchMessagesResult{}, err
 	}
 	since := in.Since
 	if since == 0 {
@@ -465,7 +478,7 @@ func (s *Server) handleSearchMessages(ctx context.Context, _ *mcp.CallToolReques
 	}
 	found, err := s.matrix.SearchMessages(ctx, matrix.SearchRequest{
 		Query:          query,
-		RoomID:         in.chatID(),
+		RoomID:         chatID,
 		Limit:          clampLimit(in.Limit),
 		SinceTimestamp: since,
 	})
@@ -491,18 +504,22 @@ func (s *Server) handleSearchMessages(ctx context.Context, _ *mcp.CallToolReques
 func (s *Server) handleMessageContext(ctx context.Context, _ *mcp.CallToolRequest, in getMessageContextInput) (*mcp.CallToolResult, getMessageContextResult, error) {
 	messageID := in.messageID()
 	if !matrix.ValidEventID(messageID) {
-		return nil, getMessageContextResult{}, fmt.Errorf("%w: message_id must be a Matrix event ID, a $ sigil followed by the ID", matrix.ErrInvalidEventID)
+		return nil, getMessageContextResult{}, fmt.Errorf("%w: message_id must be a message reference, a $ sigil followed by the ID", matrix.ErrInvalidEventID)
 	}
-	out, err := s.matrix.MessageContext(ctx, in.chatRef.chatID(), messageID, contextLimit(in.LimitBefore), contextLimit(in.LimitAfter))
+	chatID, err := s.resolveChat(ctx, in.chatRef)
+	if err != nil {
+		return nil, getMessageContextResult{}, err
+	}
+	out, err := s.matrix.MessageContext(ctx, chatID, messageID, contextLimit(in.LimitBefore), contextLimit(in.LimitAfter))
 	if err != nil {
 		return nil, getMessageContextResult{}, err
 	}
 	res := getMessageContextResult{
-		EventsBefore: toMessageResults(out.Before),
-		Event:        toMessageResult(out.Event),
-		EventsAfter:  toMessageResults(out.After),
-		Source:       out.Source,
-		Truncated:    out.Truncated,
+		MessagesBefore: toMessageResults(out.Before),
+		Message:        toMessageResult(out.Event),
+		MessagesAfter:  toMessageResults(out.After),
+		Source:         out.Source,
+		Truncated:      out.Truncated,
 	}
 	if out.ReplyTo != nil {
 		reply := toMessageResult(*out.ReplyTo)
@@ -516,7 +533,11 @@ func (s *Server) handleMessageContext(ctx context.Context, _ *mcp.CallToolReques
 }
 
 func (s *Server) handleListChatContacts(ctx context.Context, _ *mcp.CallToolRequest, in listChatContactsInput) (*mcp.CallToolResult, listChatContactsResult, error) {
-	members, err := s.matrix.Participants(ctx, in.chatID())
+	chatID, err := s.resolveChat(ctx, in.chatRef)
+	if err != nil {
+		return nil, listChatContactsResult{}, err
+	}
+	members, err := s.matrix.Participants(ctx, chatID)
 	if err != nil {
 		return nil, listChatContactsResult{}, err
 	}
@@ -555,12 +576,12 @@ func (s *Server) handleGetNewMessages(_ context.Context, _ *mcp.CallToolRequest,
 	out := make([]triggerResult, 0, len(triggers))
 	for _, t := range triggers {
 		out = append(out, triggerResult{
-			MessageID: t.EventID,
-			ChatID:    t.RoomID,
-			ChatName:  t.RoomName,
-			From:      t.Sender,
-			Text:      t.Body,
-			Type:      whatsapp.Type(t.MsgType),
+			MessageID: t.MessageID,
+			ChatID:    t.ChatID,
+			ChatName:  t.ChatName,
+			From:      t.From,
+			Text:      t.Text,
+			Type:      t.Type,
 			Timestamp: t.Timestamp,
 		})
 	}
@@ -571,12 +592,15 @@ func (s *Server) handleSendMessage(ctx context.Context, _ *mcp.CallToolRequest, 
 	if strings.TrimSpace(in.Text) == "" {
 		return nil, sendMessageResult{}, errors.New("text must not be empty or whitespace-only")
 	}
-	chatID := in.chatID()
 	// A malformed reply target is rejected here, before the rate-limit token is
 	// spent or an idempotency key is claimed: nothing is sent and the caller can
 	// retry the same call with a corrected ID.
 	if in.ReplyTo != "" && !matrix.ValidEventID(in.ReplyTo) {
-		return nil, sendMessageResult{}, fmt.Errorf("%w: reply_to must be a Matrix event ID, a $ sigil followed by the ID", matrix.ErrInvalidEventID)
+		return nil, sendMessageResult{}, fmt.Errorf("%w: reply_to must be a message ID, a $ sigil followed by the ID", matrix.ErrInvalidEventID)
+	}
+	chatID, err := s.resolveChat(ctx, in.chatRef)
+	if err != nil {
+		return nil, sendMessageResult{}, err
 	}
 	if utf8.RuneCountInString(in.IdempotencyKey) > maxIdempotencyKeyLen {
 		return nil, sendMessageResult{}, fmt.Errorf("idempotency_key must be at most %d characters", maxIdempotencyKeyLen)

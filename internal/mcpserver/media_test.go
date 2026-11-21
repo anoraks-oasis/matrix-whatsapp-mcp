@@ -312,22 +312,22 @@ func TestGetMediaTypedErrors(t *testing.T) {
 		{
 			name:    "not media",
 			err:     matrix.ErrNotMedia,
-			wantMsg: "no media attachment",
+			wantMsg: "has no attachment",
 		},
 		{
 			name:    "unknown event",
 			err:     matrix.ErrEventNotFound,
-			wantMsg: "event not found",
+			wantMsg: "message not found in this chat",
 		},
 		{
 			name:    "download failure",
 			err:     matrix.ErrMediaDownload,
-			wantMsg: "download failed",
+			wantMsg: "could not download the attachment",
 		},
 		{
 			name:    "too large",
 			err:     matrix.ErrMediaTooLarge,
-			wantMsg: "larger than the download limit",
+			wantMsg: "too large to download",
 		},
 		{
 			name:    "encrypted without e2ee",
@@ -337,7 +337,7 @@ func TestGetMediaTypedErrors(t *testing.T) {
 		{
 			name:    "unsupported codec",
 			att:     matrix.MediaAttachment{MimeType: "image/webp", MXCURI: "mxc://test/webp", Data: []byte("not a webp")},
-			wantMsg: "unsupported media codec",
+			wantMsg: "unsupported attachment format",
 		},
 	}
 	for _, tc := range cases {
@@ -375,7 +375,7 @@ func TestGetMediaRejectsMalformedEventIDBeforeFetching(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get_media: %v", err)
 	}
-	if text := resultErrorText(t, res); !strings.Contains(text, "invalid event ID") {
+	if text := resultErrorText(t, res); !strings.Contains(text, "invalid message ID") {
 		t.Fatalf("error = %q, want invalid event ID", text)
 	}
 	rooms, _ := svc.mediaCalls()
@@ -563,7 +563,7 @@ func TestSendMediaRejectsBadPayloadSources(t *testing.T) {
 		{
 			name:    "malformed reply",
 			args:    map[string]any{"chat_id": "!ok:test", "data_base64": "aGk=", "mimetype": "image/png", "reply_to": "nope"},
-			wantMsg: "invalid event ID",
+			wantMsg: "invalid message ID",
 		},
 	}
 	for _, tc := range cases {
@@ -741,7 +741,7 @@ func TestSendMediaSurfacesUpstreamError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("send_media: %v", err)
 	}
-	if text := resultErrorText(t, res); !strings.Contains(text, "bridge did not bridge") {
+	if text := resultErrorText(t, res); !strings.Contains(text, "WhatsApp did not deliver") {
 		t.Fatalf("error = %q, want the bridge rejection to surface", text)
 	}
 }

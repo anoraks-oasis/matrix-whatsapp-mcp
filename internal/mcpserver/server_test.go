@@ -581,17 +581,17 @@ func TestToolsListHasNineToolsWithSchemas(t *testing.T) {
 		}
 	}
 	contextOut := envelopeProperties(t, contextTool)
-	for _, field := range []string{"events_before", "event", "events_after", "reply_to", "edit_of", "source", "truncated"} {
+	for _, field := range []string{"messages_before", "message", "messages_after", "reply_to", "edit_of", "source", "truncated"} {
 		if _, ok := contextOut[field]; !ok {
 			t.Fatalf("get_message_context output schema has no %q property", field)
 		}
 	}
-	target, ok := contextOut["event"].(map[string]any)
+	target, ok := contextOut["message"].(map[string]any)
 	if !ok {
-		t.Fatalf("get_message_context event schema is %T, want an object", contextOut["event"])
+		t.Fatalf("get_message_context message schema is %T, want an object", contextOut["message"])
 	}
 	if _, ok := target["properties"].(map[string]any)["message_id"]; !ok {
-		t.Fatal("get_message_context event schema carries no message_id: the target must use the message shape")
+		t.Fatal("get_message_context message schema carries no message_id: the target must use the message shape")
 	}
 
 	// list_chat_contacts: one chat (with its alias), and every contact field in
@@ -966,8 +966,8 @@ func TestGetMessagesCarriesType(t *testing.T) {
 
 func TestGetRecentTriggersSinceAndLimit(t *testing.T) {
 	recent := &fakeRecent{out: []trigger.Trigger{
-		{EventID: "$t2", Timestamp: 200, RoomID: "!r:test", Body: "b"},
-		{EventID: "$t1", Timestamp: 100, RoomID: "!r:test", Body: "a"},
+		{MessageID: "$t2", Timestamp: 200, ChatID: "!r:test", Text: "b", Type: "text"},
+		{MessageID: "$t1", Timestamp: 100, ChatID: "!r:test", Text: "a", Type: "text"},
 	}}
 	srv := New(&fakeMatrix{}, &fakeProber{}, recent, nil)
 	session, cleanup := connect(t, srv)
@@ -1407,8 +1407,8 @@ func TestSendMessageRejectsMalformedReply(t *testing.T) {
 		if err != nil {
 			t.Fatalf("send_message(reply_to=%q): %v", bad, err)
 		}
-		if text := resultErrorText(t, res); !strings.Contains(text, "event ID") {
-			t.Fatalf("malformed reply error = %q, want it to name the event ID shape", text)
+		if text := resultErrorText(t, res); !strings.Contains(text, "message ID") {
+			t.Fatalf("malformed reply error = %q, want it to name the message ID shape", text)
 		}
 	}
 	if rooms, _, _ := svc.sends(); len(rooms) != 0 {

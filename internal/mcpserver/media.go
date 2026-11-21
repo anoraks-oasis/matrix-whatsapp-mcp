@@ -63,13 +63,13 @@ type getMediaInput struct {
 }
 
 type getMediaResult struct {
-	Mimetype   string `json:"mimetype" jsonschema:"the attachment's MIME type: what the message declares, else what the homeserver served, else what the first bytes look like when the declared type is application/octet-stream"`
+	Mimetype   string `json:"mimetype" jsonschema:"the attachment's MIME type: what the message declares, else what the server served, else what the first bytes look like when the declared type is application/octet-stream"`
 	Filename   string `json:"filename,omitempty" jsonschema:"the filename the sender set on the attachment (content.filename); absent when the sender set none"`
 	SizeBytes  int64  `json:"size_bytes" jsonschema:"the size of the downloaded payload in bytes; for encrypted media this is the decrypted size"`
 	Width      int    `json:"width,omitempty" jsonschema:"the width in pixels of the image this result describes: the returned image block after downscaling, or the source image when its payload did not fit; absent when the payload is not an image"`
 	Height     int    `json:"height,omitempty" jsonschema:"the height in pixels of the image this result describes: the returned image block after downscaling, or the source image when its payload did not fit; absent when the payload is not an image"`
 	DurationMS int64  `json:"duration_ms,omitempty" jsonschema:"the duration the sender declared for the media, in milliseconds; absent when the sender declared none"`
-	MediaURI   string `json:"media_uri" jsonschema:"an opaque reference to the attachment's stored bytes; pass it back to the homeserver's media API when you need the payload outside this tool"`
+	MediaURI   string `json:"media_uri" jsonschema:"an opaque reference to the attachment's stored bytes; pass it back to the server's media API when you need the payload outside this tool"`
 	Encrypted  bool   `json:"encrypted" jsonschema:"true when the attachment was end-to-end encrypted and was decrypted before being returned"`
 	Downscaled bool   `json:"downscaled" jsonschema:"true when the returned image was resized or re-encoded smaller to respect max_dimension or the inline budget"`
 	Included   bool   `json:"included" jsonschema:"whether the result also carries the payload as an image or audio content block. False means the text block is the whole answer and reason says why"`
@@ -83,7 +83,7 @@ type sendMediaInput struct {
 	Mimetype       string `json:"mimetype,omitempty" jsonschema:"the payload's MIME type, for example image/jpeg. Required with data_base64; with path it overrides the type detected from the file. It decides the reported type: image/* becomes image, video/* video, audio/* audio, anything else document"`
 	Caption        string `json:"caption,omitempty" jsonschema:"text to send as the message text, which WhatsApp shows under the media. When empty the filename is used as the text"`
 	Filename       string `json:"filename,omitempty" jsonschema:"the filename to record on the message and the upload; default the base name of path, or upload for data_base64"`
-	ReplyTo        string `json:"reply_to,omitempty" jsonschema:"optional message ID this one answers, for example $abc123. It must be a Matrix event ID ($ followed by the ID) or the call is rejected before anything is uploaded. The replied-to message can be in any chat; only the target chat must be allow-listed"`
+	ReplyTo        string `json:"reply_to,omitempty" jsonschema:"optional message ID this one answers, for example $abc123. It must be a message reference ($ followed by the ID) or the call is rejected before anything is uploaded. The replied-to message can be in any chat; only the resolved target chat must be allow-listed"`
 	IdempotencyKey string `json:"idempotency_key,omitempty" jsonschema:"optional key of at most 128 characters that makes a retry safe. A second call with the same key, chat and payload within 10 minutes returns the first message ID with deduplicated true and uploads nothing; the same key with a different payload is an error. Keys are held in memory only, so a restart forgets them"`
 }
 
@@ -100,9 +100,13 @@ type sendMediaResult struct {
 // why the payload is missing.
 func (s *Server) handleGetMedia(ctx context.Context, _ *mcp.CallToolRequest, in getMediaInput) (*mcp.CallToolResult, getMediaResult, error) {
 	if !matrix.ValidEventID(in.messageID()) {
-		return nil, getMediaResult{}, fmt.Errorf("%w: message_id must be a Matrix event ID, a $ sigil followed by the ID", matrix.ErrInvalidEventID)
+		return nil, getMediaResult{}, fmt.Errorf("%w: message_id must be a message reference, a $ sigil followed by the ID", matrix.ErrInvalidEventID)
 	}
-	att, err := s.matrix.Media(ctx, in.chatRef.chatID(), in.messageID())
+	chatID, err := s.resolveChat(ctx, in.chatRef)
+	if err != nil {
+		return nil, getMediaResult{}, err
+	}
+	att, err := s.matrix.Media(ctx, chatID, in.messageID())
 	if err != nil {
 		return nil, getMediaResult{}, err
 	}
@@ -330,9 +334,12 @@ type outgoingMedia struct {
 // source, a path that is not an absolute readable file — happens before the
 // idempotency key is claimed and before the rate-limit token is spent.
 func (s *Server) handleSendMedia(ctx context.Context, _ *mcp.CallToolRequest, in sendMediaInput) (*mcp.CallToolResult, sendMediaResult, error) {
-	chatID := in.chatID()
 	if in.ReplyTo != "" && !matrix.ValidEventID(in.ReplyTo) {
-		return nil, sendMediaResult{}, fmt.Errorf("%w: reply_to must be a Matrix event ID, a $ sigil followed by the ID", matrix.ErrInvalidEventID)
+		return nil, sendMediaResult{}, fmt.Errorf("%w: reply_to must be a message ID, a $ sigil followed by the ID", matrix.ErrInvalidEventID)
+	}
+	chatID, err := s.resolveChat(ctx, in.chatRef)
+	if err != nil {
+		return nil, sendMediaResult{}, err
 	}
 	if utf8.RuneCountInString(in.IdempotencyKey) > maxIdempotencyKeyLen {
 		return nil, sendMediaResult{}, fmt.Errorf("idempotency_key must be at most %d characters", maxIdempotencyKeyLen)

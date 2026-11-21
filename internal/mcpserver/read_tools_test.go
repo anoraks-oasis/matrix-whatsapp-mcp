@@ -2,6 +2,7 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -198,14 +199,14 @@ func TestGetMessageContextTool(t *testing.T) {
 		t.Fatalf("get_message_context returned error: %s", resultErrorText(t, res))
 	}
 	got := decodeStructured[getMessageContextResult](t, res)
-	if got.Event.MessageID != "$t" || got.Event.Text != "the target" {
-		t.Fatalf("event = %+v, want the target in the message shape", got.Event)
+	if got.Message.MessageID != "$t" || got.Message.Text != "the target" {
+		t.Fatalf("message = %+v, want the target in the message shape", got.Message)
 	}
-	if len(got.EventsBefore) != 1 || got.EventsBefore[0].MessageID != "$b1" {
-		t.Fatalf("events_before = %+v, want [$b1]", got.EventsBefore)
+	if len(got.MessagesBefore) != 1 || got.MessagesBefore[0].MessageID != "$b1" {
+		t.Fatalf("messages_before = %+v, want [$b1]", got.MessagesBefore)
 	}
-	if len(got.EventsAfter) != 1 || got.EventsAfter[0].MessageID != "$a1" {
-		t.Fatalf("events_after = %+v, want [$a1]", got.EventsAfter)
+	if len(got.MessagesAfter) != 1 || got.MessagesAfter[0].MessageID != "$a1" {
+		t.Fatalf("messages_after = %+v, want [$a1]", got.MessagesAfter)
 	}
 	if got.ReplyTo == nil || got.ReplyTo.MessageID != "$parent" || got.ReplyTo.Text != "the parent" {
 		t.Fatalf("reply_to = %+v, want the parent resolved to a full message", got.ReplyTo)
@@ -220,6 +221,47 @@ func TestGetMessageContextTool(t *testing.T) {
 	befores, afters := svc.contextCalls()
 	if len(befores) != 1 || befores[0] != defaultContextLimit || afters[0] != defaultContextLimit {
 		t.Fatalf("limits reached matrix as %v/%v, want 10/10 by default", befores, afters)
+	}
+}
+
+// TestGetMessageContextOutputSpeaksWhatsApp pins the JSON keys: the target and
+// its neighbours are messages, and none of the old event/events_* names
+// survives.
+func TestGetMessageContextOutputSpeaksWhatsApp(t *testing.T) {
+	svc := &fakeMatrix{ctxOut: matrix.ContextOutcome{
+		Before: []matrix.Message{{EventID: "$b1", RoomID: "!r:test", Body: "before", MsgType: "m.text", Timestamp: 1}},
+		Event:  matrix.Message{EventID: "$t", RoomID: "!r:test", Body: "the target", MsgType: "m.text", Timestamp: 2},
+		After:  []matrix.Message{{EventID: "$a1", RoomID: "!r:test", Body: "after", MsgType: "m.text", Timestamp: 3}},
+		Source: matrix.ContextSourceEndpoint,
+	}}
+	srv := New(svc, &fakeProber{}, &fakeRecent{}, nil)
+	session, cleanup := connect(t, srv)
+	defer cleanup()
+
+	res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+		Name:      "get_message_context",
+		Arguments: map[string]any{"chat_id": "!r:test", "message_id": "$t"},
+	})
+	if err != nil {
+		t.Fatalf("get_message_context: %v", err)
+	}
+	raw, err := json.Marshal(res.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var out map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("unmarshal structured content: %v", err)
+	}
+	for _, field := range []string{"message", "messages_before", "messages_after", "source", "truncated"} {
+		if _, ok := out[field]; !ok {
+			t.Fatalf("result has no %q key: %s", field, raw)
+		}
+	}
+	for _, old := range []string{"event", "events_before", "events_after"} {
+		if _, ok := out[old]; ok {
+			t.Fatalf("result still carries the old key %q: %s", old, raw)
+		}
 	}
 }
 
@@ -279,12 +321,12 @@ func TestGetMessageContextToolRejectsMalformedEvent(t *testing.T) {
 		if err != nil {
 			t.Fatalf("get_message_context(event_id=%q): %v", bad, err)
 		}
-		if text := resultErrorText(t, res); !strings.Contains(text, "event ID") {
-			t.Fatalf("malformed event error = %q, want it to name the event ID shape", text)
+		if text := resultErrorText(t, res); !strings.Contains(text, "message ID") {
+			t.Fatalf("malformed message error = %q, want it to name the message ID shape", text)
 		}
 	}
 	if befores, _ := svc.contextCalls(); len(befores) != 0 {
-		t.Fatalf("a malformed event ID reached matrix: %v", befores)
+		t.Fatalf("a malformed message ID reached matrix: %v", befores)
 	}
 }
 
@@ -373,7 +415,7 @@ func TestListChatContactsToolErrorAndCancellation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("list_chat_contacts: %v", err)
 		}
-		if text := resultErrorText(t, res); !strings.Contains(text, "invalid room ID") {
+		if text := resultErrorText(t, res); !strings.Contains(text, "invalid chat ID") {
 			t.Fatalf("error = %q, want the invalid-room error", text)
 		}
 	})
