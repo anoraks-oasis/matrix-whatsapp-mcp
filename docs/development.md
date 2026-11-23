@@ -135,6 +135,6 @@ internal/trigger/      m.room.message → ring buffer + webhook
 internal/mcpserver/    nine tools, send gate, idempotency cache, in-memory media
 internal/cli/          chats, chats allow|deny (rooms is a hidden alias), doctor
 scripts/smoke_test.sh  end-to-end smoke checks
-deploy/                systemd unit
+deploy/                systemd unit, env template, host layout
 docs/                  tool reference, architecture, operations, security, reviews
 ```

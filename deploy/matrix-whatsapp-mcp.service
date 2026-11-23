@@ -6,33 +6,49 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+
+# An ordinary service account, not root. Substitute the account that owns the
+# state directory; the name here is only the example.
 User=matrix-mcp
 Group=matrix-mcp
-WorkingDirectory=/var/lib/matrix-whatsapp-mcp
-ExecStart=/usr/local/bin/matrix-whatsapp-mcp
 
-# The default is stdio, which needs a client on stdin; a service has none, so
-# serve Streamable HTTP instead. Both can be overridden in the env file below.
+# The binary, its environment file and everything it writes live in one
+# directory, beside the homeserver and the bridge.
+WorkingDirectory=/srv/matrix/matrix-whatsapp-mcp
+ExecStart=/srv/matrix/matrix-whatsapp-mcp/bin/matrix-whatsapp-mcp
+
+# The default transport is stdio, which needs a client on stdin; a service has
+# none, so serve Streamable HTTP instead. A copy in the env file below overrides
+# these two lines.
+#
+# HTTP_ADDR is the host's private-network address, because the MCP client is
+# another machine on that network. There is no authentication in front of the
+# listener: keep the address off the internet.
 Environment=MCP_TRANSPORT=http
 Environment=HTTP_ADDR=127.0.0.1:8080
 
 # Holds MATRIX_HOMESERVER, MATRIX_USER_ID, MATRIX_ACCESS_TOKEN and any optional
 # variables. Keep it root:matrix-mcp 0640 so `chats allow` can be run as the
 # service user.
-EnvironmentFile=/etc/matrix-whatsapp-mcp/env
+EnvironmentFile=/srv/matrix/matrix-whatsapp-mcp/etc/env
 
-Restart=on-failure
+# Restart=always, not on-failure: the process is the only listener on that port,
+# and a clean exit would leave the tools unreachable while the host still looks
+# healthy.
+Restart=always
 RestartSec=5s
 KillSignal=SIGTERM
 TimeoutStopSec=20s
 
-# Hardening. ProtectHome keeps HOME away from the service, so the allowlist file
-# must be set explicitly (MATRIX_ALLOWLIST_FILE=/var/lib/matrix-whatsapp-mcp/allow.txt).
+# Hardening. ProtectSystem=strict makes the whole filesystem read-only for the
+# service except ReadWritePaths. ProtectHome keeps HOME away from it, so the
+# allowlist file must be set explicitly:
+# MATRIX_ALLOWLIST_FILE=/srv/matrix/matrix-whatsapp-mcp/state/allow.txt.
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/matrix-whatsapp-mcp
+ReadWritePaths=/srv/matrix/matrix-whatsapp-mcp/state /srv/matrix/matrix-whatsapp-mcp/logs
 
 [Install]
 WantedBy=multi-user.target

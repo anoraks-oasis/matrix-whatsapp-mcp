@@ -10,7 +10,8 @@ stdio or Streamable HTTP.
 
 - [Tool reference](tools.md) — the nine tools, with every input, output, default, clamp, annotation and error.
 - [Architecture](architecture.md) — packages, startup and shutdown, the sync pipeline, the ring buffer, the send gate, the bridge-ack guard, the allowlist file.
-- [Operations](operations.md) — where to run it, a systemd unit, the environment file, logs and rotation, `doctor`, troubleshooting.
+- [Operations](operations.md) — where to run it, the single-directory layout beside the homeserver, a systemd unit, the environment file, logs and rotation, `doctor`, troubleshooting.
+- [Deploy](../deploy/README.md) — the unit and env template, and how the bundle is laid out and installed on a real host.
 - [Development](development.md) — toolchain, the four gates, tests, the smoke script, CI, the `covdata` quirk.
 - [Security](security.md) — token handling, the allowlist as the only send gate, media handling, rate limiting, the relay caveat, private disclosure.
 - [Review record, November 2026](reviews/2026-11-review.md) — a point-in-time audit of the seven-tool surface with findings and gate output.
