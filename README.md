@@ -2,8 +2,6 @@
   <img src="docs/assets/banner.jpg" alt="matrix-whatsapp-mcp — a Model Context Protocol server for WhatsApp over Matrix" width="100%">
 </p>
 
-Banner: Claude Monet, *Water Lilies* (1922), public domain, via Wikimedia Commons.
-
 # matrix-whatsapp-mcp
 
 A single Go binary that keeps a Matrix `/sync` listener on a mautrix/whatsapp bridge and exposes the conversation to a Model Context Protocol client through nine tools, over stdio or Streamable HTTP.
@@ -284,3 +282,7 @@ The access token and pickle key live only in the environment, are never logged, 
 ## License
 
 MIT — see [LICENSE](LICENSE). Copyright 2026 anoraks-oasis.
+
+---
+
+Banner: Claude Monet, *Water Lilies* (1922), public domain, via [Wikimedia Commons](https://commons.wikimedia.org/).
