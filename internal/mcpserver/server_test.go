@@ -28,6 +28,7 @@ type fakeMatrix struct {
 	mu         sync.Mutex
 	rooms      []matrix.Room
 	roomsErr   error
+	roomsCalls int
 	msgs       []matrix.Message
 	msgsNext   string
 	msgsMore   bool
@@ -88,7 +89,18 @@ func (f *fakeMatrix) waitCtx(ctx context.Context) error {
 }
 
 func (f *fakeMatrix) JoinedRooms(context.Context) ([]matrix.Room, error) {
+	f.mu.Lock()
+	f.roomsCalls++
+	f.mu.Unlock()
 	return f.rooms, f.roomsErr
+}
+
+// joinedCalls reports how many times the handler read the joined-chat list, so
+// a test can prove a per-call name lookup stays one lookup.
+func (f *fakeMatrix) joinedCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.roomsCalls
 }
 
 func (f *fakeMatrix) Messages(_ context.Context, roomID string, limit int, before string) (matrix.MessagePage, error) {
@@ -425,9 +437,26 @@ func TestToolsListHasNineToolsWithSchemas(t *testing.T) {
 		}
 	}
 
-	listChats := schemaMap(t, toolByName(t, res.Tools, "list_chats"))
+	listChatsTool := toolByName(t, res.Tools, "list_chats")
+	listChats := schemaMap(t, listChatsTool)
 	if len(requiredFields(t, listChats)) != 0 {
 		t.Fatalf("list_chats required = %v, want none", requiredFields(t, listChats))
+	}
+	// list_chats answers with a chats object, and each row names the chat with
+	// chat_name, the same word every other tool uses for it.
+	listChatsOut := envelopeProperties(t, listChatsTool)
+	chatsRows, ok := listChatsOut["chats"].(map[string]any)["items"].(map[string]any)
+	if !ok {
+		t.Fatalf("list_chats output schema has no chats items object: %v", listChatsOut)
+	}
+	chatsProps := chatsRows["properties"].(map[string]any)
+	for _, field := range []string{"chat_id", "chat_name", "whatsapp"} {
+		if _, ok := chatsProps[field]; !ok {
+			t.Fatalf("list_chats row schema has no %q property", field)
+		}
+	}
+	if _, ok := chatsProps["name"]; ok {
+		t.Fatalf("list_chats row schema still has the old \"name\" property: %v", chatsProps)
 	}
 
 	// get_messages: a chat to read (with its deprecated alias), an optional
@@ -445,7 +474,7 @@ func TestToolsListHasNineToolsWithSchemas(t *testing.T) {
 		t.Fatalf("get_messages room_id description = %q, want it documented as a deprecated alias of chat_id", desc)
 	}
 	messageFields := []string{
-		"chat_id", "message_id", "from", "text", "type", "timestamp", "encrypted",
+		"chat_id", "chat_name", "message_id", "from", "text", "type", "timestamp", "encrypted",
 		"reply_to", "edit_of", "mentions", "deleted",
 		"mimetype", "filename", "size_bytes", "width", "height", "duration_ms", "media_uri",
 	}
@@ -544,7 +573,7 @@ func TestToolsListHasNineToolsWithSchemas(t *testing.T) {
 		t.Fatalf("search_messages results schema has no items object")
 	}
 	hitProps := hitItems["properties"].(map[string]any)
-	for _, field := range append(append([]string{}, messageFields...), "chat_name") {
+	for _, field := range messageFields {
 		if _, ok := hitProps[field]; !ok {
 			t.Fatalf("search_messages result has no %q property (a match carries the whole message plus its chat)", field)
 		}
@@ -708,10 +737,16 @@ func TestToolsListHasNineToolsWithSchemas(t *testing.T) {
 			t.Fatalf("get_new_messages schema has no %q property", field)
 		}
 	}
-	recentOut := outputProperties(t, recentTool)
+	// The rows live under a messages object, for the same reason list_chats
+	// wraps its rows.
+	recentOut := envelopeProperties(t, recentTool)
+	if _, ok := recentOut["messages"]; !ok {
+		t.Fatalf("get_new_messages output schema has no messages property: %v", recentOut)
+	}
+	recentRows := messageProperties(t, recentTool)
 	for _, field := range []string{"message_id", "chat_id", "chat_name", "from", "text", "type", "timestamp"} {
-		if _, ok := recentOut[field]; !ok {
-			t.Fatalf("get_new_messages output schema has no %q property", field)
+		if _, ok := recentRows[field]; !ok {
+			t.Fatalf("get_new_messages row schema has no %q property", field)
 		}
 	}
 
@@ -821,39 +856,20 @@ func TestListChatsKeepsChatsWithFailedProbes(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("list_chats returned error: %s", resultErrorText(t, res))
 	}
-	rooms := decodeStructured[[]chatResult](t, res)
-	if len(rooms) != 2 {
-		t.Fatalf("list_chats returned %d rooms, want 2", len(rooms))
+	chats := decodeStructured[listChatsResult](t, res).Chats
+	if len(chats) != 2 {
+		t.Fatalf("list_chats returned %d chats, want 2", len(chats))
 	}
-	if rooms[0].ChatID != "!a:test" || rooms[0].Name != "Alpha" || !rooms[0].WhatsApp {
-		t.Fatalf("chats[0] = %+v, want !a:test/Alpha/whatsapp", rooms[0])
+	if chats[0].ChatID != "!a:test" || chats[0].ChatName != "Alpha" || !chats[0].WhatsApp {
+		t.Fatalf("chats[0] = %+v, want !a:test/Alpha/whatsapp", chats[0])
 	}
-	if rooms[1].ChatID != "!b:test" || rooms[1].Name != "#beta:test" || rooms[1].WhatsApp {
-		t.Fatalf("chats[1] = %+v, want !b:test alias fallback and whatsapp=false despite probe error", rooms[1])
+	if chats[1].ChatID != "!b:test" || chats[1].ChatName != "#beta:test" || chats[1].WhatsApp {
+		t.Fatalf("chats[1] = %+v, want !b:test alias fallback and whatsapp=false despite probe error", chats[1])
 	}
 }
 
-// outputProperties returns the properties of a tool's structured output, which
-// is an array schema for list_chats and get_new_messages.
-func outputProperties(t *testing.T, tool *mcp.Tool) map[string]any {
-	t.Helper()
-	schema, ok := tool.OutputSchema.(map[string]any)
-	if !ok {
-		t.Fatalf("tool %q OutputSchema is %T, want map[string]any", tool.Name, tool.OutputSchema)
-	}
-	items, ok := schema["items"].(map[string]any)
-	if !ok {
-		t.Fatalf("tool %q output schema has no items object: %v", tool.Name, schema)
-	}
-	props, ok := items["properties"].(map[string]any)
-	if !ok {
-		t.Fatalf("tool %q output schema has no properties: %v", tool.Name, items)
-	}
-	return props
-}
-
-// envelopeProperties returns the properties of a tool's object-shaped output
-// (get_messages and send_message).
+// envelopeProperties returns the properties of a tool's object-shaped output,
+// which every tool has: each result is an envelope, never a bare array.
 func envelopeProperties(t *testing.T, tool *mcp.Tool) map[string]any {
 	t.Helper()
 	schema, ok := tool.OutputSchema.(map[string]any)
@@ -867,9 +883,9 @@ func envelopeProperties(t *testing.T, tool *mcp.Tool) map[string]any {
 	return props
 }
 
-// messageProperties returns the schema of one message inside get_messages'
-// output envelope, so a field cannot be dropped from the message shape without
-// failing the tools/list test.
+// messageProperties returns the schema of one message inside a tool's messages
+// envelope (get_messages and get_new_messages), so a field cannot be dropped
+// from the message shape without failing the tools/list test.
 func messageProperties(t *testing.T, tool *mcp.Tool) map[string]any {
 	t.Helper()
 	messages, ok := envelopeProperties(t, tool)["messages"].(map[string]any)
@@ -980,9 +996,9 @@ func TestGetRecentTriggersSinceAndLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get_new_messages: %v", err)
 	}
-	triggers := decodeStructured[[]triggerResult](t, res)
-	if len(triggers) != 2 || triggers[0].MessageID != "$t2" || triggers[1].MessageID != "$t1" {
-		t.Fatalf("get_new_messages = %+v, want [$t2 $t1]", triggers)
+	messages := decodeStructured[getNewMessagesResult](t, res).Messages
+	if len(messages) != 2 || messages[0].MessageID != "$t2" || messages[1].MessageID != "$t1" {
+		t.Fatalf("get_new_messages = %+v, want [$t2 $t1]", messages)
 	}
 	since, limit := recent.lastCall()
 	if since != 50 || limit != 100 {
@@ -1752,7 +1768,7 @@ func TestListChatsBoundsTheProbePhase(t *testing.T) {
 	if res.IsError {
 		t.Fatalf("list_chats returned error: %s", resultErrorText(t, res))
 	}
-	if got := decodeStructured[[]chatResult](t, res); len(got) != len(rooms) {
+	if got := decodeStructured[listChatsResult](t, res).Chats; len(got) != len(rooms) {
 		t.Fatalf("list_chats returned %d chats, want %d", len(got), len(rooms))
 	}
 

@@ -91,6 +91,28 @@ func matchChats(rooms []matrix.Room, query string) (string, []matrix.Room, bool)
 	}
 }
 
+// chatDisplayName resolves the name a message result carries for its chat: the
+// joined chat's own name, then its canonical alias, then the chat ID, which is
+// the same chain search_messages reports. It is one bounded lookup per call, so
+// a name that cannot be read costs a short wait instead of failing the call.
+func (s *Server) chatDisplayName(ctx context.Context, chatID string) string {
+	ctx, cancel := context.WithTimeout(ctx, chatNameTimeout)
+	defer cancel()
+	if rooms, err := s.matrix.JoinedRooms(ctx); err == nil {
+		for _, r := range rooms {
+			if r.ID == chatID && r.Name != "" && r.Name != r.ID {
+				return r.Name
+			}
+		}
+	}
+	if s.prober != nil {
+		if alias := s.prober.CanonicalAlias(ctx, chatID); alias != "" {
+			return alias
+		}
+	}
+	return chatID
+}
+
 // displayChats returns a copy of rooms with the same fallback names list_chats
 // reports: the canonical alias when the joined entry has no name of its own,
 // then "unnamed". The copy matters because the joined list is shared state.

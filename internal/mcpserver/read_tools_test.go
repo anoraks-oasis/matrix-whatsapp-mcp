@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
+	"sort"
 	"strings"
 	"testing"
 
@@ -47,7 +49,7 @@ func TestSearchMessagesTool(t *testing.T) {
 		t.Fatalf("results = %+v, want newest first as the Matrix layer returned them", got.Results)
 	}
 	if got.Results[0].ChatName != "Family" || got.Results[0].Text != "dinner tomorrow" || got.Results[0].Type != "text" {
-		t.Fatalf("hit = %+v, want the message shape plus chat_name", got.Results[0])
+		t.Fatalf("hit = %+v, want the message shape with the chat it matched in", got.Results[0])
 	}
 	if got.Results[1].ReplyTo != "$parent" {
 		t.Fatalf("hit reply_to = %q, want $parent carried through", got.Results[1].ReplyTo)
@@ -172,7 +174,7 @@ func TestSearchMessagesToolErrorAndCancellation(t *testing.T) {
 }
 
 func TestGetMessageContextTool(t *testing.T) {
-	svc := &fakeMatrix{ctxOut: matrix.ContextOutcome{
+	svc := &fakeMatrix{rooms: []matrix.Room{{ID: "!r:test", Name: "Family"}}, ctxOut: matrix.ContextOutcome{
 		Before: []matrix.Message{
 			{EventID: "$b1", RoomID: "!r:test", Sender: "@alice:test", Body: "before", MsgType: "m.text", Timestamp: 800},
 		},
@@ -207,6 +209,12 @@ func TestGetMessageContextTool(t *testing.T) {
 	}
 	if len(got.MessagesAfter) != 1 || got.MessagesAfter[0].MessageID != "$a1" {
 		t.Fatalf("messages_after = %+v, want [$a1]", got.MessagesAfter)
+	}
+	// Every message in the answer is in the same chat, so each one names it.
+	for _, msg := range append(append([]messageResult{got.Message, *got.ReplyTo, *got.EditOf}, got.MessagesBefore...), got.MessagesAfter...) {
+		if msg.ChatName != "Family" {
+			t.Fatalf("message %s chat_name = %q, want the chat's display name Family", msg.MessageID, msg.ChatName)
+		}
 	}
 	if got.ReplyTo == nil || got.ReplyTo.MessageID != "$parent" || got.ReplyTo.Text != "the parent" {
 		t.Fatalf("reply_to = %+v, want the parent resolved to a full message", got.ReplyTo)
@@ -472,5 +480,189 @@ func TestTriggerDescriptionStatesTheBuffer(t *testing.T) {
 		if !strings.Contains(desc, want) {
 			t.Fatalf("get_new_messages description = %q, want it to state %q", desc, want)
 		}
+	}
+}
+
+// TestGetMessagesCarriesChatName proves the message shape names its chat on the
+// same chain search_messages reports: the joined chat's display name, then its
+// canonical alias, then the chat ID. The lookup happens once per call, so a page
+// of messages costs one name resolution rather than one per message.
+func TestGetMessagesCarriesChatName(t *testing.T) {
+	tests := []struct {
+		name  string
+		rooms []matrix.Room
+		alias string
+		want  string
+	}{
+		{
+			name:  "display name",
+			rooms: []matrix.Room{{ID: "!r:test", Name: "Family"}},
+			want:  "Family",
+		},
+		{
+			name:  "canonical alias when the chat has no name",
+			rooms: []matrix.Room{{ID: "!r:test"}},
+			alias: "#family:test",
+			want:  "#family:test",
+		},
+		{
+			name:  "chat ID when the name is not known",
+			rooms: []matrix.Room{{ID: "!r:test"}},
+			want:  "!r:test",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := &fakeMatrix{
+				rooms: tc.rooms,
+				msgs: []matrix.Message{
+					{EventID: "$2", RoomID: "!r:test", Body: "new", MsgType: "m.text", Timestamp: 200},
+					{EventID: "$1", RoomID: "!r:test", Body: "old", MsgType: "m.text", Timestamp: 100},
+				},
+			}
+			prober := &fakeProber{}
+			if tc.alias != "" {
+				prober.aliases = map[string]string{"!r:test": tc.alias}
+			}
+			srv := New(svc, prober, &fakeRecent{}, nil)
+			session, cleanup := connect(t, srv)
+			defer cleanup()
+
+			res, err := session.CallTool(context.Background(), &mcp.CallToolParams{
+				Name:      "get_messages",
+				Arguments: map[string]any{"chat_id": "!r:test"},
+			})
+			if err != nil {
+				t.Fatalf("get_messages: %v", err)
+			}
+			if res.IsError {
+				t.Fatalf("get_messages returned error: %s", resultErrorText(t, res))
+			}
+			msgs := decodeStructured[getMessagesResult](t, res).Messages
+			if len(msgs) != 2 {
+				t.Fatalf("got %d messages, want 2", len(msgs))
+			}
+			for _, msg := range msgs {
+				if msg.ChatName != tc.want {
+					t.Fatalf("message %s chat_name = %q, want %q", msg.MessageID, msg.ChatName, tc.want)
+				}
+			}
+			if got := svc.joinedCalls(); got != 1 {
+				t.Fatalf("joined-chat lookups = %d, want 1: the chat name is resolved once per call, not once per message", got)
+			}
+		})
+	}
+}
+
+// TestResultShapesAreExact pins the key sets a model sees, because a model
+// reads the shape and a field that appears in one tool but not its neighbour is
+// a trap. The envelopes are objects (not bare arrays) so a later count or
+// cursor has somewhere to go, and the rows carry chat_name, the one word every
+// tool uses for a chat's name.
+func TestResultShapesAreExact(t *testing.T) {
+	svc := &fakeMatrix{
+		rooms: []matrix.Room{{ID: "!r:test", Name: "Family"}},
+		msgs: []matrix.Message{{
+			EventID: "$m", RoomID: "!r:test", Sender: "@alice:test",
+			Body: "hi", MsgType: "m.text", Timestamp: 100,
+		}},
+	}
+	recent := &fakeRecent{out: []trigger.Trigger{{
+		MessageID: "$m", ChatID: "!r:test", ChatName: "Family",
+		From: "@alice:test", Text: "hi", Type: "text", Timestamp: 100,
+	}}}
+	srv := New(svc, &fakeProber{}, recent, nil)
+	session, cleanup := connect(t, srv)
+	defer cleanup()
+
+	envelopes := []struct {
+		tool string
+		args map[string]any
+		want []string
+	}{
+		{tool: "list_chats", want: []string{"chats"}},
+		{tool: "get_messages", args: map[string]any{"chat_id": "!r:test"}, want: []string{"has_more", "messages"}},
+		{tool: "get_new_messages", want: []string{"messages"}},
+	}
+	objects := make(map[string]map[string]any, len(envelopes))
+	for _, tc := range envelopes {
+		res, err := session.CallTool(context.Background(), &mcp.CallToolParams{Name: tc.tool, Arguments: tc.args})
+		if err != nil {
+			t.Fatalf("%s: %v", tc.tool, err)
+		}
+		if res.IsError {
+			t.Fatalf("%s returned error: %s", tc.tool, resultErrorText(t, res))
+		}
+		obj := structuredObject(t, res)
+		assertExactKeys(t, tc.tool+" result", obj, tc.want)
+		objects[tc.tool] = obj
+	}
+
+	chatRow := firstRow(t, objects["list_chats"], "chats")
+	assertExactKeys(t, "list_chats row", chatRow, []string{"chat_id", "chat_name", "whatsapp"})
+	if chatRow["chat_name"] != "Family" {
+		t.Fatalf("list_chats row chat_name = %v, want Family", chatRow["chat_name"])
+	}
+
+	messageRow := firstRow(t, objects["get_messages"], "messages")
+	assertExactKeys(t, "get_messages message", messageRow, []string{
+		"chat_id", "chat_name", "deleted", "encrypted", "from", "message_id", "text", "timestamp", "type",
+	})
+	if messageRow["chat_name"] != "Family" {
+		t.Fatalf("get_messages message chat_name = %v, want Family", messageRow["chat_name"])
+	}
+
+	triggerRow := firstRow(t, objects["get_new_messages"], "messages")
+	assertExactKeys(t, "get_new_messages row", triggerRow, []string{
+		"chat_id", "chat_name", "from", "message_id", "text", "timestamp", "type",
+	})
+}
+
+// structuredObject returns a tool result's structured content as a generic
+// object, so a shape assertion sees the keys that were actually sent rather
+// than the keys a struct would decode.
+func structuredObject(t *testing.T, res *mcp.CallToolResult) map[string]any {
+	t.Helper()
+	raw, err := json.Marshal(res.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("structured content is not an object: %s", raw)
+	}
+	return obj
+}
+
+// firstRow returns the first element of an envelope's array field.
+func firstRow(t *testing.T, obj map[string]any, field string) map[string]any {
+	t.Helper()
+	rows, ok := obj[field].([]any)
+	if !ok {
+		t.Fatalf("envelope has no %q array: %v", field, obj)
+	}
+	if len(rows) == 0 {
+		t.Fatalf("envelope %q is empty, want one row", field)
+	}
+	row, ok := rows[0].(map[string]any)
+	if !ok {
+		t.Fatalf("%s[0] is %T, want an object", field, rows[0])
+	}
+	return row
+}
+
+// assertExactKeys compares a value's key set to want exactly, so an added,
+// dropped or renamed field fails here instead of drifting between tools.
+func assertExactKeys(t *testing.T, what string, obj map[string]any, want []string) {
+	t.Helper()
+	got := make([]string, 0, len(obj))
+	for key := range obj {
+		got = append(got, key)
+	}
+	sort.Strings(got)
+	sorted := append([]string(nil), want...)
+	sort.Strings(sorted)
+	if !slices.Equal(got, sorted) {
+		t.Fatalf("%s keys = %v, want exactly %v", what, got, sorted)
 	}
 }

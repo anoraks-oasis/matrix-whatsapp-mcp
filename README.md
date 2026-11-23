@@ -66,7 +66,7 @@ The webhook payload (`TRIGGER_WEBHOOK_URL`) uses the same vocabulary as the tool
 **Read**
 
 - `list_chats` — every joined chat, its display name, and a best-effort flag for whether it is a WhatsApp chat relayed by the bridge.
-- `get_messages` — one page of a chat's history, oldest first, behind an opaque `next_token`. Each message carries `reply_to`, `edit_of`, `mentions` and `deleted`, so a client reads a conversation instead of isolated messages, plus `mimetype`, `filename`, `size_bytes`, `width`, `height`, `duration_ms` and `media_uri` when it has an attachment.
+- `get_messages` — one page of a chat's history, oldest first, behind an opaque `next_token`. Each message carries its `chat_id` and `chat_name`, plus `reply_to`, `edit_of`, `mentions` and `deleted`, so a client reads a conversation instead of isolated messages, and `mimetype`, `filename`, `size_bytes`, `width`, `height`, `duration_ms` and `media_uri` when it has an attachment.
 - `search_messages` — the homeserver's own search index first; when it has none, a bounded scan of the 50 newest messages in at most 10 chats, with `truncated`, `scanned_chats`, `scanned_messages` and `source` reporting what actually happened.
 - `get_message_context` — one message with up to 50 messages on each side, and `reply_to`/`edit_of` resolved to full messages.
 - `list_chat_contacts` — joined contacts with `whatsapp` and `contact_type` (`whatsapp_contact`, `bridge_bot`, or `matrix_user`).
@@ -183,13 +183,13 @@ Streamable HTTP — start the server with `MCP_TRANSPORT=http` first, then point
 
 What the client sees:
 
-- `list_chats` → `[{chat_id, name, whatsapp}]`
+- `list_chats` → `{chats: [{chat_id, chat_name, whatsapp}]}`
 - `get_messages` → `{messages: [...], has_more, next_token}`, oldest first
 - `search_messages` → `{results: [...], truncated, scanned_chats, scanned_messages, source}`
 - `get_message_context` → `{messages_before, message, messages_after, reply_to?, edit_of?, source, truncated}`
 - `list_chat_contacts` → `{contacts: [{user_id, display_name, membership, whatsapp, contact_type}]}`
 - `get_media` → a `text` block with the metadata JSON, plus an `image` or `audio` block when the payload qualifies
-- `get_new_messages` → `[{message_id, chat_id, chat_name, from, text, type, timestamp}]`, newest first
+- `get_new_messages` → `{messages: [{message_id, chat_id, chat_name, from, text, type, timestamp}]}`, newest first
 - `send_message` → `{message_id, deduplicated}`
 - `send_media` → `{message_id, deduplicated, type, media_uri}`
 

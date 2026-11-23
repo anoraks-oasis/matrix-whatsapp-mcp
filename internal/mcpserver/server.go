@@ -51,6 +51,10 @@ const (
 	// agent makes casually. Past the bound the chats are still listed, with
 	// the WhatsApp flag false for the ones the probes did not reach.
 	listChatsTimeout = 10 * time.Second
+	// chatNameTimeout bounds the one display-name lookup a message result does
+	// per call (get_messages and get_message_context), so a name that cannot be
+	// read costs a short wait and then falls back to the chat ID.
+	chatNameTimeout = 3 * time.Second
 )
 
 // instructions is the handshake text every MCP client reads first. It
@@ -129,7 +133,8 @@ func newServerWithBudget(svc matrix.MatrixService, prober RoomProber, recent Tri
 	mcp.AddTool(mcpServer, &mcp.Tool{
 		Name: "list_chats",
 		Description: fmt.Sprintf("List every chat the account is in, with its display name and whether it is a WhatsApp chat. "+
-			"Use a chat's name as the chat argument of another tool. Chat probes run %d at a time and the whole probe phase is cut off after %s, "+
+			"The result is a chats object holding one row per chat, each with chat_id, chat_name and whatsapp; use a row's chat_name as the chat argument of another tool. "+
+			"Chat probes run %d at a time and the whole probe phase is cut off after %s, "+
 			"so a large account answers promptly: a chat whose probes did not finish is still listed, with whatsapp false and the name the joined-chat list carried.",
 			listProbeParallel, listChatsTimeout),
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
@@ -139,7 +144,8 @@ func newServerWithBudget(svc matrix.MatrixService, prober RoomProber, recent Tri
 		Name: "get_messages",
 		Description: "Get messages from a chat, oldest first. Name the chat with chat_id from list_chats, or with chat: a chat name or a unique case-insensitive substring of one. " +
 			"Without a cursor this returns the newest messages; pass before with the next_token of an earlier get_messages result to page further back, and follow next_token while has_more is true. " +
-			"Every message carries its relations: the message it replies to, the message it edits, mentioned user IDs, and whether it was deleted.",
+			"Every message carries its chat_id and chat_name, the display name of the chat it is in or that chat's ID when the name is not known, " +
+			"and its relations: the message it replies to, the message it edits, mentioned user IDs, and whether it was deleted.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, s.handleGetMessages)
 
@@ -190,8 +196,8 @@ func newServerWithBudget(svc matrix.MatrixService, prober RoomProber, recent Tri
 		Name: "get_new_messages",
 		Description: fmt.Sprintf("Read the incoming messages this server has seen, newest first. It is an in-memory, process-local ring buffer: "+
 			"it holds the newest %d messages and is empty again after a restart, so it is a recent-activity view and not a transcript. "+
-			"since keeps only messages received strictly after that unix-millisecond time, and limit caps the answer at 1..100 (20 by default); "+
-			"both apply to what the buffer still holds. Each message carries its message_id, chat_id and chat_name, from, text (a media message with no text "+
+			"The result is a messages object holding one row per message. since keeps only messages received strictly after that unix-millisecond time, and limit caps the answer at 1..100 (20 by default); "+
+			"both apply to what the buffer still holds. Each row carries its message_id, chat_id and chat_name, from, text (a media message with no text "+
 			"carries a bracketed marker such as [image]), type and receipt time. since is the canonical input name; since_timestamp is still accepted as a deprecated alias.", trigger.BufferSize),
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, s.handleGetNewMessages)
@@ -264,8 +270,15 @@ type listChatsInput struct{}
 
 type chatResult struct {
 	ChatID   string `json:"chat_id" jsonschema:"the chat ID: a chat reference such as !abc:example.com, as list_chats reports it"`
-	Name     string `json:"name" jsonschema:"the display name; falls back to the chat's alternate name, then to 'unnamed'"`
+	ChatName string `json:"chat_name" jsonschema:"the display name; falls back to the chat's alternate name, then to 'unnamed'"`
 	WhatsApp bool   `json:"whatsapp" jsonschema:"true when this chat is a WhatsApp chat relayed by the bridge"`
+}
+
+// listChatsResult wraps the rows in an object: structured content is an object
+// everywhere else in this server, and a field such as a count or a page cursor
+// can join chats later without changing the shape a model sees.
+type listChatsResult struct {
+	Chats []chatResult `json:"chats" jsonschema:"every chat the account has joined, sorted by chat name"`
 }
 
 type getMessagesInput struct {
@@ -276,6 +289,7 @@ type getMessagesInput struct {
 
 type messageResult struct {
 	ChatID     string   `json:"chat_id" jsonschema:"the chat the message is in: a chat reference such as !abc:example.com"`
+	ChatName   string   `json:"chat_name" jsonschema:"the display name of the chat the message is in, falling back to the chat ID when the name is not known"`
 	MessageID  string   `json:"message_id" jsonschema:"the message ID: a message reference such as $abc123"`
 	From       string   `json:"from" jsonschema:"the sender's user ID, for example @15551234:example.com"`
 	Text       string   `json:"text" jsonschema:"the message text; a media message with no caption carries a bracketed type marker such as [image] or [document]; a deleted message has empty text"`
@@ -309,17 +323,12 @@ type searchMessagesInput struct {
 	SinceTimestamp int64  `json:"since_timestamp,omitempty" jsonschema:"deprecated alias of since; still accepted, and since wins when both are set. Use since in new calls"`
 }
 
-type searchHitResult struct {
-	messageResult
-	ChatName string `json:"chat_name" jsonschema:"the display name of the chat the match is in, falling back to the chat ID when the name is not known"`
-}
-
 type searchMessagesResult struct {
-	Results         []searchHitResult `json:"results" jsonschema:"the matching messages, newest first, each in the same shape get_messages returns plus its chat name; empty when nothing matched"`
-	Truncated       bool              `json:"truncated" jsonschema:"true when the search stopped at a budget instead of covering everything it was asked to search: more matches than limit, a chat with history behind the page that was read, more chats than the scan may read, or a chat that could not be read. The results are then a partial answer"`
-	ScannedChats    int               `json:"scanned_chats" jsonschema:"how many chats the bounded fallback scan actually read; 0 when the server's search index answered, because nothing was scanned"`
-	ScannedMessages int               `json:"scanned_messages" jsonschema:"how many messages the bounded fallback scan actually looked at; 0 when the server's search index answered"`
-	Source          string            `json:"source" jsonschema:"which path produced the results: server when the server's search index answered, fallback when the bounded chat scan did"`
+	Results         []messageResult `json:"results" jsonschema:"the matching messages, newest first, in the same message shape every tool returns; empty when nothing matched. A search can span chats, so chat_name is how a result says which one it came from"`
+	Truncated       bool            `json:"truncated" jsonschema:"true when the search stopped at a budget instead of covering everything it was asked to search: more matches than limit, a chat with history behind the page that was read, more chats than the scan may read, or a chat that could not be read. The results are then a partial answer"`
+	ScannedChats    int             `json:"scanned_chats" jsonschema:"how many chats the bounded fallback scan actually read; 0 when the server's search index answered, because nothing was scanned"`
+	ScannedMessages int             `json:"scanned_messages" jsonschema:"how many messages the bounded fallback scan actually looked at; 0 when the server's search index answered"`
+	Source          string          `json:"source" jsonschema:"which path produced the results: server when the server's search index answered, fallback when the bounded chat scan did"`
 }
 
 type getMessageContextInput struct {
@@ -370,11 +379,18 @@ type getNewMessagesInput struct {
 type triggerResult struct {
 	MessageID string `json:"message_id" jsonschema:"the message ID: a message reference such as $abc123"`
 	ChatID    string `json:"chat_id" jsonschema:"the chat ID: a chat reference such as !abc:example.com, as list_chats reports it"`
-	ChatName  string `json:"chat_name" jsonschema:"the display name of the chat"`
+	ChatName  string `json:"chat_name" jsonschema:"the display name of the chat the message is in, falling back to the chat ID when the name is not known"`
 	From      string `json:"from" jsonschema:"the sender's user ID"`
 	Text      string `json:"text" jsonschema:"the message text; a media message with no caption carries a bracketed type marker such as [image] or [document]"`
 	Type      string `json:"type" jsonschema:"the WhatsApp message type: text, image, video, audio, document, sticker, location, or other"`
 	Timestamp int64  `json:"timestamp" jsonschema:"unix milliseconds when the message was received"`
+}
+
+// getNewMessagesResult wraps the rows in an object, for the same reason
+// listChatsResult does: structured content is an object everywhere else, and a
+// count or a cursor can join messages later without reshaping the result.
+type getNewMessagesResult struct {
+	Messages []triggerResult `json:"messages" jsonschema:"the incoming messages the buffer still holds, newest first; empty when nothing has arrived since the process started"`
 }
 
 type sendMessageInput struct {
@@ -389,10 +405,10 @@ type sendMessageResult struct {
 	Deduplicated bool   `json:"deduplicated" jsonschema:"true when an earlier send with the same idempotency_key was returned instead of sending again"`
 }
 
-func (s *Server) handleListChats(ctx context.Context, _ *mcp.CallToolRequest, _ listChatsInput) (*mcp.CallToolResult, []chatResult, error) {
+func (s *Server) handleListChats(ctx context.Context, _ *mcp.CallToolRequest, _ listChatsInput) (*mcp.CallToolResult, listChatsResult, error) {
 	rooms, err := s.matrix.JoinedRooms(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, listChatsResult{}, err
 	}
 
 	results := make([]chatResult, len(rooms))
@@ -414,21 +430,21 @@ func (s *Server) handleListChats(ctx context.Context, _ *mcp.CallToolRequest, _ 
 	}
 	wg.Wait()
 	if ctx.Err() != nil {
-		return nil, nil, ctx.Err()
+		return nil, listChatsResult{}, ctx.Err()
 	}
-	return nil, results, nil
+	return nil, listChatsResult{Chats: results}, nil
 }
 
 // probeChat resolves a chat's display name and WhatsApp flag. Both probes are
 // best effort: any error inside them (including cancellation) yields the
 // fallback value rather than failing the list_chats call.
 func (s *Server) probeChat(ctx context.Context, r matrix.Room) chatResult {
-	res := chatResult{ChatID: r.ID, Name: r.Name}
-	if res.Name == "" || res.Name == r.ID {
-		res.Name = "unnamed"
+	res := chatResult{ChatID: r.ID, ChatName: r.Name}
+	if res.ChatName == "" || res.ChatName == r.ID {
+		res.ChatName = "unnamed"
 		if s.prober != nil {
 			if alias := s.prober.CanonicalAlias(ctx, r.ID); alias != "" {
-				res.Name = alias
+				res.ChatName = alias
 			}
 		}
 	}
@@ -445,8 +461,9 @@ func (s *Server) handleGetMessages(ctx context.Context, _ *mcp.CallToolRequest, 
 	if err != nil {
 		return nil, getMessagesResult{}, err
 	}
+	chatName := s.chatDisplayName(ctx, chatID)
 	out := getMessagesResult{
-		Messages:  toMessageResults(page.Messages),
+		Messages:  toMessageResults(page.Messages, chatName),
 		NextToken: page.NextToken,
 		HasMore:   page.HasMore,
 	}
@@ -486,17 +503,21 @@ func (s *Server) handleSearchMessages(ctx context.Context, _ *mcp.CallToolReques
 		return nil, searchMessagesResult{}, err
 	}
 	out := searchMessagesResult{
-		Results:         make([]searchHitResult, 0, len(found.Hits)),
+		Results:         make([]messageResult, 0, len(found.Hits)),
 		Truncated:       found.Truncated,
 		ScannedChats:    found.ScannedRooms,
 		ScannedMessages: found.ScannedEvents,
 		Source:          found.Source,
 	}
 	for _, hit := range found.Hits {
-		out.Results = append(out.Results, searchHitResult{
-			messageResult: toMessageResult(hit.Message),
-			ChatName:      hit.RoomName,
-		})
+		// A search can span chats, so each hit names the chat it was found in.
+		// The matrix layer falls back to the chat ID, and that fallback is
+		// repeated here for any other implementation.
+		chatName := hit.RoomName
+		if chatName == "" {
+			chatName = hit.Message.RoomID
+		}
+		out.Results = append(out.Results, toMessageResult(hit.Message, chatName))
 	}
 	return nil, out, nil
 }
@@ -514,19 +535,20 @@ func (s *Server) handleMessageContext(ctx context.Context, _ *mcp.CallToolReques
 	if err != nil {
 		return nil, getMessageContextResult{}, err
 	}
+	chatName := s.chatDisplayName(ctx, chatID)
 	res := getMessageContextResult{
-		MessagesBefore: toMessageResults(out.Before),
-		Message:        toMessageResult(out.Event),
-		MessagesAfter:  toMessageResults(out.After),
+		MessagesBefore: toMessageResults(out.Before, chatName),
+		Message:        toMessageResult(out.Event, chatName),
+		MessagesAfter:  toMessageResults(out.After, chatName),
 		Source:         out.Source,
 		Truncated:      out.Truncated,
 	}
 	if out.ReplyTo != nil {
-		reply := toMessageResult(*out.ReplyTo)
+		reply := toMessageResult(*out.ReplyTo, chatName)
 		res.ReplyTo = &reply
 	}
 	if out.EditOf != nil {
-		edit := toMessageResult(*out.EditOf)
+		edit := toMessageResult(*out.EditOf, chatName)
 		res.EditOf = &edit
 	}
 	return nil, res, nil
@@ -567,7 +589,7 @@ func contactType(kind string) string {
 	}
 }
 
-func (s *Server) handleGetNewMessages(_ context.Context, _ *mcp.CallToolRequest, in getNewMessagesInput) (*mcp.CallToolResult, []triggerResult, error) {
+func (s *Server) handleGetNewMessages(_ context.Context, _ *mcp.CallToolRequest, in getNewMessagesInput) (*mcp.CallToolResult, getNewMessagesResult, error) {
 	since := in.Since
 	if since == 0 {
 		since = in.SinceTimestamp
@@ -585,7 +607,7 @@ func (s *Server) handleGetNewMessages(_ context.Context, _ *mcp.CallToolRequest,
 			Timestamp: t.Timestamp,
 		})
 	}
-	return nil, out, nil
+	return nil, getNewMessagesResult{Messages: out}, nil
 }
 
 func (s *Server) handleSendMessage(ctx context.Context, _ *mcp.CallToolRequest, in sendMessageInput) (*mcp.CallToolResult, sendMessageResult, error) {
@@ -665,12 +687,13 @@ func contextLimit(v *int) int {
 }
 
 // toMessageResult is the one place a Matrix message becomes the tool shape, so
-// every tool that returns a message returns exactly the same one. The type and
-// the placeholder text are the only values translated; every ID is passed
-// through untouched.
-func toMessageResult(m matrix.Message) messageResult {
+// every tool that returns a message returns exactly the same one. The type, the
+// placeholder text and the chat's display name are the only values translated;
+// every ID is passed through untouched.
+func toMessageResult(m matrix.Message, chatName string) messageResult {
 	return messageResult{
 		ChatID:     m.RoomID,
+		ChatName:   chatName,
 		MessageID:  m.EventID,
 		From:       m.Sender,
 		Text:       m.Body,
@@ -691,10 +714,12 @@ func toMessageResult(m matrix.Message) messageResult {
 	}
 }
 
-func toMessageResults(msgs []matrix.Message) []messageResult {
+// toMessageResults converts one page of one chat's messages, which all carry
+// the same chat name.
+func toMessageResults(msgs []matrix.Message, chatName string) []messageResult {
 	out := make([]messageResult, 0, len(msgs))
 	for _, m := range msgs {
-		out = append(out, toMessageResult(m))
+		out = append(out, toMessageResult(m, chatName))
 	}
 	return out
 }

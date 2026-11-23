@@ -1,9 +1,10 @@
 # Tool reference
 
 Nine tools, seven that only read and two that send or upload. Every tool is
-registered with a JSON schema, a description, and MCP annotations; every result is
-structured JSON, and `get_media` additionally returns the payload as an MCP content
-block. A call that cannot be answered fails as an MCP error with a short WhatsApp-
+registered with a JSON schema, a description, and MCP annotations; every result is a
+structured JSON object, never a bare array, so a tool can grow a field such as a count or
+a cursor without changing the shape a model reads, and `get_media` additionally returns
+the payload as an MCP content block. A call that cannot be answered fails as an MCP error with a short WhatsApp-
 facing message — no tool returns an empty result to mean "something went wrong".
 
 Every tool that acts on a chat accepts the chat either by `chat_id` or by `chat`, a
@@ -93,6 +94,7 @@ shape.
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `chat_id` | string | The chat the message belongs to: a chat reference such as `!abc:server`. |
+| `chat_name` | string | The display name of that chat, falling back to the chat ID when the name is not known. A single chat's page names it once; search results name the chat each match came from. |
 | `message_id` | string | The message ID: a message reference such as `$abc123`. |
 | `from` | string | The sender's user ID. |
 | `text` | string | The message text. A media message with no caption gets a bracketed type marker such as `[image]` or `[document]`, derived from `type` alone; a deleted message has empty text. |
@@ -136,8 +138,8 @@ Lists every chat the account has joined, with a display name and a best-effort
 "is this a WhatsApp chat" flag.
 
 - **Input:** none.
-- **Output:** an array of `{chat_id, name, whatsapp}`, sorted by name.
-- **Name:** the chat name; if the chat has none, its canonical alias; otherwise `unnamed`.
+- **Output:** an object `{"chats": [{chat_id, chat_name, whatsapp}]}`, sorted by chat name.
+- **`chat_name`:** the chat name; if the chat has none, its canonical alias; otherwise `unnamed`.
 - **`whatsapp`:** true when the chat carries a bridge state marker; failing that, when any
   joined contact's localpart contains `whatsapp` (case-insensitive). Probes are best effort,
   so an error means `whatsapp: false`, never a failed call.
@@ -161,11 +163,15 @@ Reads one page of a chat's history, oldest first.
 
 ```json
 {
-  "messages": [ { "chat_id": "!...", "message_id": "$...", "from": "@...", "text": "hi", "type": "text", "timestamp": 1763600000000, "encrypted": false, "deleted": false } ],
+  "messages": [ { "chat_id": "!...", "chat_name": "Cafe", "message_id": "$...", "from": "@...", "text": "hi", "type": "text", "timestamp": 1763600000000, "encrypted": false, "deleted": false } ],
   "has_more": true,
   "next_token": "eyJ2IjoxLCJyIjoiIXI6dGVzdCIsImMiOiJ0MTIzIn0.aBcDeF..."
 }
 ```
+
+`chat_name` is resolved once per call — the joined chat's display name, then its
+canonical alias, then the chat ID — inside a short bound, so a page of messages costs one
+name lookup rather than one per message and an unreadable name never fails the call.
 
 The envelope exists because `structuredContent` is a JSON object and the cursor needs
 somewhere to live. `next_token` is present only when there is history behind this page: pass
@@ -225,7 +231,8 @@ the bounded scan instead.
 }
 ```
 
-Each result is the message shape above plus `chat_name`, newest first.
+Each result is the message shape above, newest first. A search can span chats, so a
+result's `chat_name` is how it says which chat the match came from.
 
 **Server path.** `POST /_matrix/client/v3/search` with `keys: ["content.body"]`,
 `order_by: recent`, a message filter, and a chat filter when `chat_id` is given. `truncated` is
@@ -415,7 +422,7 @@ Returns the incoming messages this process has seen, newest first.
 | `since` | no | — | Unix milliseconds; keeps messages received strictly after this time. `since_timestamp` is its deprecated alias. |
 | `limit` | no | 20 | Clamped to 1..100. |
 
-- **Output:** an array of `{message_id, chat_id, chat_name, from, text, type, timestamp}`,
+- **Output:** an object `{"messages": [{message_id, chat_id, chat_name, from, text, type, timestamp}]}`,
   newest first.
 - **What it is:** an in-memory, process-local ring buffer holding the newest 100 messages. It
   is a recent-activity view, not a transcript: it starts empty and is empty again after a
