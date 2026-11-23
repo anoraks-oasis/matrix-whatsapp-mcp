@@ -9,7 +9,7 @@ A single Go binary that keeps a Matrix `/sync` listener on a mautrix/whatsapp br
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Go 1.26+](https://img.shields.io/badge/go-1.26%2B-00ADD8.svg)](go.mod)
 [![MCP server](https://img.shields.io/badge/MCP-server-6E56CF.svg)](https://modelcontextprotocol.io)
-[![CI](https://github.com/ButterHost69/matrix-whatsapp-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/ButterHost69/matrix-whatsapp-mcp/actions/workflows/ci.yml)
+[![CI](https://github.com/anoraks-oasis/matrix-whatsapp-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/anoraks-oasis/matrix-whatsapp-mcp/actions/workflows/ci.yml)
 
 ## What it does
 
@@ -100,7 +100,7 @@ Prerequisites:
 - A Matrix account and access token on a homeserver that runs mautrix/whatsapp.
 
 ```sh
-git clone https://github.com/ButterHost69/matrix-whatsapp-mcp.git
+git clone https://github.com/anoraks-oasis/matrix-whatsapp-mcp.git
 cd matrix-whatsapp-mcp
 make build
 ```
@@ -281,4 +281,4 @@ The access token and pickle key live only in the environment, are never logged, 
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Copyright 2026 ButterHost69.
+MIT — see [LICENSE](LICENSE). Copyright 2026 anoraks-oasis.

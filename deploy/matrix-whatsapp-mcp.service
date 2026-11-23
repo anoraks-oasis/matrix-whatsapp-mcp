@@ -1,6 +1,6 @@
 [Unit]
 Description=matrix-whatsapp-mcp - MCP server for a mautrix/whatsapp bridge
-Documentation=https://github.com/ButterHost69/matrix-whatsapp-mcp
+Documentation=https://github.com/anoraks-oasis/matrix-whatsapp-mcp
 After=network-online.target
 Wants=network-online.target
 
