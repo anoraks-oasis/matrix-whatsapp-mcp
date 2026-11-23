@@ -51,9 +51,14 @@ const (
 	// agent makes casually. Past the bound the chats are still listed, with
 	// the WhatsApp flag false for the ones the probes did not reach.
 	listChatsTimeout = 10 * time.Second
-	// chatNameTimeout bounds the one display-name lookup a message result does
-	// per call (get_messages and get_message_context), so a name that cannot be
-	// read costs a short wait and then falls back to the chat ID.
+	// chatNameParallel bounds how many canonical-alias probes one call's chat
+	// name resolution runs at once, so a page of results spanning many chats
+	// costs bounded time instead of one round trip per result.
+	chatNameParallel = 8
+	// chatNameTimeout bounds the display-name resolution a call does for the
+	// chats its results mention (get_messages, get_message_context,
+	// search_messages and get_new_messages), so a name that cannot be read costs
+	// a short wait and then falls back to the chat ID.
 	chatNameTimeout = 3 * time.Second
 )
 
@@ -461,7 +466,7 @@ func (s *Server) handleGetMessages(ctx context.Context, _ *mcp.CallToolRequest, 
 	if err != nil {
 		return nil, getMessagesResult{}, err
 	}
-	chatName := s.chatDisplayName(ctx, chatID)
+	chatName := s.chatNames().name(ctx, chatID)
 	out := getMessagesResult{
 		Messages:  toMessageResults(page.Messages, chatName),
 		NextToken: page.NextToken,
@@ -502,6 +507,12 @@ func (s *Server) handleSearchMessages(ctx context.Context, _ *mcp.CallToolReques
 	if err != nil {
 		return nil, searchMessagesResult{}, err
 	}
+	names := s.chatNames()
+	chatIDs := make([]string, 0, len(found.Hits))
+	for _, hit := range found.Hits {
+		chatIDs = append(chatIDs, hit.Message.RoomID)
+	}
+	names.resolve(ctx, chatIDs)
 	out := searchMessagesResult{
 		Results:         make([]messageResult, 0, len(found.Hits)),
 		Truncated:       found.Truncated,
@@ -511,13 +522,9 @@ func (s *Server) handleSearchMessages(ctx context.Context, _ *mcp.CallToolReques
 	}
 	for _, hit := range found.Hits {
 		// A search can span chats, so each hit names the chat it was found in.
-		// The matrix layer falls back to the chat ID, and that fallback is
-		// repeated here for any other implementation.
-		chatName := hit.RoomName
-		if chatName == "" {
-			chatName = hit.Message.RoomID
-		}
-		out.Results = append(out.Results, toMessageResult(hit.Message, chatName))
+		// The resolver named every distinct chat once, ahead of this loop, so it
+		// answers from the cache here whatever the matrix layer's own cache held.
+		out.Results = append(out.Results, toMessageResult(hit.Message, names.name(ctx, hit.Message.RoomID)))
 	}
 	return nil, out, nil
 }
@@ -535,7 +542,7 @@ func (s *Server) handleMessageContext(ctx context.Context, _ *mcp.CallToolReques
 	if err != nil {
 		return nil, getMessageContextResult{}, err
 	}
-	chatName := s.chatDisplayName(ctx, chatID)
+	chatName := s.chatNames().name(ctx, chatID)
 	res := getMessageContextResult{
 		MessagesBefore: toMessageResults(out.Before, chatName),
 		Message:        toMessageResult(out.Event, chatName),
@@ -589,18 +596,28 @@ func contactType(kind string) string {
 	}
 }
 
-func (s *Server) handleGetNewMessages(_ context.Context, _ *mcp.CallToolRequest, in getNewMessagesInput) (*mcp.CallToolResult, getNewMessagesResult, error) {
+func (s *Server) handleGetNewMessages(ctx context.Context, _ *mcp.CallToolRequest, in getNewMessagesInput) (*mcp.CallToolResult, getNewMessagesResult, error) {
 	since := in.Since
 	if since == 0 {
 		since = in.SinceTimestamp
 	}
 	triggers := s.recent.Recent(since, clampLimit(in.Limit))
+	// The buffer records the name its sync loop knew when the message arrived,
+	// which is the chat ID until the first /sync lands. Resolve at emit time
+	// instead, exactly as get_messages does, so a row never reports a chat by
+	// its ID while every other tool reports its name.
+	names := s.chatNames()
+	chatIDs := make([]string, 0, len(triggers))
+	for _, t := range triggers {
+		chatIDs = append(chatIDs, t.ChatID)
+	}
+	names.resolve(ctx, chatIDs)
 	out := make([]triggerResult, 0, len(triggers))
 	for _, t := range triggers {
 		out = append(out, triggerResult{
 			MessageID: t.MessageID,
 			ChatID:    t.ChatID,
-			ChatName:  t.ChatName,
+			ChatName:  names.name(ctx, t.ChatID),
 			From:      t.From,
 			Text:      t.Text,
 			Type:      t.Type,

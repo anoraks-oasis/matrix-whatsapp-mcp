@@ -232,7 +232,9 @@ the bounded scan instead.
 ```
 
 Each result is the message shape above, newest first. A search can span chats, so a
-result's `chat_name` is how it says which chat the match came from.
+result's `chat_name` is how it says which chat the match came from: every distinct chat in a
+page is named once per call, through the same chain `get_messages` uses, so a process that
+has not finished its first `/sync` still names its chats.
 
 **Server path.** `POST /_matrix/client/v3/search` with `keys: ["content.body"]`,
 `order_by: recent`, a message filter, and a chat filter when `chat_id` is given. `truncated` is
@@ -428,7 +430,10 @@ Returns the incoming messages this process has seen, newest first.
   is a recent-activity view, not a transcript: it starts empty and is empty again after a
   restart.
 - **Duplicates:** a message whose ID is already in the buffer is not recorded twice.
-- **Chat name:** the cached display name, or the chat ID when the name is not known.
+- **Chat name:** resolved per call, through the same chain `get_messages` uses — the joined
+  chat's display name, then its canonical alias, then the chat ID — rather than the name the
+  buffer happened to record, so a row does not report the ID just because the first `/sync`
+  had not landed when the message arrived.
 - **Annotations:** `readOnlyHint: true`.
 
 ## send_message

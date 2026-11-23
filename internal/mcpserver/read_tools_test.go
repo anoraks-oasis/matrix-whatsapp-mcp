@@ -17,10 +17,13 @@ import (
 )
 
 func TestSearchMessagesTool(t *testing.T) {
-	svc := &fakeMatrix{searchOut: matrix.SearchOutcome{
+	// The matrix layer's own cache is not seeded here, so its hits carry the chat
+	// ID as room_name. The handler still reports the display name the joined-chat
+	// list carries, which is what list_chats and get_messages report.
+	svc := &fakeMatrix{rooms: []matrix.Room{{ID: "!r:test", Name: "Family"}}, searchOut: matrix.SearchOutcome{
 		Hits: []matrix.SearchHit{
-			{Message: matrix.Message{EventID: "$b", RoomID: "!r:test", Sender: "@bob:test", Body: "dinner tomorrow", MsgType: "m.text", Timestamp: 200}, RoomName: "Family"},
-			{Message: matrix.Message{EventID: "$a", RoomID: "!r:test", Sender: "@alice:test", Body: "dinner at eight", MsgType: "m.text", Timestamp: 100, ReplyTo: "$parent"}, RoomName: "Family"},
+			{Message: matrix.Message{EventID: "$b", RoomID: "!r:test", Sender: "@bob:test", Body: "dinner tomorrow", MsgType: "m.text", Timestamp: 200}, RoomName: "!r:test"},
+			{Message: matrix.Message{EventID: "$a", RoomID: "!r:test", Sender: "@alice:test", Body: "dinner at eight", MsgType: "m.text", Timestamp: 100, ReplyTo: "$parent"}, RoomName: "!r:test"},
 		},
 		Truncated:     true,
 		ScannedRooms:  3,

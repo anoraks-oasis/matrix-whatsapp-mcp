@@ -91,26 +91,122 @@ func matchChats(rooms []matrix.Room, query string) (string, []matrix.Room, bool)
 	}
 }
 
-// chatDisplayName resolves the name a message result carries for its chat: the
-// joined chat's own name, then its canonical alias, then the chat ID, which is
-// the same chain search_messages reports. It is one bounded lookup per call, so
-// a name that cannot be read costs a short wait instead of failing the call.
-func (s *Server) chatDisplayName(ctx context.Context, chatID string) string {
-	ctx, cancel := context.WithTimeout(ctx, chatNameTimeout)
-	defer cancel()
-	if rooms, err := s.matrix.JoinedRooms(ctx); err == nil {
-		for _, r := range rooms {
-			if r.ID == chatID && r.Name != "" && r.Name != r.ID {
-				return r.Name
-			}
-		}
+// chatNameResolver resolves the name every message result carries for its chat,
+// through the one chain the message tools share: the joined chat's own display
+// name, then its canonical alias, then the chat ID. One resolver serves one
+// call, so a page of messages spanning two chats costs one lookup per distinct
+// chat and a chat that repeats is answered from the cache. Every step is best
+// effort: a lookup that fails or runs out of time leaves the chat ID in place
+// instead of failing the tool that asked for the name.
+type chatNameResolver struct {
+	server *Server
+	names  map[string]string
+	joined map[string]string
+	// joinedRead records that the joined-chat list was read for this call, so a
+	// later resolve does not pay for it a second time.
+	joinedRead bool
+}
+
+// chatNames returns a resolver scoped to one tool call.
+func (s *Server) chatNames() *chatNameResolver {
+	return &chatNameResolver{
+		server: s,
+		names:  make(map[string]string),
+		joined: make(map[string]string),
 	}
-	if s.prober != nil {
-		if alias := s.prober.CanonicalAlias(ctx, chatID); alias != "" {
-			return alias
-		}
+}
+
+// name returns the display name of chatID, resolving it first when this call
+// has not seen the chat yet, and the chat ID itself when no name could be read.
+// The name is resolved at emit time, not read from the sync-seeded cache, so a
+// process that has not synced yet still names its chats.
+func (r *chatNameResolver) name(ctx context.Context, chatID string) string {
+	if _, ok := r.names[chatID]; !ok {
+		r.resolve(ctx, []string{chatID})
+	}
+	if name := r.names[chatID]; name != "" {
+		return name
 	}
 	return chatID
+}
+
+// resolve names every chat in ids this call has not named yet. The whole
+// resolution runs under one chatNameTimeout: one read of the joined-chat list
+// names the chats that have a name of their own, and the rest get one
+// canonical-alias probe each, at most chatNameParallel at a time. A chat whose
+// probes found nothing is cached as unnamed, so asking twice costs nothing.
+func (r *chatNameResolver) resolve(ctx context.Context, ids []string) {
+	pending := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		if _, ok := r.names[id]; ok {
+			continue
+		}
+		pending = append(pending, id)
+	}
+	if len(pending) == 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, chatNameTimeout)
+	defer cancel()
+
+	r.readJoined(ctx)
+	probes := make([]string, 0, len(pending))
+	for _, id := range pending {
+		if name := r.joined[id]; name != "" {
+			r.names[id] = name
+			continue
+		}
+		probes = append(probes, id)
+	}
+	aliases := make([]string, len(probes))
+	if r.server.prober != nil {
+		sem := make(chan struct{}, chatNameParallel)
+		var wg sync.WaitGroup
+		for i, id := range probes {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(i int, id string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				aliases[i] = r.server.prober.CanonicalAlias(ctx, id)
+			}(i, id)
+		}
+		wg.Wait()
+	}
+	for i, id := range probes {
+		r.names[id] = aliases[i]
+	}
+}
+
+// readJoined reads the joined-chat list once per call and keeps the names it
+// carries. An entry whose name is empty or is the chat ID has no name of its
+// own, the same test list_chats applies before it falls back to the alias, so
+// the entry is left out and resolve probes the chat's canonical alias. A failed
+// read is not an error: the alias probes still run and the ID remains the last
+// resort.
+func (r *chatNameResolver) readJoined(ctx context.Context) {
+	if r.joinedRead {
+		return
+	}
+	r.joinedRead = true
+	rooms, err := r.server.matrix.JoinedRooms(ctx)
+	if err != nil {
+		return
+	}
+	for _, room := range rooms {
+		if room.Name != "" && room.Name != room.ID {
+			r.joined[room.ID] = room.Name
+		}
+	}
 }
 
 // displayChats returns a copy of rooms with the same fallback names list_chats
