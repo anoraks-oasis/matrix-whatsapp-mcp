@@ -20,7 +20,7 @@ import (
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
 
-	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/whatsapp"
+	"github.com/anoraks-oasis/matrix-whatsapp-mcp/internal/whatsapp"
 )
 
 const (

@@ -24,8 +24,8 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"golang.org/x/image/draw"
 
-	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/matrix"
-	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/whatsapp"
+	"github.com/anoraks-oasis/matrix-whatsapp-mcp/internal/matrix"
+	"github.com/anoraks-oasis/matrix-whatsapp-mcp/internal/whatsapp"
 )
 
 const (

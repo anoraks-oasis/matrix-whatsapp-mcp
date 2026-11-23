@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/allowlist"
-	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/matrix"
+	"github.com/anoraks-oasis/matrix-whatsapp-mcp/internal/allowlist"
+	"github.com/anoraks-oasis/matrix-whatsapp-mcp/internal/matrix"
 )
 
 func runChats(ctx context.Context, args []string, deps Deps) int {

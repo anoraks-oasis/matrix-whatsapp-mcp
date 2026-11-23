@@ -15,7 +15,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/matrix"
+	"github.com/anoraks-oasis/matrix-whatsapp-mcp/internal/matrix"
 )
 
 // chatTool is one tool that names a chat, with the extra arguments that make a

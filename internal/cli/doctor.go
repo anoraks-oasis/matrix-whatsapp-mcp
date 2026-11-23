@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/config"
+	"github.com/anoraks-oasis/matrix-whatsapp-mcp/internal/config"
 )
 
 const (

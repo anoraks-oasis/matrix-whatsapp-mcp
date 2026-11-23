@@ -14,7 +14,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/matrix"
+	"github.com/anoraks-oasis/matrix-whatsapp-mcp/internal/matrix"
 )
 
 // makePNG builds a valid PNG of the given size with a cheap gradient, so a test

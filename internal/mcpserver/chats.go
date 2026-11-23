@@ -7,7 +7,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/matrix"
+	"github.com/anoraks-oasis/matrix-whatsapp-mcp/internal/matrix"
 )
 
 // maxChatCandidates caps how many chat names an ambiguity or a miss lists, so

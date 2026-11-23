@@ -20,12 +20,12 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/cli"
-	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/config"
-	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/logger"
-	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/matrix"
-	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/mcpserver"
-	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/trigger"
+	"github.com/anoraks-oasis/matrix-whatsapp-mcp/internal/cli"
+	"github.com/anoraks-oasis/matrix-whatsapp-mcp/internal/config"
+	"github.com/anoraks-oasis/matrix-whatsapp-mcp/internal/logger"
+	"github.com/anoraks-oasis/matrix-whatsapp-mcp/internal/matrix"
+	"github.com/anoraks-oasis/matrix-whatsapp-mcp/internal/mcpserver"
+	"github.com/anoraks-oasis/matrix-whatsapp-mcp/internal/trigger"
 )
 
 func main() {

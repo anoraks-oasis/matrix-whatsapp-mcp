@@ -24,7 +24,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/config"
+	"github.com/anoraks-oasis/matrix-whatsapp-mcp/internal/config"
 )
 
 // EnvSource is the origin label of the ALLOWED_SEND_ROOMS baseline.

@@ -23,9 +23,9 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
-	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/allowlist"
-	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/config"
-	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/whatsapp"
+	"github.com/anoraks-oasis/matrix-whatsapp-mcp/internal/allowlist"
+	"github.com/anoraks-oasis/matrix-whatsapp-mcp/internal/config"
+	"github.com/anoraks-oasis/matrix-whatsapp-mcp/internal/whatsapp"
 )
 
 // Room is a joined Matrix room. Name falls back to the room ID when the room

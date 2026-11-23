@@ -14,9 +14,9 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/config"
-	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/matrix"
-	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/trigger"
+	"github.com/anoraks-oasis/matrix-whatsapp-mcp/internal/config"
+	"github.com/anoraks-oasis/matrix-whatsapp-mcp/internal/matrix"
+	"github.com/anoraks-oasis/matrix-whatsapp-mcp/internal/trigger"
 )
 
 // stateRead names one state-event read the fake homeserver answered: the chat it

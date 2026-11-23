@@ -18,7 +18,7 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
-	"github.com/ButterHost69/matrix-whatsapp-mcp/internal/config"
+	"github.com/anoraks-oasis/matrix-whatsapp-mcp/internal/config"
 )
 
 // MaxMediaDownloadBytes is the largest attachment one get_media call will

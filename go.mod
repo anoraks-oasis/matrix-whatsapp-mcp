@@ -1,4 +1,4 @@
-module github.com/ButterHost69/matrix-whatsapp-mcp
+module github.com/anoraks-oasis/matrix-whatsapp-mcp
 
 go 1.26.0
 
