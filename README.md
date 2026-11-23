@@ -1,6 +1,8 @@
 <p align="center">
-  <img src="docs/assets/banner.svg" alt="matrix-whatsapp-mcp — a Model Context Protocol server for WhatsApp over Matrix" width="100%">
+  <img src="docs/assets/banner.jpg" alt="matrix-whatsapp-mcp — a Model Context Protocol server for WhatsApp over Matrix" width="100%">
 </p>
+
+Banner: Claude Monet, *Water Lilies* (1922), public domain, via Wikimedia Commons.
 
 # matrix-whatsapp-mcp
 
